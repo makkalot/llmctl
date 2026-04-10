@@ -37,15 +37,23 @@ const (
 // Config
 // ═══════════════════════════════════════════════════════════════════════════
 
+type ModelConfig struct {
+	ServerBin *string  `json:"server_bin,omitempty"`
+	GpuLayers *int     `json:"gpu_layers,omitempty"`
+	CtxSize   *int     `json:"ctx_size,omitempty"`
+	ExtraArgs []string `json:"extra_args,omitempty"`
+}
+
 type Config struct {
-	ModelsDir  string            `json:"models_dir"`
-	ServerBin  string            `json:"server_bin"`
-	Host       string            `json:"host"`
-	Port       int               `json:"port"`
-	GpuLayers  int               `json:"gpu_layers"`
-	CtxSize    int               `json:"ctx_size"`
-	ExtraArgs  []string          `json:"extra_args,omitempty"`
-	Aliases    map[string]string `json:"aliases,omitempty"`
+	ModelsDir string                 `json:"models_dir"`
+	ServerBin string                 `json:"server_bin"`
+	Host      string                 `json:"host"`
+	Port      int                    `json:"port"`
+	GpuLayers int                    `json:"gpu_layers"`
+	CtxSize   int                    `json:"ctx_size"`
+	ExtraArgs []string               `json:"extra_args,omitempty"`
+	Aliases   map[string]string      `json:"aliases,omitempty"`
+	Models    map[string]ModelConfig `json:"models,omitempty"`
 }
 
 func defaultConfig() Config {
@@ -79,12 +87,37 @@ func loadConfig() Config {
 	if cfg.Aliases == nil {
 		cfg.Aliases = map[string]string{}
 	}
+	if cfg.Models == nil {
+		cfg.Models = map[string]ModelConfig{}
+	}
 	return cfg
 }
 
 func saveConfig(cfg Config) error {
 	data, _ := json.MarshalIndent(cfg, "", "  ")
 	return os.WriteFile(configPath(), data, 0644)
+}
+
+// configForModel returns a copy of cfg with per-model overrides applied.
+// The modelKey is matched exactly against keys in cfg.Models.
+func configForModel(cfg Config, modelKey string) Config {
+	mc, ok := cfg.Models[modelKey]
+	if !ok {
+		return cfg
+	}
+	if mc.ServerBin != nil {
+		cfg.ServerBin = *mc.ServerBin
+	}
+	if mc.GpuLayers != nil {
+		cfg.GpuLayers = *mc.GpuLayers
+	}
+	if mc.CtxSize != nil {
+		cfg.CtxSize = *mc.CtxSize
+	}
+	if mc.ExtraArgs != nil {
+		cfg.ExtraArgs = mc.ExtraArgs
+	}
+	return cfg
 }
 
 func findServerBin() string {
@@ -102,7 +135,7 @@ func findServerBin() string {
 
 type Instance struct {
 	Name      string `json:"name"`
-	Model     string `json:"model"`      // full path to .gguf
+	Model     string `json:"model"` // full path to .gguf
 	PID       int    `json:"pid"`
 	Port      int    `json:"port"`       // internal backend port
 	IsDefault bool   `json:"is_default"` // default model for unmatched requests
@@ -240,9 +273,44 @@ func listModelFiles(dir string) []string {
 	for _, e := range entries {
 		if strings.HasSuffix(strings.ToLower(e.Name()), ".gguf") {
 			models = append(models, e.Name())
+		} else if e.IsDir() && strings.HasPrefix(e.Name(), "models--") {
+			subPath := filepath.Join(dir, e.Name())
+			models = append(models, listModelFilesRecursive(subPath, e.Name())...)
+		}
+	}
+	// Also scan the hub/ subdirectory used by huggingface_hub's cache
+	hubDir := filepath.Join(dir, "hub")
+	hubEntries, _ := os.ReadDir(hubDir)
+	for _, e := range hubEntries {
+		if e.IsDir() && strings.HasPrefix(e.Name(), "models--") {
+			subPath := filepath.Join(hubDir, e.Name())
+			models = append(models, listModelFilesRecursive(subPath, filepath.Join("hub", e.Name()))...)
 		}
 	}
 	sort.Strings(models)
+	return models
+}
+
+func listModelFilesRecursive(dir, prefix string) []string {
+	var models []string
+	entries, _ := os.ReadDir(dir)
+	for _, e := range entries {
+		full := filepath.Join(dir, e.Name())
+		if e.IsDir() && e.Name() == "snapshots" {
+			snapshots, _ := os.ReadDir(full)
+			for _, s := range snapshots {
+				snapDir := filepath.Join(full, s.Name())
+				files, _ := os.ReadDir(snapDir)
+				for _, f := range files {
+					if strings.HasSuffix(strings.ToLower(f.Name()), ".gguf") {
+						models = append(models, filepath.Join(prefix, "snapshots", s.Name(), f.Name()))
+					}
+				}
+			}
+		} else if e.IsDir() {
+			models = append(models, listModelFilesRecursive(full, filepath.Join(prefix, e.Name()))...)
+		}
+	}
 	return models
 }
 
@@ -256,7 +324,38 @@ func resolveModel(cfg Config, name string) (string, error) {
 		}
 		return "", fmt.Errorf("model not found: %s", name)
 	}
+
+	// Check if name looks like a HuggingFace repo (user/repo) and try to
+	// find a .gguf file in the HF cache before falling back to other lookups.
+	origName := name
 	if !strings.HasSuffix(strings.ToLower(name), ".gguf") {
+		repoParts := strings.SplitN(name, "/", 2)
+		if len(repoParts) == 2 {
+			cachePrefix := "models--" + repoParts[0] + "--" + repoParts[1]
+			// Search multiple cache layouts:
+			//   1. <modelsDir>/<cachePrefix>                  (top-level models-- dir)
+			//   2. <modelsDir>/hub/<cachePrefix>              (hf download format)
+			searchBases := []string{
+				cfg.ModelsDir,
+				filepath.Join(cfg.ModelsDir, "hub"),
+			}
+			for _, base := range searchBases {
+				snapshotsDir := filepath.Join(base, cachePrefix, "snapshots")
+				snapshots, err := os.ReadDir(snapshotsDir)
+				if err != nil {
+					continue
+				}
+				for _, s := range snapshots {
+					snapDir := filepath.Join(snapshotsDir, s.Name())
+					files, _ := os.ReadDir(snapDir)
+					for _, f := range files {
+						if strings.HasSuffix(strings.ToLower(f.Name()), ".gguf") {
+							return filepath.Join(snapDir, f.Name()), nil
+						}
+					}
+				}
+			}
+		}
 		name = name + ".gguf"
 	}
 	full := filepath.Join(cfg.ModelsDir, name)
@@ -269,7 +368,42 @@ func resolveModel(cfg Config, name string) (string, error) {
 			return filepath.Join(cfg.ModelsDir, m), nil
 		}
 	}
-	return "", fmt.Errorf("model not found: %s (looked in %s)", name, cfg.ModelsDir)
+	if strings.HasPrefix(name, "models--") {
+		if path := findInHFCache(cfg.ModelsDir, name); path != "" {
+			return path, nil
+		}
+	}
+	return "", fmt.Errorf("model not found: %s (looked in %s)", origName, cfg.ModelsDir)
+}
+
+func findInHFCache(modelsDir, name string) string {
+	parts := strings.SplitN(name, "/", 2)
+	if len(parts) < 2 {
+		return ""
+	}
+	// Search both <modelsDir>/<cacheDir> and <modelsDir>/hub/<cacheDir>
+	// since huggingface_hub stores caches under a hub/ subdirectory.
+	candidates := []string{
+		filepath.Join(modelsDir, parts[0]),
+		filepath.Join(modelsDir, "hub", parts[0]),
+	}
+	for _, cacheDir := range candidates {
+		snapshotsDir := filepath.Join(cacheDir, "snapshots")
+		entries, err := os.ReadDir(snapshotsDir)
+		if err != nil {
+			continue
+		}
+		for _, e := range entries {
+			snapPath := filepath.Join(snapshotsDir, e.Name())
+			files, _ := os.ReadDir(snapPath)
+			for _, f := range files {
+				if f.Name() == parts[1] {
+					return filepath.Join(snapPath, f.Name())
+				}
+			}
+		}
+	}
+	return ""
 }
 
 func shortName(path string) string { return filepath.Base(path) }
@@ -506,12 +640,22 @@ func handleListModels(w http.ResponseWriter) {
 // CLI Commands
 // ═══════════════════════════════════════════════════════════════════════════
 
-func cmdLoad(cfg Config, modelName string, instanceName string) {
-	modelPath, err := resolveModel(cfg, modelName)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
+func cmdLoad(cfg Config, modelName string, instanceName string, hfRepo string) {
+	var modelPath string
+	var err error
+
+	if hfRepo != "" {
+		modelPath = hfRepo
+	} else {
+		modelPath, err = resolveModel(cfg, modelName)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
 	}
+
+	// Apply per-model config overrides (exact match on modelName).
+	cfg = configForModel(cfg, modelName)
 
 	if instanceName == "" {
 		instanceName = deriveInstanceName(modelPath)
@@ -520,7 +664,6 @@ func cmdLoad(cfg Config, modelName string, instanceName string) {
 	reg := loadRegistry()
 	reg.CleanDead()
 
-	// Replace existing instance with same name
 	if existing := reg.FindByName(instanceName); existing != nil {
 		if isRunning(existing.PID) {
 			fmt.Printf("Replacing instance '%s'...\n", instanceName)
@@ -530,14 +673,23 @@ func cmdLoad(cfg Config, modelName string, instanceName string) {
 	}
 
 	backendPort := reg.NextPort()
-	fmt.Printf("Loading %s as '%s' (backend :%d)...\n", shortName(modelPath), instanceName, backendPort)
+	displayName := modelPath
+	if hfRepo != "" {
+		displayName = hfRepo
+	}
+	fmt.Printf("Loading %s as '%s' (backend :%d)...\n", shortName(displayName), instanceName, backendPort)
 
-	args := []string{
-		"--model", modelPath,
+	args := []string{}
+	if hfRepo != "" {
+		args = append(args, "-hf", hfRepo)
+	} else {
+		args = append(args, "--model", modelPath)
+	}
+	args = append(args,
 		"--host", "127.0.0.1",
 		"--port", strconv.Itoa(backendPort),
 		"--ctx-size", strconv.Itoa(cfg.CtxSize),
-	}
+	)
 	if cfg.GpuLayers != 0 {
 		args = append(args, "--n-gpu-layers", strconv.Itoa(cfg.GpuLayers))
 	}
@@ -746,17 +898,18 @@ func cmdList(cfg Config) {
 	fmt.Printf("Models in %s:\n\n", cfg.ModelsDir)
 	for _, m := range models {
 		full := filepath.Join(cfg.ModelsDir, m)
+		displayName := filepath.Base(m)
 		marker := "  "
 		extra := ""
-		if name, ok := loaded[m]; ok {
+		if name, ok := loaded[displayName]; ok {
 			marker = "▶ "
 			extra = fmt.Sprintf(" [loaded as: %s]", name)
 		}
 		aliases := ""
-		if a, ok := revAlias[m]; ok {
+		if a, ok := revAlias[displayName]; ok {
 			aliases = fmt.Sprintf(" (alias: %s)", strings.Join(a, ", "))
 		}
-		fmt.Printf("  %s%-42s %8s%s%s\n", marker, m, fileSizeStr(full), aliases, extra)
+		fmt.Printf("  %s%-42s %8s%s%s\n", marker, displayName, fileSizeStr(full), aliases, extra)
 	}
 	fmt.Println()
 }
@@ -817,13 +970,12 @@ func cmdAlias(cfg Config, alias, model string) {
 }
 
 func cmdPull(cfg Config, repo string) {
-	os.MkdirAll(cfg.ModelsDir, 0755)
 	repo = strings.TrimPrefix(repo, "https://huggingface.co/")
 	repo = strings.TrimSuffix(repo, "/")
 
 	parts := strings.Split(repo, "/")
 	if len(parts) < 2 {
-		fmt.Fprintln(os.Stderr, "Usage: llmctl pull <user/repo>")
+		fmt.Fprintln(os.Stderr, "Usage: llmctl pull <user/repo>[:<file>]")
 		os.Exit(1)
 	}
 
@@ -833,43 +985,37 @@ func cmdPull(cfg Config, repo string) {
 		specificFile = strings.Join(parts[2:], "/")
 	}
 
-	apiURL := fmt.Sprintf("https://huggingface.co/api/models/%s/%s", user, repoName)
-	fmt.Printf("Fetching %s/%s...\n", user, repoName)
-
-	resp, err := http.Get(apiURL)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
-		fmt.Fprintf(os.Stderr, "Error: repo not found (HTTP %d)\n", resp.StatusCode)
-		os.Exit(1)
-	}
-
-	body, _ := io.ReadAll(resp.Body)
-	var repoInfo struct {
-		Siblings []struct {
-			Filename string `json:"rfilename"`
-		} `json:"siblings"`
-	}
-	json.Unmarshal(body, &repoInfo)
-
-	var ggufFiles []string
-	for _, s := range repoInfo.Siblings {
-		if strings.HasSuffix(strings.ToLower(s.Filename), ".gguf") {
-			ggufFiles = append(ggufFiles, s.Filename)
+	if specificFile == "" {
+		apiURL := fmt.Sprintf("https://huggingface.co/api/models/%s/%s", user, repoName)
+		resp, err := http.Get(apiURL)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
 		}
-	}
-	if len(ggufFiles) == 0 {
-		fmt.Println("No .gguf files in this repo.")
-		return
-	}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
 
-	fileToDownload := specificFile
-	if fileToDownload == "" {
+		var repoInfo struct {
+			Siblings []struct {
+				Filename string `json:"rfilename"`
+			} `json:"siblings"`
+		}
+		json.Unmarshal(body, &repoInfo)
+
+		var ggufFiles []string
+		for _, s := range repoInfo.Siblings {
+			if strings.HasSuffix(strings.ToLower(s.Filename), ".gguf") {
+				ggufFiles = append(ggufFiles, s.Filename)
+			}
+		}
+
+		if len(ggufFiles) == 0 {
+			fmt.Println("No .gguf files in this repo.")
+			return
+		}
+
 		if len(ggufFiles) == 1 {
-			fileToDownload = ggufFiles[0]
+			specificFile = ggufFiles[0]
 		} else {
 			fmt.Println("Available GGUF files:")
 			for i, f := range ggufFiles {
@@ -888,39 +1034,69 @@ func cmdPull(cfg Config, repo string) {
 				}
 				idx = n - 1
 			}
-			fileToDownload = ggufFiles[idx]
+			specificFile = ggufFiles[idx]
 		}
 	}
 
-	dlURL := fmt.Sprintf("https://huggingface.co/%s/%s/resolve/main/%s", user, repoName, fileToDownload)
-	destPath := filepath.Join(cfg.ModelsDir, filepath.Base(fileToDownload))
+	cacheKey := "models--" + user + "--" + repoName + "/" + specificFile
+	if hfPath := findInHFCache(cfg.ModelsDir, cacheKey); hfPath != "" {
+		fmt.Printf("Already in cache: %s\n", hfPath)
+		fmt.Printf("  Use: llmctl load %s\n", repo)
+		return
+	}
 
-	if _, err := os.Stat(destPath); err == nil {
-		fmt.Printf("Already exists: %s. Overwrite? [y/N]: ", destPath)
-		reader := bufio.NewReader(os.Stdin)
-		input, _ := reader.ReadString('\n')
-		if strings.TrimSpace(strings.ToLower(input)) != "y" {
+	dlRepo := repo + ":" + specificFile
+
+	fmt.Printf("Downloading %s to HF cache at %s...\n", dlRepo, cfg.ModelsDir)
+	fmt.Println("  (This uses huggingface_hub to populate the proper cache format)")
+	fmt.Println("  Press Ctrl+C to cancel")
+
+	var cmd *exec.Cmd
+	env := os.Environ()
+	env = append(env, "HF_HOME="+cfg.ModelsDir)
+
+	if p, err := exec.LookPath("hf"); err == nil {
+		cmd = exec.Command(p, "download", repo, specificFile)
+	} else if p, err := exec.LookPath("huggingface-cli"); err == nil {
+		cmd = exec.Command(p, "download", repo, specificFile)
+	} else if p, err := exec.LookPath("python3"); err == nil {
+		cmd = exec.Command(p, "-m", "huggingface_hub", "download", repo, specificFile)
+	} else if p, err := exec.LookPath("python"); err == nil {
+		cmd = exec.Command(p, "-m", "huggingface_hub", "download", repo, specificFile)
+	} else {
+		fmt.Fprintf(os.Stderr, "Error: huggingface_hub not installed.\n")
+		fmt.Fprintf(os.Stderr, "  Run: pip install huggingface_hub\n")
+		os.Exit(1)
+	}
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	cmd.Stdin = os.Stdin
+	cmd.Env = env
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	wasCancelled := false
+
+	go func() {
+		<-sigCh
+		wasCancelled = true
+		fmt.Println("\nCancelled.")
+		if cmd.Process != nil {
+			cmd.Process.Kill()
+		}
+	}()
+
+	if err := cmd.Run(); err != nil {
+		if wasCancelled {
 			return
 		}
+		fmt.Fprintf(os.Stderr, "Download failed: %v\n", err)
+		os.Exit(1)
 	}
 
-	fmt.Printf("Downloading %s...\n", fileToDownload)
-	if p, err := exec.LookPath("curl"); err == nil {
-		cmd := exec.Command(p, "-L", "-#", "-o", destPath, dlURL)
-		cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
-		cmd.Run()
-	} else if p, err := exec.LookPath("wget"); err == nil {
-		cmd := exec.Command(p, "-O", destPath, dlURL)
-		cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
-		cmd.Run()
-	} else {
-		resp, _ := http.Get(dlURL)
-		f, _ := os.Create(destPath)
-		io.Copy(f, resp.Body)
-		resp.Body.Close()
-		f.Close()
-	}
-	fmt.Printf("✓ Downloaded %s (%s)\n", filepath.Base(destPath), fileSizeStr(destPath))
+	fmt.Printf("✓ Downloaded %s\n", dlRepo)
+	fmt.Println("\nTo load, use the repo path:")
+	fmt.Printf("  llmctl load %s\n", repo)
 }
 
 func cmdRM(cfg Config, modelName string) {
@@ -961,6 +1137,24 @@ func cmdConfig(cfg Config) {
 		fmt.Println("  Aliases:")
 		for k, v := range cfg.Aliases {
 			fmt.Printf("    %s → %s\n", k, v)
+		}
+	}
+	if len(cfg.Models) > 0 {
+		fmt.Println("  Model overrides:")
+		for name, mc := range cfg.Models {
+			fmt.Printf("    [%s]\n", name)
+			if mc.ServerBin != nil {
+				fmt.Printf("      server_bin:  %s\n", *mc.ServerBin)
+			}
+			if mc.GpuLayers != nil {
+				fmt.Printf("      gpu_layers:  %d\n", *mc.GpuLayers)
+			}
+			if mc.CtxSize != nil {
+				fmt.Printf("      ctx_size:    %d\n", *mc.CtxSize)
+			}
+			if mc.ExtraArgs != nil {
+				fmt.Printf("      extra_args:  %s\n", strings.Join(mc.ExtraArgs, " "))
+			}
 		}
 	}
 }
@@ -1061,8 +1255,8 @@ Model Management:
   alias <name> <model>        Create a short alias
 
 Instance Management:
-  load <model> [--name NAME]  Load a model (starts a backend)
-  unload <name>               Stop a model instance
+  load <model> [-hf <hf_repo>] [--name NAME]  Load a model (starts a backend)
+  unload <name>                             Stop a model instance
   stop                        Stop everything
   default <name>              Set default model for unmatched requests
   ps                          List loaded instances
@@ -1077,10 +1271,11 @@ Config:
   set <key> <value>           Update config
 
 Workflow:
-  llmctl load mistral                     # backend on :9100
-  llmctl load llama3 --name chat          # backend on :9101
+  llmctl load mistral                              # backend on :9100
+  llmctl load llama3 --name chat                   # backend on :9101
+  llmctl load "" -hf unsloth/Qwen3.5-27B-GGUF     # direct from HF
   llmctl default chat
-  llmctl proxy                            # proxy on :8080
+  llmctl proxy                                     # proxy on :8080
 
   # Any OpenAI client just works:
   curl http://server:8080/v1/chat/completions \
@@ -1105,11 +1300,12 @@ func main() {
 		cmdList(cfg)
 	case "load", "run":
 		if len(os.Args) < 3 {
-			fmt.Fprintln(os.Stderr, "Usage: llmctl load <model> [--name NAME]")
+			fmt.Fprintln(os.Stderr, "Usage: llmctl load <model> [-hf <huggingface_repo>] [--name NAME]")
 			os.Exit(1)
 		}
-		name, _ := extractFlag(os.Args[3:], "--name")
-		cmdLoad(cfg, os.Args[2], name)
+		name, args := extractFlag(os.Args[3:], "--name")
+		hf, _ := extractFlag(args, "-hf")
+		cmdLoad(cfg, os.Args[2], name, hf)
 	case "unload":
 		if len(os.Args) < 3 {
 			fmt.Fprintln(os.Stderr, "Usage: llmctl unload <name>")
