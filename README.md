@@ -61,7 +61,8 @@ curl http://localhost:8080/v1/chat/completions \
 | `llmctl unload <name>` | | Stop a running model instance |
 | `llmctl stop` | `kill` | Stop all instances and the proxy |
 | `llmctl default <name>` | | Set the default model for unmatched requests |
-| `llmctl ps` | | List all loaded instances with status |
+| `llmctl ps` | | List all loaded instances with status and context size |
+| `llmctl info <name>` | | Show detailed info for an instance (params, aliases, etc.) |
 | `llmctl logs <name>` | `log` | Show last 50 lines of an instance's log |
 
 ### Proxy
@@ -82,11 +83,12 @@ curl http://localhost:8080/v1/chat/completions \
 
 ### From local files
 
-`llmctl load` finds models by fuzzy matching against `.gguf` files in your configured models directory:
+`llmctl load` finds models by fuzzy matching against `.gguf` files in your configured models directory. Both `/` and `:` are supported as separators for HuggingFace-style names:
 
 ```sh
 llmctl load mistral              # matches e.g. Mistral-7B-Instruct-v0.3.Q4_K_M.gguf
 llmctl load llama3 --name chat   # load with a custom instance name
+llmctl load Qwen3.5-27B-GGUF:UD-Q4_K_XL   # HF-style name with : separator
 ```
 
 ### From Hugging Face (direct)
@@ -169,10 +171,11 @@ Add extra `llama-server` arguments in the config file directly (`~/.llmctl.json`
 
 ### Per-model overrides
 
-Override settings for specific models by adding a `models` section to `~/.llmctl.json`:
+Override settings for specific models by adding a `models` section to `~/.llmctl.json`. Per-model `extra_args` are merged with global `extra_args` — matching flags are replaced, new flags are appended:
 
 ```json
 {
+  "extra_args": ["--flash-attn", "on", "--temp", "0.6"],
   "models": {
     "codellama": {
       "gpu_layers": 20,
@@ -183,13 +186,44 @@ Override settings for specific models by adding a `models` section to `~/.llmctl
 }
 ```
 
+In this example, `codellama` would use `--flash-attn on --temp 0.2` (global `--temp 0.6` is replaced by the per-model override).
+
 ### Aliases
 
-Create short names for model files:
+Create short names for model files. When loading via an alias, the alias becomes the instance name exposed in the API:
 
 ```sh
 llmctl alias qwen Qwen3.5-27B-GGUF/UD-Q4_K_XL.gguf
 llmctl load qwen
+# Instance name is "qwen" — use it in API requests: {"model": "qwen", ...}
+```
+
+Aliases also support the `:` separator:
+
+```sh
+llmctl alias qwen Qwen3.5-27B-GGUF:UD-Q4_K_XL
+```
+
+You can load the same model multiple times with different aliases and per-model overrides:
+
+```json
+{
+  "aliases": {
+    "qwen27b": "Qwen3.5-27B-GGUF:UD-Q4_K_XL",
+    "qwen27b_code": "Qwen3.5-27B-GGUF:UD-Q4_K_XL"
+  },
+  "models": {
+    "qwen27b_code": {
+      "ctx_size": 32768,
+      "extra_args": ["--chat-template-kwargs", "{\"enable_thinking\":true}"]
+    }
+  }
+}
+```
+
+```sh
+llmctl load qwen27b       # instance "qwen27b", default params
+llmctl load qwen27b_code  # instance "qwen27b_code", code-specific params
 ```
 
 ## API endpoints
