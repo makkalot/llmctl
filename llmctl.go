@@ -192,6 +192,61 @@ func configForModel(cfg Config, modelKey string) Config {
 	return cfg
 }
 
+func modelConfigKey(cfg Config, requestedName, instanceName, modelPath string) string {
+	canonicalRef := modelRef(cfg.ModelsDir, modelPath)
+	base := filepath.Base(modelPath)
+	baseNoExt := strings.TrimSuffix(strings.TrimSuffix(base, ".gguf"), ".GGUF")
+
+	candidates := []string{
+		requestedName,
+		instanceName,
+		canonicalRef,
+		strings.TrimSuffix(strings.TrimSuffix(canonicalRef, ".gguf"), ".GGUF"),
+		base,
+		baseNoExt,
+	}
+	for _, c := range candidates {
+		if _, ok := cfg.Models[c]; ok {
+			return c
+		}
+	}
+
+	var aliasMatches []string
+	for alias, target := range cfg.Aliases {
+		if _, ok := cfg.Models[alias]; !ok {
+			continue
+		}
+		if aliasTargetMatchesModel(cfg, target, modelPath) {
+			aliasMatches = append(aliasMatches, alias)
+		}
+	}
+	sort.Strings(aliasMatches)
+	if len(aliasMatches) > 0 {
+		return aliasMatches[0]
+	}
+	return ""
+}
+
+func aliasTargetMatchesModel(cfg Config, target, modelPath string) bool {
+	if resolved, err := resolveModel(cfg, target); err == nil {
+		return filepath.Clean(resolved) == filepath.Clean(modelPath)
+	}
+
+	normalizedTarget := strings.ToLower(strings.TrimSuffix(strings.TrimSuffix(target, ".gguf"), ".GGUF"))
+	refs := []string{
+		modelRef(cfg.ModelsDir, modelPath),
+		filepath.Base(modelPath),
+		strings.TrimSuffix(strings.TrimSuffix(filepath.Base(modelPath), ".gguf"), ".GGUF"),
+	}
+	for _, ref := range refs {
+		normalizedRef := strings.ToLower(strings.TrimSuffix(strings.TrimSuffix(ref, ".gguf"), ".GGUF"))
+		if normalizedTarget == normalizedRef {
+			return true
+		}
+	}
+	return false
+}
+
 func findServerBin() string {
 	for _, name := range []string{"llama-server", "llama-cpp-server", "server"} {
 		if p, err := exec.LookPath(name); err == nil {
@@ -341,6 +396,34 @@ func waitForHealth(port int, timeout time.Duration) bool {
 	return false
 }
 
+func printLogTail(path string, maxLines int) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	lines := strings.Split(strings.TrimRight(string(data), "\n"), "\n")
+	if len(lines) == 0 || lines[0] == "" {
+		return
+	}
+	start := 0
+	if len(lines) > maxLines {
+		start = len(lines) - maxLines
+	}
+	fmt.Fprintln(os.Stderr, "Last log lines:")
+	for _, line := range lines[start:] {
+		fmt.Fprintln(os.Stderr, "  "+line)
+	}
+}
+
+func backendExited(exitCh <-chan error) (error, bool) {
+	select {
+	case err := <-exitCh:
+		return err, true
+	default:
+		return nil, false
+	}
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Model helpers
 // ═══════════════════════════════════════════════════════════════════════════
@@ -392,6 +475,12 @@ func listModelFilesRecursive(dir, prefix string) []string {
 	return models
 }
 
+type hfModelRef struct {
+	User string
+	Repo string
+	File string
+}
+
 func resolveModel(cfg Config, name string) (string, error) {
 	if resolved, ok := cfg.Aliases[name]; ok {
 		name = resolved
@@ -405,31 +494,32 @@ func resolveModel(cfg Config, name string) (string, error) {
 
 	origName := name
 
-	// Split on / or : to get repo parts for HF cache lookup.
-	// Both "user/repo" and "repo:variant" map to models--user--repo or models--repo--variant.
-	hfParts := hfRepoParts(name)
-
-	if !strings.HasSuffix(strings.ToLower(name), ".gguf") {
-		if len(hfParts) == 2 {
-			cachePrefix := "models--" + hfParts[0] + "--" + hfParts[1]
-			if path := findHFSnapshot(cfg.ModelsDir, cachePrefix); path != "" {
-				return path, nil
-			}
+	if ref, ok := parseHFModelRef(name); ok {
+		matches := findHFSnapshots(cfg.ModelsDir, ref)
+		if len(matches) == 1 {
+			return matches[0], nil
 		}
-		name = name + ".gguf"
-	} else if len(hfParts) == 2 {
-		// Name like "RepoName/filename.gguf" or "RepoName:filename.gguf"
-		cachePrefix := "models--" + hfParts[0] + "--" + hfParts[1]
-		if path := findHFSnapshot(cfg.ModelsDir, cachePrefix); path != "" {
+		if len(matches) > 1 {
+			return "", ambiguousModelError(origName, cfg.ModelsDir, matches)
+		}
+	}
+
+	if strings.HasPrefix(name, "models--") || strings.HasPrefix(name, "hub"+string(filepath.Separator)+"models--") || strings.HasPrefix(name, "hub/models--") {
+		if path := findInHFCache(cfg.ModelsDir, filepath.ToSlash(name)); path != "" {
 			return path, nil
 		}
+	}
+
+	if !strings.HasSuffix(strings.ToLower(name), ".gguf") {
+		name = name + ".gguf"
 	}
 	full := filepath.Join(cfg.ModelsDir, name)
 	if _, err := os.Stat(full); err == nil {
 		return full, nil
 	}
+
 	// Fuzzy substring match: also try matching just the filename part
-	// (after last / or :) against top-level model files.
+	// (after last / or :) against model files.
 	lower := strings.ToLower(strings.TrimSuffix(name, ".gguf"))
 	basename := lower
 	for _, sep := range []string{"/", ":"} {
@@ -440,40 +530,58 @@ func resolveModel(cfg Config, name string) (string, error) {
 			}
 		}
 	}
+	var matches []string
 	for _, m := range listModelFiles(cfg.ModelsDir) {
 		ml := strings.ToLower(m)
 		if strings.Contains(ml, lower) || strings.Contains(ml, basename) {
-			return filepath.Join(cfg.ModelsDir, m), nil
+			matches = append(matches, filepath.Join(cfg.ModelsDir, m))
 		}
 	}
-	if strings.HasPrefix(name, "models--") {
-		if path := findInHFCache(cfg.ModelsDir, name); path != "" {
-			return path, nil
-		}
+	if len(matches) == 1 {
+		return matches[0], nil
+	}
+	if len(matches) > 1 {
+		return "", ambiguousModelError(origName, cfg.ModelsDir, matches)
 	}
 	return "", fmt.Errorf("model not found: %s (looked in %s)", origName, cfg.ModelsDir)
 }
 
-// hfRepoParts splits a model name on / or : to return [repo, variant] for
-// HuggingFace cache lookup. Both "user/repo" and "repo:variant" map to
-// models--repo--variant directories. Returns nil if no separator found.
-func hfRepoParts(name string) []string {
-	for _, sep := range []string{":", "/"} {
-		parts := strings.SplitN(name, sep, 2)
-		if len(parts) == 2 {
-			return parts
-		}
+func parseHFModelRef(name string) (hfModelRef, bool) {
+	name = strings.TrimPrefix(name, "https://huggingface.co/")
+	name = strings.TrimSuffix(name, "/")
+	slash := strings.Index(name, "/")
+	if slash <= 0 || slash == len(name)-1 {
+		return hfModelRef{}, false
 	}
-	return nil
+	user := name[:slash]
+	rest := name[slash+1:]
+	repo := rest
+	file := ""
+	if colon := strings.Index(rest, ":"); colon >= 0 {
+		repo = rest[:colon]
+		file = rest[colon+1:]
+	} else if slash := strings.Index(rest, "/"); slash >= 0 {
+		repo = rest[:slash]
+		file = rest[slash+1:]
+	}
+	if user == "" || repo == "" {
+		return hfModelRef{}, false
+	}
+	return hfModelRef{User: user, Repo: repo, File: file}, true
 }
 
-// findHFSnapshot searches HuggingFace cache directories for a .gguf file
-// under models--<cachePrefix>/snapshots/.
-func findHFSnapshot(modelsDir, cachePrefix string) string {
+func hfCachePrefix(ref hfModelRef) string {
+	return "models--" + ref.User + "--" + ref.Repo
+}
+
+func findHFSnapshots(modelsDir string, ref hfModelRef) []string {
+	cachePrefix := hfCachePrefix(ref)
 	searchBases := []string{
 		modelsDir,
 		filepath.Join(modelsDir, "hub"),
 	}
+	var matches []string
+	seenRefs := map[string]bool{}
 	for _, base := range searchBases {
 		snapshotsDir := filepath.Join(base, cachePrefix, "snapshots")
 		snapshots, err := os.ReadDir(snapshotsDir)
@@ -484,16 +592,35 @@ func findHFSnapshot(modelsDir, cachePrefix string) string {
 			snapDir := filepath.Join(snapshotsDir, s.Name())
 			files, _ := os.ReadDir(snapDir)
 			for _, f := range files {
-				if strings.HasSuffix(strings.ToLower(f.Name()), ".gguf") {
-					return filepath.Join(snapDir, f.Name())
+				if !strings.HasSuffix(strings.ToLower(f.Name()), ".gguf") {
+					continue
+				}
+				if ref.File == "" || f.Name() == ref.File {
+					path := filepath.Join(snapDir, f.Name())
+					canonicalRef := modelRef(modelsDir, path)
+					if !seenRefs[canonicalRef] {
+						seenRefs[canonicalRef] = true
+						matches = append(matches, path)
+					}
 				}
 			}
 		}
 	}
-	return ""
+	sort.Strings(matches)
+	return matches
+}
+
+func ambiguousModelError(name, modelsDir string, matches []string) error {
+	refs := make([]string, 0, len(matches))
+	for _, m := range matches {
+		refs = append(refs, modelRef(modelsDir, m))
+	}
+	sort.Strings(refs)
+	return fmt.Errorf("ambiguous model %q; matches: %s", name, strings.Join(refs, ", "))
 }
 
 func findInHFCache(modelsDir, name string) string {
+	name = strings.TrimPrefix(filepath.ToSlash(name), "hub/")
 	parts := strings.SplitN(name, "/", 2)
 	if len(parts) < 2 {
 		return ""
@@ -523,6 +650,28 @@ func findInHFCache(modelsDir, name string) string {
 	return ""
 }
 
+func modelRef(modelsDir, path string) string {
+	rel := path
+	if filepath.IsAbs(path) {
+		if r, err := filepath.Rel(modelsDir, path); err == nil && !strings.HasPrefix(r, "..") {
+			rel = r
+		}
+	}
+	rel = filepath.ToSlash(rel)
+	parts := strings.Split(rel, "/")
+	offset := 0
+	if len(parts) > 0 && parts[0] == "hub" {
+		offset = 1
+	}
+	if len(parts) >= offset+4 && strings.HasPrefix(parts[offset], "models--") && parts[offset+1] == "snapshots" {
+		cacheParts := strings.SplitN(strings.TrimPrefix(parts[offset], "models--"), "--", 2)
+		if len(cacheParts) == 2 {
+			return cacheParts[0] + "/" + cacheParts[1] + ":" + strings.Join(parts[offset+3:], "/")
+		}
+	}
+	return filepath.Base(path)
+}
+
 func shortName(path string) string { return filepath.Base(path) }
 
 func fileSizeStr(path string) string {
@@ -537,9 +686,12 @@ func fileSizeStr(path string) string {
 	return fmt.Sprintf("%.0f MB", mb)
 }
 
-// Derive a clean instance name from the model filename
-func deriveInstanceName(modelPath string) string {
-	base := filepath.Base(modelPath)
+// Derive a clean instance name from the model filename or canonical HF ref.
+func deriveInstanceName(modelRef string) string {
+	base := filepath.Base(modelRef)
+	if idx := strings.LastIndex(base, ":"); idx >= 0 {
+		base = base[idx+1:]
+	}
 	base = strings.TrimSuffix(base, ".gguf")
 	base = strings.TrimSuffix(base, ".GGUF")
 	// Strip quantization suffix like .Q4_K_M
@@ -551,7 +703,7 @@ func deriveInstanceName(modelPath string) string {
 		}
 	}
 	base = strings.Map(func(r rune) rune {
-		if r == ' ' || r == '/' || r == '\\' {
+		if r == ' ' || r == '/' || r == '\\' || r == ':' {
 			return '-'
 		}
 		return r
@@ -772,6 +924,34 @@ func findMmprojForModel(modelPath string) string {
 	return ""
 }
 
+func resolveMmproj(cfg Config, modelPath, mmprojName string) (string, error) {
+	if mmprojName == "" {
+		return findMmprojForModel(modelPath), nil
+	}
+	if filepath.IsAbs(mmprojName) {
+		if _, err := os.Stat(mmprojName); err == nil {
+			return mmprojName, nil
+		}
+		return "", fmt.Errorf("mmproj not found: %s", mmprojName)
+	}
+
+	nearModel := filepath.Join(filepath.Dir(modelPath), mmprojName)
+	if _, err := os.Stat(nearModel); err == nil {
+		return nearModel, nil
+	}
+
+	inModelsDir := filepath.Join(cfg.ModelsDir, mmprojName)
+	if _, err := os.Stat(inModelsDir); err == nil {
+		return inModelsDir, nil
+	}
+
+	path, err := resolveModel(cfg, mmprojName)
+	if err != nil {
+		return "", fmt.Errorf("mmproj %q not resolved near %s: %w", mmprojName, modelRef(cfg.ModelsDir, modelPath), err)
+	}
+	return path, nil
+}
+
 func cmdLoad(cfg Config, modelName string, instanceName string, hfRepo string, mmprojArg string) {
 	var modelPath string
 	var err error
@@ -786,8 +966,6 @@ func cmdLoad(cfg Config, modelName string, instanceName string, hfRepo string, m
 		}
 	}
 
-	cfg = configForModel(cfg, modelName)
-
 	aliasUsed := ""
 	if _, ok := cfg.Aliases[modelName]; ok {
 		aliasUsed = modelName
@@ -797,26 +975,29 @@ func cmdLoad(cfg Config, modelName string, instanceName string, hfRepo string, m
 		if aliasUsed != "" {
 			instanceName = aliasUsed
 		} else {
-			instanceName = deriveInstanceName(modelPath)
+			instanceName = deriveInstanceName(modelRef(cfg.ModelsDir, modelPath))
 		}
+	}
+
+	if configKey := modelConfigKey(cfg, modelName, instanceName, modelPath); configKey != "" {
+		cfg = configForModel(cfg, configKey)
 	}
 
 	var mmprojPath string
 	if mmprojArg != "" {
-		mmprojPath, err = resolveModel(cfg, mmprojArg)
+		mmprojPath, err = resolveMmproj(cfg, modelPath, mmprojArg)
 		if err != nil {
-			mmprojPath = mmprojArg
-		}
-		if isMmprojFile(mmprojPath) {
-			fmt.Printf("Warning: '%s' appears to be a mmproj file, passing it directly.\n", shortName(mmprojPath))
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
 		}
 	} else if cfg.Mmproj != "" {
-		mmprojPath, err = resolveModel(cfg, cfg.Mmproj)
+		mmprojPath, err = resolveMmproj(cfg, modelPath, cfg.Mmproj)
 		if err != nil {
-			mmprojPath = cfg.Mmproj
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
 		}
 	} else {
-		mmprojPath = findMmprojForModel(modelPath)
+		mmprojPath, _ = resolveMmproj(cfg, modelPath, "")
 	}
 
 	reg := loadRegistry()
@@ -871,6 +1052,10 @@ func cmdLoad(cfg Config, modelName string, instanceName string, hfRepo string, m
 		fmt.Fprintf(os.Stderr, "Is '%s' installed and in PATH?\n", cfg.ServerBin)
 		os.Exit(1)
 	}
+	exitCh := make(chan error, 1)
+	go func() {
+		exitCh <- cmd.Wait()
+	}()
 
 	isDefault := len(reg.Instances) == 0
 
@@ -895,6 +1080,21 @@ func cmdLoad(cfg Config, modelName string, instanceName string, hfRepo string, m
 	if waitForHealth(backendPort, 60*time.Second) {
 		fmt.Printf("✓ '%s' ready (PID %d, backend :%d)\n", instanceName, inst.PID, backendPort)
 	} else {
+		if exitErr, exited := backendExited(exitCh); exited {
+			reg := loadRegistry()
+			reg.Remove(instanceName)
+			if isDefault && len(reg.Instances) > 0 {
+				reg.Instances[0].IsDefault = true
+			}
+			saveRegistry(reg)
+			fmt.Fprintf(os.Stderr, "Error: '%s' exited before becoming healthy. Check: llmctl logs %s\n",
+				instanceName, instanceName)
+			if exitErr != nil {
+				fmt.Fprintf(os.Stderr, "Backend exit: %v\n", exitErr)
+			}
+			printLogTail(filepath.Join(logDir, instanceName+".log"), 20)
+			os.Exit(1)
+		}
 		fmt.Printf("⚠ '%s' started (PID %d) but not yet healthy. Check: llmctl logs %s\n",
 			instanceName, inst.PID, instanceName)
 	}
@@ -1127,6 +1327,26 @@ func isMmprojFile(name string) bool {
 	return strings.HasPrefix(strings.ToLower(filepath.Base(name)), "mmproj-")
 }
 
+func loadedModelsByPath(reg Registry) map[string]string {
+	loaded := map[string]string{}
+	for _, inst := range reg.Instances {
+		loaded[filepath.Clean(inst.Model)] = inst.Name
+	}
+	return loaded
+}
+
+func aliasesByResolvedPath(cfg Config) map[string][]string {
+	revAlias := map[string][]string{}
+	for a, t := range cfg.Aliases {
+		if p, err := resolveModel(cfg, t); err == nil {
+			revAlias[filepath.Clean(p)] = append(revAlias[filepath.Clean(p)], a)
+		} else {
+			revAlias[t] = append(revAlias[t], a)
+		}
+	}
+	return revAlias
+}
+
 func cmdList(cfg Config) {
 	models := listModelFiles(cfg.ModelsDir)
 	filtered := make([]string, 0, len(models))
@@ -1143,31 +1363,24 @@ func cmdList(cfg Config) {
 
 	reg := loadRegistry()
 	reg.CleanDead()
-	loaded := map[string]string{}
-	for _, inst := range reg.Instances {
-		loaded[shortName(inst.Model)] = inst.Name
-	}
-
-	revAlias := map[string][]string{}
-	for a, t := range cfg.Aliases {
-		revAlias[t] = append(revAlias[t], a)
-	}
+	loaded := loadedModelsByPath(reg)
+	revAlias := aliasesByResolvedPath(cfg)
 
 	fmt.Printf("Models in %s:\n\n", cfg.ModelsDir)
 	for _, m := range models {
 		full := filepath.Join(cfg.ModelsDir, m)
-		displayName := filepath.Base(m)
+		displayName := modelRef(cfg.ModelsDir, full)
 		marker := "  "
 		extra := ""
-		if name, ok := loaded[displayName]; ok {
+		if name, ok := loaded[filepath.Clean(full)]; ok {
 			marker = "▶ "
 			extra = fmt.Sprintf(" [loaded as: %s]", name)
 		}
 		aliases := ""
-		if a, ok := revAlias[displayName]; ok {
+		if a, ok := revAlias[filepath.Clean(full)]; ok {
 			aliases = fmt.Sprintf(" (alias: %s)", strings.Join(a, ", "))
 		}
-		fmt.Printf("  %s%-42s %8s%s%s\n", marker, displayName, fileSizeStr(full), aliases, extra)
+		fmt.Printf("  %s%-60s %8s%s%s\n", marker, displayName, fileSizeStr(full), aliases, extra)
 	}
 	fmt.Println()
 }
@@ -1203,44 +1416,49 @@ func cmdLogs(name string) {
 }
 
 func cmdAlias(cfg Config, alias, model string) {
-	if !strings.HasSuffix(strings.ToLower(model), ".gguf") {
-		model = model + ".gguf"
+	modelPath, err := resolveModel(cfg, model)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
 	}
-	full := filepath.Join(cfg.ModelsDir, model)
-	if _, err := os.Stat(full); err != nil {
-		lower := strings.ToLower(strings.TrimSuffix(model, ".gguf"))
-		found := false
-		for _, m := range listModelFiles(cfg.ModelsDir) {
-			if strings.Contains(strings.ToLower(m), lower) {
-				model = m
-				found = true
-				break
-			}
-		}
-		if !found {
-			fmt.Fprintf(os.Stderr, "Error: model '%s' not found\n", model)
-			os.Exit(1)
-		}
-	}
+	model = modelRef(cfg.ModelsDir, modelPath)
 	cfg.Aliases[alias] = model
 	saveConfig(cfg)
 	fmt.Printf("✓ Alias '%s' → %s\n", alias, model)
 }
 
-func cmdPull(cfg Config, repo string) {
-	repo = strings.TrimPrefix(repo, "https://huggingface.co/")
-	repo = strings.TrimSuffix(repo, "/")
-
-	parts := strings.Split(repo, "/")
+func parsePullTarget(target string) (user string, repoName string, repoID string, specificFile string, err error) {
+	target = strings.TrimPrefix(target, "https://huggingface.co/")
+	target = strings.TrimSuffix(target, "/")
+	parts := strings.Split(target, "/")
 	if len(parts) < 2 {
-		fmt.Fprintln(os.Stderr, "Usage: llmctl pull <user/repo>[:<file>]")
-		os.Exit(1)
+		return "", "", "", "", fmt.Errorf("invalid repo")
 	}
 
-	user, repoName := parts[0], parts[1]
-	specificFile := ""
+	user, repoName = parts[0], parts[1]
+	if user == "" || repoName == "" {
+		return "", "", "", "", fmt.Errorf("invalid repo")
+	}
+
+	if colon := strings.Index(repoName, ":"); colon >= 0 {
+		specificFile = repoName[colon+1:]
+		repoName = repoName[:colon]
+	}
 	if len(parts) >= 3 {
 		specificFile = strings.Join(parts[2:], "/")
+	}
+	if repoName == "" {
+		return "", "", "", "", fmt.Errorf("invalid repo")
+	}
+	repoID = user + "/" + repoName
+	return user, repoName, repoID, specificFile, nil
+}
+
+func cmdPull(cfg Config, repo string) {
+	user, repoName, repoID, specificFile, err := parsePullTarget(repo)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "Usage: llmctl pull <user/repo>[:<file>]")
+		os.Exit(1)
 	}
 
 	if specificFile == "" {
@@ -1299,11 +1517,11 @@ func cmdPull(cfg Config, repo string) {
 	cacheKey := "models--" + user + "--" + repoName + "/" + specificFile
 	if hfPath := findInHFCache(cfg.ModelsDir, cacheKey); hfPath != "" {
 		fmt.Printf("Already in cache: %s\n", hfPath)
-		fmt.Printf("  Use: llmctl load %s\n", repo)
+		fmt.Printf("  Use: llmctl load %s:%s\n", repoID, specificFile)
 		return
 	}
 
-	dlRepo := repo + ":" + specificFile
+	dlRepo := repoID + ":" + specificFile
 
 	fmt.Printf("Downloading %s to HF cache at %s...\n", dlRepo, cfg.ModelsDir)
 	fmt.Println("  (This uses huggingface_hub to populate the proper cache format)")
@@ -1314,13 +1532,13 @@ func cmdPull(cfg Config, repo string) {
 	env = append(env, "HF_HOME="+cfg.ModelsDir)
 
 	if p, err := exec.LookPath("hf"); err == nil {
-		cmd = exec.Command(p, "download", repo, specificFile)
+		cmd = exec.Command(p, "download", repoID, specificFile)
 	} else if p, err := exec.LookPath("huggingface-cli"); err == nil {
-		cmd = exec.Command(p, "download", repo, specificFile)
+		cmd = exec.Command(p, "download", repoID, specificFile)
 	} else if p, err := exec.LookPath("python3"); err == nil {
-		cmd = exec.Command(p, "-m", "huggingface_hub", "download", repo, specificFile)
+		cmd = exec.Command(p, "-m", "huggingface_hub", "download", repoID, specificFile)
 	} else if p, err := exec.LookPath("python"); err == nil {
-		cmd = exec.Command(p, "-m", "huggingface_hub", "download", repo, specificFile)
+		cmd = exec.Command(p, "-m", "huggingface_hub", "download", repoID, specificFile)
 	} else {
 		fmt.Fprintf(os.Stderr, "Error: huggingface_hub not installed.\n")
 		fmt.Fprintf(os.Stderr, "  Run: pip install huggingface_hub\n")
@@ -1354,7 +1572,7 @@ func cmdPull(cfg Config, repo string) {
 
 	fmt.Printf("✓ Downloaded %s\n", dlRepo)
 	fmt.Println("\nTo load, use the repo path:")
-	fmt.Printf("  llmctl load %s\n", repo)
+	fmt.Printf("  llmctl load %s:%s\n", repoID, specificFile)
 }
 
 func cmdRM(cfg Config, modelName string) {
