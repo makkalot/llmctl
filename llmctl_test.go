@@ -99,6 +99,43 @@ func TestResolveModelDistinguishesSameHFFileNameByRepo(t *testing.T) {
 	}
 }
 
+func TestValidateExtraArgsSuggestsLlamaCppPenaltyFlags(t *testing.T) {
+	err := validateExtraArgs([]string{"--temp", "0.6", "presence_penalty", "0.0"})
+	if err == nil {
+		t.Fatal("expected validation error")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "presence_penalty") || !strings.Contains(msg, "--presence-penalty") {
+		t.Fatalf("validation error = %q, want presence penalty suggestion", msg)
+	}
+
+	err = validateExtraArgs([]string{"repetition_penalty", "1.0"})
+	if err == nil {
+		t.Fatal("expected validation error")
+	}
+	if !strings.Contains(err.Error(), "--repeat-penalty") {
+		t.Fatalf("validation error = %q, want repeat penalty suggestion", err)
+	}
+
+	err = validateExtraArgs([]string{"--repetition-penalty", "1.0"})
+	if err == nil {
+		t.Fatal("expected validation error")
+	}
+	if !strings.Contains(err.Error(), "--repeat-penalty") {
+		t.Fatalf("validation error = %q, want repeat penalty suggestion", err)
+	}
+}
+
+func TestValidateExtraArgsAcceptsDashedPenaltyFlags(t *testing.T) {
+	err := validateExtraArgs([]string{
+		"--presence-penalty", "0.0",
+		"--repeat-penalty", "1.0",
+	})
+	if err != nil {
+		t.Fatalf("valid extra args rejected: %v", err)
+	}
+}
+
 func TestResolveModelReportsAmbiguousDuplicateBasename(t *testing.T) {
 	root := t.TempDir()
 	cfg := testConfig(root)

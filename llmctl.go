@@ -178,6 +178,26 @@ func mergeExtraArgs(global, perModel []string) []string {
 	return result
 }
 
+func validateExtraArgs(args []string) error {
+	suggestions := map[string]string{
+		"presence_penalty":     "--presence-penalty",
+		"frequency_penalty":    "--frequency-penalty",
+		"repetition_penalty":   "--repeat-penalty",
+		"repeat_penalty":       "--repeat-penalty",
+		"--presence_penalty":   "--presence-penalty",
+		"--frequency_penalty":  "--frequency-penalty",
+		"--repetition_penalty": "--repeat-penalty",
+		"--repeat_penalty":     "--repeat-penalty",
+		"--repetition-penalty": "--repeat-penalty",
+	}
+	for _, a := range args {
+		if suggestion, ok := suggestions[a]; ok {
+			return fmt.Errorf("invalid extra_args entry %q; llama.cpp flags use dashes, try %q", a, suggestion)
+		}
+	}
+	return nil
+}
+
 // configForModel returns a copy of cfg with per-model overrides applied.
 // The modelKey is matched exactly against keys in cfg.Models.
 func configForModel(cfg Config, modelKey string) Config {
@@ -1424,6 +1444,9 @@ func loadInstance(cfg Config, opts loadOptions) (Instance, bool, error) {
 	}
 	if opts.Verbose {
 		fmt.Printf("Loading %s as '%s' (backend :%d)...\n", shortName(displayName), spec.InstanceName, backendPort)
+	}
+	if err := validateExtraArgs(cfg.ExtraArgs); err != nil {
+		return Instance{}, false, err
 	}
 
 	args := []string{}
