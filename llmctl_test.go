@@ -363,7 +363,9 @@ func TestValidateAutoswitchConfigRequiresVramMB(t *testing.T) {
 		t.Fatal("expected error for model without vram_mb")
 	}
 
-	cfg.Models["no-vram"].VramMB = 8000
+	mc := cfg.Models["no-vram"]
+	mc.VramMB = 8000
+	cfg.Models["no-vram"] = mc
 	err = validateAutoswitchConfig(cfg)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
