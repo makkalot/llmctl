@@ -1,6 +1,7 @@
 package main
 
 import (
+	"embed"
 	"bufio"
 	"bytes"
 	"encoding/json"
@@ -970,6 +971,127 @@ func autoswitchModel(cfg Config, targetName string) (*url.URL, string, error) {
 	return u, inst.Name, nil
 }
 
+//go:embed web/index.html
+var webFS embed.FS
+
+var proxyEvents []string
+var eventsMu sync.Mutex
+
+func addEvent(msg string) {
+	eventsMu.Lock()
+	defer eventsMu.Unlock()
+	ts := time.Now().Format("15:04:05")
+	proxyEvents = append(proxyEvents, fmt.Sprintf("[%s] %s", ts, msg))
+	if len(proxyEvents) > 100 {
+		proxyEvents = proxyEvents[len(proxyEvents)-100:]
+	}
+}
+
+func handleUIVRAM(w http.ResponseWriter, cfg Config) {
+	total, err := gpuTotalVramMB(cfg)
+	if err != nil {
+		total = 0
+	}
+	used, err := gpuUsedVramMB()
+	if err != nil {
+		used = 0
+	}
+	available := total - used
+	if available < 0 {
+		available = 0
+	}
+	pct := 0
+	if total > 0 {
+		pct = used * 100 / total
+	}
+
+	w.Header().Set("Content-Type", "text/html")
+	fmt.Fprintf(w, `<div class="stats">
+		<div class="stat"><div class="stat-value">%d</div><div class="stat-label">Total MB</div></div>
+		<div class="stat"><div class="stat-value">%d</div><div class="stat-label">Used MB</div></div>
+		<div class="stat"><div class="stat-value">%d</div><div class="stat-label">Available MB</div></div>
+	</div>
+	<div class="vram-bar"><div class="vram-fill" style="width:%d%%"></div></div>`, total, used, available, pct)
+}
+
+func handleUIModels(w http.ResponseWriter, cfg Config) {
+	reg := loadRegistry()
+	// Don't CleanDead here -- we want to show stale instances so the user can clean them up
+
+	w.Header().Set("Content-Type", "text/html")
+	fmt.Fprintf(w, `<table><tr><th>Name</th><th>Status</th><th>VRAM</th><th>Port</th><th>Actions</th></tr>`)
+	for _, inst := range reg.Instances {
+		running := isRunning(inst.PID)
+		badge := "badge-loaded"
+		status := "Loaded"
+		if !running {
+			badge = "badge-unloaded"
+			status = "Unloaded"
+		}
+		vram := inst.EstimatedVramMB
+		if vram == 0 {
+			vram = cfg.Models[inst.Name].VramMB
+		}
+		fmt.Fprintf(w, `<tr>
+		<td>%s</td>
+		<td><span class="badge %s">%s</span></td>
+		<td>%d MB</td>
+		<td>%d</td>
+		<td>`, inst.Name, badge, status, vram, inst.Port)
+		if running {
+			fmt.Fprintf(w, `<button class="btn btn-unload" hx-post="/api/ui/unload/%s" hx-target="closest tr" hx-swap="outerHTML">Unload</button>`, inst.Name)
+		} else {
+			fmt.Fprintf(w, `<button class="btn btn-load" hx-post="/api/ui/load/%s" hx-target="closest tr" hx-swap="outerHTML">Load</button>`, inst.Name)
+		}
+		fmt.Fprintf(w, `</td></tr>`)
+	}
+	fmt.Fprint(w, `</table>`)
+	if len(reg.Instances) == 0 {
+		fmt.Fprint(w, "<p style='color:#64748b;padding:0.5rem 0;'>No models loaded</p>")
+	}
+}
+
+func handleUILoad(w http.ResponseWriter, r *http.Request, cfg Config) {
+	name := strings.TrimPrefix(r.URL.Path, "/api/ui/load/")
+	addEvent(fmt.Sprintf("Loading model %q", name))
+	_, _, err := autoswitchModel(cfg, name)
+	if err != nil {
+		w.Header().Set("Content-Type", "text/html")
+		fmt.Fprintf(w, `<td colspan="5" style="color:#fca5a5;">Error: %v</td>`, err)
+		return
+	}
+	addEvent(fmt.Sprintf("Loaded model %q", name))
+	w.Header().Set("Content-Type", "text/html")
+	w.Write([]byte("<tr><td colspan='5' style='color:#6ee7b7;'>✓ Loaded</td></tr>"))
+}
+
+func handleUIUnload(w http.ResponseWriter, r *http.Request, cfg Config) {
+	name := strings.TrimPrefix(r.URL.Path, "/api/ui/unload/")
+	addEvent(fmt.Sprintf("Unloading model %q", name))
+	reg := loadRegistry()
+	inst := reg.FindByName(name)
+	if inst == nil {
+		w.Header().Set("Content-Type", "text/html")
+		fmt.Fprintf(w, `<td colspan="5" style="color:#fca5a5;">Model not found</td>`)
+		return
+	}
+	stopProcess(inst.PID)
+	reg.Remove(name)
+	saveRegistry(reg)
+	addEvent(fmt.Sprintf("Unloaded model %q", name))
+	w.Header().Set("Content-Type", "text/html")
+	w.Write([]byte("<tr><td colspan='5' style='color:#6ee7b7;'>✓ Unloaded</td></tr>"))
+}
+
+func handleUILogs(w http.ResponseWriter, cfg Config) {
+	eventsMu.Lock()
+	defer eventsMu.Unlock()
+	w.Header().Set("Content-Type", "text/html")
+	for _, e := range proxyEvents {
+		fmt.Fprintf(w, `<div class="log-entry"><span class="log-time">%s</span></div>`, e)
+	}
+}
+
 func startProxy(cfg Config) {
 	reg := loadRegistry()
 	reg.CleanDead()
@@ -1021,6 +1143,34 @@ func startProxy(cfg Config) {
 		if r.URL.Path == "/health" {
 			w.Header().Set("Content-Type", "application/json")
 			w.Write([]byte(`{"status":"ok"}`))
+			return
+		}
+
+		// Web UI
+		if r.URL.Path == "/ui" || r.URL.Path == "/ui/" {
+			data, _ := webFS.ReadFile("web/index.html")
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			w.Write(data)
+			return
+		}
+		if strings.HasPrefix(r.URL.Path, "/api/ui/vram") {
+			handleUIVRAM(w, cfg)
+			return
+		}
+		if strings.HasPrefix(r.URL.Path, "/api/ui/models") {
+			handleUIModels(w, cfg)
+			return
+		}
+		if strings.HasPrefix(r.URL.Path, "/api/ui/load/") && r.Method == "POST" {
+			handleUILoad(w, r, cfg)
+			return
+		}
+		if strings.HasPrefix(r.URL.Path, "/api/ui/unload/") && r.Method == "POST" {
+			handleUIUnload(w, r, cfg)
+			return
+		}
+		if strings.HasPrefix(r.URL.Path, "/api/ui/logs") {
+			handleUILogs(w, cfg)
 			return
 		}
 
@@ -1120,6 +1270,8 @@ func startProxy(cfg Config) {
 	addr := fmt.Sprintf("%s:%d", cfg.Host, cfg.Port)
 	fmt.Printf("Proxy listening on %s\n", addr)
 	fmt.Printf("  API: http://%s:%d/v1\n", displayHost(cfg.Host), cfg.Port)
+	fmt.Printf("  UI:  http://%s:%d/ui\n", displayHost(cfg.Host), cfg.Port)
+	addEvent("Proxy started")
 	fmt.Println("  Routes:")
 
 	mu.RLock()
