@@ -38,21 +38,38 @@ const (
 // ═══════════════════════════════════════════════════════════════════════════
 
 type ModelConfig struct {
-	ServerBin     *string  `json:"server_bin,omitempty"`
-	GpuLayers     *int     `json:"gpu_layers,omitempty"`
-	CtxSize       *int     `json:"ctx_size,omitempty"`
-	Mmproj        string   `json:"mmproj,omitempty"`
-	ExtraArgs     []string `json:"extra_args,omitempty"`
-	AutoLoad      bool     `json:"auto_load,omitempty"`
-	AutoUnload    bool     `json:"auto_unload,omitempty"`
-	ForceAutoLoad bool     `json:"force_auto_load,omitempty"`
-	VramMB        int      `json:"vram_mb,omitempty"`
+	ServerBin  *string  `json:"server_bin,omitempty"`
+	GpuLayers  *int     `json:"gpu_layers,omitempty"`
+	CtxSize    *int     `json:"ctx_size,omitempty"`
+	Mmproj     string   `json:"mmproj,omitempty"`
+	ExtraArgs  []string `json:"extra_args,omitempty"`
+	AutoLoad   bool     `json:"auto_load,omitempty"`
+	AutoUnload bool     `json:"auto_unload,omitempty"`
+	VramMB     int      `json:"vram_mb,omitempty"`
 }
 
 type AutoswitchConfig struct {
 	Enabled           bool `json:"enabled,omitempty"`
 	TotalVramMB       int  `json:"total_vram_mb,omitempty"`
 	StartupTimeoutSec int  `json:"startup_timeout_sec,omitempty"`
+}
+
+func validateAutoswitchConfig(cfg Config) error {
+	if !cfg.Autoswitch.Enabled {
+		return nil
+	}
+	var errors []string
+	for name, mc := range cfg.Models {
+		if mc.AutoLoad || mc.AutoUnload {
+			if mc.VramMB <= 0 {
+				errors = append(errors, fmt.Sprintf("  model %q has auto_load/auto_unload but vram_mb is not set", name))
+			}
+		}
+	}
+	if len(errors) > 0 {
+		return fmt.Errorf("autoswitch config errors:\n%s", strings.Join(errors, "\n"))
+	}
+	return nil
 }
 
 type Config struct {
@@ -756,133 +773,57 @@ func autoswitchStartupTimeout(cfg Config) time.Duration {
 	return 60 * time.Second
 }
 
-func estimateModelVramMB(modelPath string, ctxSize int, overrideMB int) (int, error) {
-	if overrideMB > 0 {
-		return overrideMB, nil
-	}
-	info, err := os.Stat(modelPath)
-	if err != nil {
-		return 0, err
-	}
-	fileMB := int((info.Size() + 1024*1024 - 1) / (1024 * 1024))
-	if fileMB < 1 {
-		fileMB = 1
-	}
-	ctxBlocks := (ctxSize + 8191) / 8192
-	if ctxBlocks < 1 {
-		ctxBlocks = 1
-	}
-	ctxOverhead := ctxBlocks * 128
-	return fileMB + ctxOverhead, nil
-}
-
-func parseNvidiaSMIMemory(output string) []int {
-	var values []int
-	for _, line := range strings.Split(output, "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
-		fields := strings.FieldsFunc(line, func(r rune) bool {
-			return r == ',' || r == ' ' || r == '\t'
-		})
-		if len(fields) == 0 {
-			continue
-		}
-		n, err := strconv.Atoi(fields[0])
-		if err == nil && n > 0 {
-			values = append(values, n)
-		}
-	}
-	return values
-}
-
-func parseDarwinVRAM(output string) []int {
-	var values []int
-	var walk func(interface{})
-	walk = func(v interface{}) {
-		switch x := v.(type) {
-		case map[string]interface{}:
-			for k, val := range x {
-				lower := strings.ToLower(k)
-				if strings.Contains(lower, "vram") || strings.Contains(lower, "spdisplays_vram") {
-					if mb := vramValueMB(val); mb > 0 {
-						values = append(values, mb)
-					}
-				}
-				walk(val)
-			}
-		case []interface{}:
-			for _, val := range x {
-				walk(val)
-			}
-		}
-	}
-	var parsed interface{}
-	if json.Unmarshal([]byte(output), &parsed) == nil {
-		walk(parsed)
-	}
-	return values
-}
-
-func vramValueMB(v interface{}) int {
-	switch x := v.(type) {
-	case float64:
-		return int(x)
-	case string:
-		lower := strings.ToLower(strings.ReplaceAll(x, ",", ""))
-		fields := strings.Fields(lower)
-		if len(fields) == 0 {
-			return 0
-		}
-		n, err := strconv.ParseFloat(fields[0], 64)
-		if err != nil {
-			return 0
-		}
-		if strings.Contains(lower, "gb") {
-			return int(n * 1024)
-		}
-		return int(n)
-	default:
-		return 0
-	}
-}
-
-func largestInt(values []int) int {
-	largest := 0
-	for _, v := range values {
-		if v > largest {
-			largest = v
-		}
-	}
-	return largest
-}
-
-func detectGPUCapacityMB() (int, error) {
-	if runtime.GOOS == "linux" {
-		out, err := exec.Command("nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits").Output()
-		if err == nil {
-			if largest := largestInt(parseNvidiaSMIMemory(string(out))); largest > 0 {
-				return largest, nil
-			}
-		}
-	}
-	if runtime.GOOS == "darwin" {
-		out, err := exec.Command("system_profiler", "SPDisplaysDataType", "-json").Output()
-		if err == nil {
-			if largest := largestInt(parseDarwinVRAM(string(out))); largest > 0 {
-				return largest, nil
-			}
-		}
-	}
-	return 0, fmt.Errorf("could not detect GPU memory; set autoswitch.total_vram_mb")
-}
-
-func autoswitchCapacityMB(cfg Config) (int, error) {
+// gpuTotalVramMB returns total VRAM of GPU 0 from nvidia-smi, or the config override.
+func gpuTotalVramMB(cfg Config) (int, error) {
 	if cfg.Autoswitch.TotalVramMB > 0 {
 		return cfg.Autoswitch.TotalVramMB, nil
 	}
-	return detectGPUCapacityMB()
+	out, err := exec.Command("nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits").Output()
+	if err != nil {
+		return 0, fmt.Errorf("cannot detect GPU VRAM (nvidia-smi failed: %v); set autoswitch.total_vram_mb in config", err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	if len(lines) == 0 || strings.TrimSpace(lines[0]) == "" {
+		return 0, fmt.Errorf("nvidia-smi returned empty output; set autoswitch.total_vram_mb in config")
+	}
+	val, err := strconv.Atoi(strings.TrimSpace(lines[0]))
+	if err != nil {
+		return 0, fmt.Errorf("cannot parse nvidia-smi output %q; set autoswitch.total_vram_mb in config", lines[0])
+	}
+	if val <= 0 {
+		return 0, fmt.Errorf("nvidia-smi reported %d MB for GPU 0, refusing; set autoswitch.total_vram_mb in config", val)
+	}
+	return val, nil
+}
+
+// gpuUsedVramMB returns currently used VRAM on GPU 0 from nvidia-smi.
+func gpuUsedVramMB() (int, error) {
+	out, err := exec.Command("nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits").Output()
+	if err != nil {
+		return 0, fmt.Errorf("cannot read GPU usage (nvidia-smi failed: %v)", err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	if len(lines) == 0 || strings.TrimSpace(lines[0]) == "" {
+		return 0, fmt.Errorf("nvidia-smi returned empty output for memory.used")
+	}
+	return strconv.Atoi(strings.TrimSpace(lines[0]))
+}
+
+// autoswitchAvailableMB returns available VRAM on GPU 0.
+func autoswitchAvailableMB(cfg Config) (int, error) {
+	total, err := gpuTotalVramMB(cfg)
+	if err != nil {
+		return 0, err
+	}
+	used, err := gpuUsedVramMB()
+	if err != nil {
+		return 0, err
+	}
+	avail := total - used
+	if avail < 0 {
+		avail = 0
+	}
+	return avail, nil
 }
 
 func formatRegistryTime(ts int64) string {
@@ -892,23 +833,11 @@ func formatRegistryTime(ts int64) string {
 	return time.Unix(ts, 0).Format(time.RFC3339)
 }
 
-func instanceEstimatedVramMB(inst Instance) int {
-	if inst.EstimatedVramMB > 0 {
-		return inst.EstimatedVramMB
-	}
-	if v, err := estimateModelVramMB(inst.Model, inst.CtxSize, 0); err == nil {
-		return v
-	}
-	return 0
-}
-
-func autoswitchEvictionPlan(reg Registry, targetName string, requiredMB, capacityMB int) ([]Instance, int, bool) {
-	used := 0
-	for _, inst := range reg.Instances {
-		used += instanceEstimatedVramMB(inst)
-	}
-	if used+requiredMB <= capacityMB {
-		return nil, capacityMB - used, true
+// autoswitchEvictionPlan checks if requiredMB fits in availableMB.
+// If not, returns a list of auto_unload instances to evict (sorted oldest first).
+func autoswitchEvictionPlan(reg Registry, targetName string, requiredMB, availableMB int) ([]Instance, bool) {
+	if availableMB >= requiredMB {
+		return nil, true
 	}
 
 	candidates := make([]Instance, 0)
@@ -924,24 +853,7 @@ func autoswitchEvictionPlan(reg Registry, targetName string, requiredMB, capacit
 		return candidates[i].LastUsedAt < candidates[j].LastUsedAt
 	})
 
-	var evict []Instance
-	freeMB := capacityMB - used
-	for _, inst := range candidates {
-		evict = append(evict, inst)
-		freeMB += instanceEstimatedVramMB(inst)
-		if freeMB >= requiredMB {
-			return evict, freeMB, true
-		}
-	}
-	return evict, freeMB, false
-}
-
-func autoswitchEvictionDecision(reg Registry, targetName string, requiredMB, capacityMB int, force bool) ([]Instance, int, error) {
-	evict, freeMB, ok := autoswitchEvictionPlan(reg, targetName, requiredMB, capacityMB)
-	if !ok && !force {
-		return evict, freeMB, fmt.Errorf("model %q needs about %d MB, but only %d MB is available after evicting auto_unload models", targetName, requiredMB, freeMB)
-	}
-	return evict, freeMB, nil
+	return candidates, len(candidates) > 0
 }
 
 func shouldFallbackToDefault(targetName string, autoswitchErr error) bool {
@@ -1002,30 +914,38 @@ func autoswitchModel(cfg Config, targetName string) (*url.URL, string, error) {
 	if !mc.AutoLoad {
 		return nil, "", fmt.Errorf("model %q is not configured with auto_load", targetName)
 	}
-	forceAutoLoad := mc.ForceAutoLoad
-
-	requiredMB, err := estimateModelVramMB(spec.ModelPath, spec.Config.CtxSize, mc.VramMB)
-	if err != nil {
-		return nil, "", fmt.Errorf("cannot estimate memory for %q: %w", targetName, err)
-	}
-	capacityMB, err := autoswitchCapacityMB(cfg)
-	if err != nil {
-		if !forceAutoLoad {
-			return nil, "", err
-		}
-	}
+	requiredMB := mc.VramMB
 
 	reg := loadRegistry()
 	reg.CleanDead()
-	if capacityMB > 0 {
-		evict, _, err := autoswitchEvictionDecision(reg, spec.InstanceName, requiredMB, capacityMB, forceAutoLoad)
+
+	availableMB, err := autoswitchAvailableMB(cfg)
+	if err != nil {
+		return nil, "", err
+	}
+
+	if availableMB < requiredMB {
+		candidates, hasCandidates := autoswitchEvictionPlan(reg, spec.InstanceName, requiredMB, availableMB)
+		if !hasCandidates {
+			return nil, "", fmt.Errorf("model %q needs %d MB but only %d MB available on GPU 0, no auto_unload models to evict", targetName, requiredMB, availableMB)
+		}
+		evicted := 0
+		for _, inst := range candidates {
+			if err := unloadInstance(inst.Name, false); err != nil {
+				return nil, "", fmt.Errorf("failed to evict %q: %w", inst.Name, err)
+			}
+			evicted++
+			newAvail, checkErr := autoswitchAvailableMB(cfg)
+			if checkErr == nil && newAvail >= requiredMB {
+				break
+			}
+		}
+		availableMB, err = autoswitchAvailableMB(cfg)
 		if err != nil {
 			return nil, "", err
 		}
-		for _, inst := range evict {
-			if err := unloadInstance(inst.Name, false); err != nil {
-				return nil, "", err
-			}
+		if availableMB < requiredMB {
+			return nil, "", fmt.Errorf("model %q needs %d MB but only %d MB available after evicting %d auto_unload models", targetName, requiredMB, availableMB, evicted)
 		}
 	}
 
@@ -1053,6 +973,11 @@ func autoswitchModel(cfg Config, targetName string) (*url.URL, string, error) {
 func startProxy(cfg Config) {
 	reg := loadRegistry()
 	reg.CleanDead()
+
+	if err := validateAutoswitchConfig(cfg); err != nil {
+		fmt.Fprintf(os.Stderr, "Config error: %v\n", err)
+		os.Exit(1)
+	}
 
 	if len(reg.Instances) == 0 && !hasAutoLoadModels(cfg) {
 		fmt.Fprintln(os.Stderr, "Error: no models loaded. Use `llmctl load <model>` first.")
@@ -1418,8 +1343,8 @@ func loadInstance(cfg Config, opts loadOptions) (Instance, bool, error) {
 			if !autoUnload {
 				autoUnload = mc.AutoUnload
 			}
-			if estimatedVramMB == 0 && (mc.AutoLoad || mc.AutoUnload || mc.ForceAutoLoad || mc.VramMB > 0) {
-				estimatedVramMB, _ = estimateModelVramMB(spec.ModelPath, cfg.CtxSize, mc.VramMB)
+			if estimatedVramMB == 0 && mc.VramMB > 0 {
+				estimatedVramMB = mc.VramMB
 			}
 		}
 	}
@@ -2139,9 +2064,6 @@ func cmdConfig(cfg Config) {
 			}
 			if mc.AutoUnload {
 				fmt.Printf("      auto_unload: %t\n", mc.AutoUnload)
-			}
-			if mc.ForceAutoLoad {
-				fmt.Printf("      force_auto_load: %t\n", mc.ForceAutoLoad)
 			}
 			if mc.VramMB > 0 {
 				fmt.Printf("      vram_mb:     %d\n", mc.VramMB)
