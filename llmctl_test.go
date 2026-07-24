@@ -1,6 +1,9 @@
 package main
 
 import (
+	"bytes"
+	"encoding/json"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -40,6 +43,36 @@ func writeLocalModel(t *testing.T, path string) string {
 		t.Fatal(err)
 	}
 	return path
+}
+
+func writeSizedModel(t *testing.T, path string, size int64) string {
+	t.Helper()
+	path = writeLocalModel(t, path)
+	if err := os.Truncate(path, size); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+type responseRecorder struct {
+	header http.Header
+	body   bytes.Buffer
+	status int
+}
+
+func (r *responseRecorder) Header() http.Header {
+	if r.header == nil {
+		r.header = http.Header{}
+	}
+	return r.header
+}
+
+func (r *responseRecorder) Write(b []byte) (int, error) {
+	return r.body.Write(b)
+}
+
+func (r *responseRecorder) WriteHeader(status int) {
+	r.status = status
 }
 
 func TestResolveModelDistinguishesSameHFFileNameByRepo(t *testing.T) {
@@ -257,5 +290,158 @@ func TestParsePullTargetNestedFile(t *testing.T) {
 	}
 	if user != "unsloth" || repoName != "Repo-GGUF" || repoID != "unsloth/Repo-GGUF" || file != "subdir/model.gguf" {
 		t.Fatalf("parsePullTarget() = %q %q %q %q", user, repoName, repoID, file)
+	}
+}
+
+func TestAutoswitchConfigParsing(t *testing.T) {
+	var cfg Config
+	data := []byte(`{
+		"autoswitch": {"enabled": true, "total_vram_mb": 24576, "startup_timeout_sec": 90},
+		"models": {
+			"qwen": {"auto_load": true, "auto_unload": true, "force_auto_load": true, "vram_mb": 18000}
+		}
+	}`)
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Autoswitch.Enabled || cfg.Autoswitch.TotalVramMB != 24576 || cfg.Autoswitch.StartupTimeoutSec != 90 {
+		t.Fatalf("autoswitch config = %+v", cfg.Autoswitch)
+	}
+	mc := cfg.Models["qwen"]
+	if !mc.AutoLoad || !mc.AutoUnload || !mc.ForceAutoLoad || mc.VramMB != 18000 {
+		t.Fatalf("model autoswitch config = %+v", mc)
+	}
+}
+
+func TestEstimateModelVramUsesOverride(t *testing.T) {
+	root := t.TempDir()
+	model := writeSizedModel(t, filepath.Join(root, "tiny.gguf"), 1024*1024)
+
+	got, err := estimateModelVramMB(model, 4096, 12345)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != 12345 {
+		t.Fatalf("estimateModelVramMB() = %d, want override", got)
+	}
+}
+
+func TestEstimateModelVramUsesFileSizeAndCtx(t *testing.T) {
+	root := t.TempDir()
+	model := writeSizedModel(t, filepath.Join(root, "model.gguf"), 64*1024*1024)
+
+	got, err := estimateModelVramMB(model, 65536, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != 1088 {
+		t.Fatalf("estimateModelVramMB() = %d, want 1088", got)
+	}
+}
+
+func TestParseNvidiaSMIMemory(t *testing.T) {
+	got := parseNvidiaSMIMemory("24576\n8192 MiB\n")
+	if largestInt(got) != 24576 {
+		t.Fatalf("largest parsed nvidia memory = %d, want 24576 (all=%v)", largestInt(got), got)
+	}
+}
+
+func TestParseDarwinVRAM(t *testing.T) {
+	out := `{"SPDisplaysDataType":[{"sppci_model":"GPU A","spdisplays_vram":"8 GB"},{"sppci_model":"GPU B","spdisplays_vram":"24576 MB"}]}`
+	got := parseDarwinVRAM(out)
+	if largestInt(got) != 24576 {
+		t.Fatalf("largest parsed darwin memory = %d, want 24576 (all=%v)", largestInt(got), got)
+	}
+}
+
+func TestAutoswitchEvictionPlanEvictsLRUAutoUnloadOnly(t *testing.T) {
+	reg := Registry{Instances: []Instance{
+		{Name: "pinned", EstimatedVramMB: 6000, AutoUnload: false, LastUsedAt: 1},
+		{Name: "old", EstimatedVramMB: 5000, AutoUnload: true, LastUsedAt: 2},
+		{Name: "new", EstimatedVramMB: 5000, AutoUnload: true, LastUsedAt: 3},
+	}}
+
+	evict, free, ok := autoswitchEvictionPlan(reg, "target", 6000, 12000)
+	if !ok {
+		t.Fatalf("eviction plan did not fit; free=%d evict=%v", free, evict)
+	}
+	if len(evict) != 2 || evict[0].Name != "old" || evict[1].Name != "new" {
+		t.Fatalf("eviction order = %+v, want old,new", evict)
+	}
+}
+
+func TestAutoswitchEvictionPlanRefusesPinnedModels(t *testing.T) {
+	reg := Registry{Instances: []Instance{
+		{Name: "pinned", EstimatedVramMB: 9000, AutoUnload: false, LastUsedAt: 1},
+		{Name: "old", EstimatedVramMB: 1000, AutoUnload: true, LastUsedAt: 2},
+	}}
+
+	evict, free, ok := autoswitchEvictionPlan(reg, "target", 6000, 10000)
+	if ok {
+		t.Fatalf("eviction plan fit unexpectedly; free=%d evict=%v", free, evict)
+	}
+	if len(evict) != 1 || evict[0].Name != "old" {
+		t.Fatalf("eviction candidates = %+v, want only old", evict)
+	}
+}
+
+func TestAutoswitchEvictionDecisionAllowsForcedOverCapacity(t *testing.T) {
+	reg := Registry{Instances: []Instance{
+		{Name: "pinned", EstimatedVramMB: 9000, AutoUnload: false, LastUsedAt: 1},
+		{Name: "old", EstimatedVramMB: 1000, AutoUnload: true, LastUsedAt: 2},
+	}}
+
+	evict, free, err := autoswitchEvictionDecision(reg, "target", 6000, 10000, true)
+	if err != nil {
+		t.Fatalf("forced eviction decision returned error: %v", err)
+	}
+	if free != 1000 {
+		t.Fatalf("free = %d, want 1000", free)
+	}
+	if len(evict) != 1 || evict[0].Name != "old" {
+		t.Fatalf("eviction candidates = %+v, want only old", evict)
+	}
+}
+
+func TestExplicitModelWithAutoswitchErrorDoesNotFallbackToDefault(t *testing.T) {
+	if shouldFallbackToDefault("qwen3627b_code", os.ErrNotExist) {
+		t.Fatal("explicit model with autoswitch error should not fall back to default")
+	}
+}
+
+func TestMissingModelCanFallbackToDefault(t *testing.T) {
+	if !shouldFallbackToDefault("", nil) {
+		t.Fatal("request without model should fall back to default")
+	}
+	if !shouldFallbackToDefault("loaded-model", nil) {
+		t.Fatal("request with no autoswitch error may use existing default fallback behavior")
+	}
+}
+
+func TestHandleListModelsIncludesAutoLoadModels(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	cfg := testConfig(t.TempDir())
+	cfg.Models = map[string]ModelConfig{
+		"autoload": {AutoLoad: true},
+		"manual":   {},
+	}
+
+	rec := &responseRecorder{}
+	handleListModels(rec, cfg)
+
+	var body struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(rec.body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	var ids []string
+	for _, m := range body.Data {
+		ids = append(ids, m.ID)
+	}
+	if strings.Join(ids, ",") != "autoload" {
+		t.Fatalf("/v1/models ids = %v, want [autoload]", ids)
 	}
 }

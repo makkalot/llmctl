@@ -9,7 +9,7 @@
 ```sh
 make build          # cross-compile all 4 targets (darwin/linux × amd64/arm64) into ./bin/
 make lint           # go vet + golangci-lint (default config, no .golangci.yml)
-make test           # go test -v ./... (no tests exist yet)
+make test           # go test -v ./... (~28 tests in llmctl_test.go)
 make install        # build + copy current-platform binary to /usr/local/bin/llmctl
 ```
 
@@ -31,7 +31,7 @@ Everything lives in `llmctl.go` under `package main`. Sections are separated by 
 
 - **No sub-packages.** Do not create new Go files or packages — all code goes in `llmctl.go`.
 - **No third-party deps.** Do not add `require` entries to `go.mod`. Use only the standard library.
-- **No tests yet.** `_test.go` files don't exist. If adding tests, they go in the root alongside `llmctl.go`.
+- **Tests** live in `llmctl_test.go` in the root (~28 tests). Covers model resolution, HF cache layout, alias/config key matching, pull target parsing, autoswitch VRAM estimation & eviction logic, and proxy model listing. Add new tests there — same `package main`, no external deps.
 - **Runtime state** is file-based JSON in `$HOME` (`~/.llmctl.json`, `~/.llmctl.registry.json`, `~/.llmctl-logs/`).
 - **Process management** detaches backends with `Setsid: true` and uses SIGTERM → SIGKILL.
 - **Fuzzy matching** is used for model/instance resolution (case-insensitive substring). Don't break this contract.
