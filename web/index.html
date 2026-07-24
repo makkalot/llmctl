@@ -1,111 +1,176 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>llmctl Dashboard</title>
-    <script src="https://unpkg.com/htmx.org@1.9.10"></script>
-    <style>
-        * { box-sizing: border-box; margin: 0; padding: 0; }
-        body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            background: #0f172a;
-            color: #e2e8f0;
-            padding: 2rem;
-        }
-        .container { max-width: 900px; margin: 0 auto; }
-        h1 { font-size: 1.5rem; margin-bottom: 1.5rem; color: #38bdf8; }
-        h2 { font-size: 1.1rem; margin-bottom: 0.75rem; color: #94a3b8; }
-        .card {
-            background: #1e293b;
-            border-radius: 8px;
-            padding: 1.25rem;
-            margin-bottom: 1rem;
-            border: 1px solid #334155;
-        }
-        .vram-bar {
-            height: 24px;
-            background: #334155;
-            border-radius: 4px;
-            overflow: hidden;
-            margin-top: 0.5rem;
-        }
-        .vram-fill {
-            height: 100%;
-            background: linear-gradient(90deg, #38bdf8, #818cf8);
-            transition: width 0.3s ease;
-        }
-        .stats {
-            display: grid;
-            grid-template-columns: repeat(3, 1fr);
-            gap: 1rem;
-            margin-top: 0.75rem;
-        }
-        .stat { text-align: center; }
-        .stat-value { font-size: 1.5rem; font-weight: bold; color: #38bdf8; }
-        .stat-label { font-size: 0.75rem; color: #64748b; margin-top: 0.25rem; }
-        table { width: 100%; border-collapse: collapse; }
-        th { text-align: left; padding: 0.5rem; color: #64748b; font-size: 0.75rem; text-transform: uppercase; }
-        td { padding: 0.5rem; border-top: 1px solid #334155; }
-        .badge {
-            display: inline-block;
-            padding: 0.15rem 0.5rem;
-            border-radius: 4px;
-            font-size: 0.75rem;
-            font-weight: 600;
-        }
-        .badge-loaded { background: #065f46; color: #6ee7b7; }
-        .badge-unloaded { background: #7c2d12; color: #fca5a5; }
-        .btn {
-            background: #334155;
-            color: #e2e8f0;
-            border: none;
-            padding: 0.25rem 0.75rem;
-            border-radius: 4px;
-            cursor: pointer;
-            font-size: 0.75rem;
-            margin-right: 0.25rem;
-        }
-        .btn:hover { background: #475569; }
-        .btn-load { background: #065f46; }
-        .btn-load:hover { background: #047857; }
-        .btn-unload { background: #7c2d12; }
-        .btn-unload:hover { background: #991b1b; }
-        .log {
-            background: #0f172a;
-            border-radius: 4px;
-            padding: 0.75rem;
-            font-family: monospace;
-            font-size: 0.75rem;
-            max-height: 200px;
-            overflow-y: auto;
-            color: #94a3b8;
-        }
-        .log-entry { margin-bottom: 0.25rem; }
-        .log-time { color: #475569; }
-    </style>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>llmctl Dashboard</title>
+<script src="https://unpkg.com/htmx.org@2.0.4"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.14.8/dist/cdn.min.js"></script>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#0b0f19;color:#e2e8f0;padding:1.5rem}
+.wrap{max-width:860px;margin:0 auto}
+header{display:flex;align-items:center;justify-content:space-between;margin-bottom:1.5rem}
+header h1{font-size:1.35rem;color:#38bdf8}
+header .ver{font-size:.7rem;color:#475569}
+.card{background:#131927;border:1px solid #1e293b;border-radius:10px;padding:1.25rem;margin-bottom:1rem}
+.card h2{font-size:.8rem;text-transform:uppercase;letter-spacing:.06em;color:#64748b;margin-bottom:.75rem}
+.grid3{display:grid;grid-template-columns:repeat(3,1fr);gap:.75rem}
+.stat{text-align:center;padding:.5rem}
+.stat .val{font-size:1.6rem;font-weight:700;color:#38bdf8}
+.stat .lbl{font-size:.7rem;color:#475569;margin-top:.15rem}
+.bar{height:8px;background:#1e293b;border-radius:4px;overflow:hidden;margin-top:.75rem}
+.bar .fill{height:100%;border-radius:4px;transition:width .4s ease}
+.bar .fill.ok{background:linear-gradient(90deg,#22d3ee,#818cf8)}
+.bar .fill.warn{background:linear-gradient(90deg,#facc15,#f97316)}
+.bar .fill.hot{background:linear-gradient(90deg,#f87171,#ef4444)}
+table{width:100%;border-collapse:collapse}
+th{text-align:left;padding:.4rem .5rem;font-size:.7rem;color:#475569;text-transform:uppercase;letter-spacing:.04em}
+td{padding:.55rem .5rem;border-top:1px solid #1e293b;font-size:.85rem}
+.badge{display:inline-block;padding:.12rem .5rem;border-radius:4px;font-size:.7rem;font-weight:600}
+.on{background:#052e16;color:#4ade80}
+.off{background:#2a0a0a;color:#f87171}
+.btn{background:#1e293b;color:#cbd5e1;border:1px solid #334155;padding:.2rem .6rem;border-radius:5px;cursor:pointer;font-size:.72rem;margin-right:.3rem;transition:background .15s}
+.btn:hover{background:#334155}
+.btn.go{background:#052e16;border-color:#166534;color:#4ade80}
+.btn.go:hover{background:#064e2b}
+.btn.stop{background:#2a0a0a;border-color:#7f1d1d;color:#f87171}
+.btn.stop:hover{background:#450a0a}
+.btn:disabled{opacity:.4;cursor:default}
+.log{background:#0b0f19;border:1px solid #1e293b;border-radius:6px;padding:.6rem;font-family:'Cascadia Code','Fira Code',monospace;font-size:.72rem;max-height:180px;overflow-y:auto;color:#64748b;line-height:1.6}
+.log div{border-bottom:1px solid #131927;padding:.15rem 0}
+.log .ts{color:#334155}
+.empty{text-align:center;padding:1.5rem;color:#334155;font-size:.85rem}
+.spinner{display:inline-block;width:14px;height:14px;border:2px solid #334155;border-top-color:#38bdf8;border-radius:50%;animation:spin .6s linear infinite;margin-right:.4rem;vertical-align:middle}
+@keyframes spin{to{transform:rotate(360deg)}}
+.fade{transition:opacity .3s}
+</style>
 </head>
 <body>
-    <div class="container">
-        <h1>llmctl Dashboard</h1>
+<div class="wrap" x-data="dashboard()">
 
-        <!-- VRAM Status -->
-        <div class="card" hx-get="/api/ui/vram" hx-trigger="every 5s">
-            <h2>GPU VRAM</h2>
-            <div id="vram-status">Loading...</div>
-        </div>
+  <header>
+    <h1>llmctl <span style="font-weight:400;color:#64748b;font-size:.85rem">proxy</span></h1>
+    <span class="ver">v<span x-text="version"></span></span>
+  </header>
 
-        <!-- Models -->
-        <div class="card" hx-get="/api/ui/models" hx-trigger="every 5s">
-            <h2>Models</h2>
-            <div id="models-list">Loading...</div>
-        </div>
-
-        <!-- Logs -->
-        <div class="card">
-            <h2>Recent Events</h2>
-            <div class="log" id="log-container" hx-get="/api/ui/logs" hx-trigger="every 3s"></div>
-        </div>
+  <!-- VRAM -->
+  <div class="card">
+    <h2>GPU VRAM</h2>
+    <div class="grid3">
+      <div class="stat"><div class="val" x-text="vram.total ?? '—'"></div><div class="lbl">Total MB</div></div>
+      <div class="stat"><div class="val" x-text="vram.used ?? '—'"></div><div class="lbl">Used MB</div></div>
+      <div class="stat"><div class="val" x-text="vram.avail ?? '—'"></div><div class="lbl">Available MB</div></div>
     </div>
+    <div class="bar"><div class="fill" :class="barClass" :style="'width:' + pct + '%'"></div></div>
+  </div>
+
+  <!-- Models -->
+  <div class="card">
+    <h2>Models</h2>
+    <template x-if="models.length === 0">
+      <div class="empty">No models loaded</div>
+    </template>
+    <table x-show="models.length > 0">
+      <tr><th>Name</th><th>Status</th><th>VRAM</th><th>Port</th><th></th></tr>
+      <template x-for="m in models" :key="m.name">
+        <tr>
+          <td x-text="m.name"></td>
+          <td><span class="badge" :class="m.running ? 'on' : 'off'" x-text="m.running ? 'Loaded' : 'Unloaded'"></span></td>
+          <td x-text="m.vram + ' MB'"></td>
+          <td x-text="m.port"></td>
+          <td>
+            <button class="btn" :class="m.running ? 'stop' : 'go'"
+                    :disabled="loading === m.name"
+                    @click="toggle(m.name)">
+              <template x-if="loading === m.name"><span class="spinner"></span></template>
+              <span x-text="m.running ? 'Unload' : 'Load'"></span>
+            </button>
+          </td>
+        </tr>
+      </template>
+    </table>
+  </div>
+
+  <!-- Events -->
+  <div class="card">
+    <h2>Events</h2>
+    <div class="log">
+      <template x-for="(e, i) in events.slice(-20)" :key="i">
+        <div><span class="ts" x-text="e.ts"></span> <span x-text="e.msg"></span></div>
+      </template>
+      <template x-if="events.length === 0">
+        <div style="color:#334155">Waiting for events…</div>
+      </template>
+    </div>
+  </div>
+
+</div>
+
+<script>
+function dashboard() {
+  return {
+    version: '0.3.0',
+    vram: {},
+    models: [],
+    events: [],
+    loading: null,
+
+    get pct() {
+      if (!this.vram.total || this.vram.total === 0) return 0;
+      return Math.round((this.vram.used / this.vram.total) * 100);
+    },
+
+    get barClass() {
+      const p = this.pct;
+      if (p > 85) return 'hot';
+      if (p > 60) return 'warn';
+      return 'ok';
+    },
+
+    async fetchVRAM() {
+      try {
+        const r = await fetch('/api/ui/vram');
+        this.vram = await r.json();
+      } catch(e) {}
+    },
+
+    async fetchModels() {
+      try {
+        const r = await fetch('/api/ui/models');
+        this.models = await r.json();
+      } catch(e) {}
+    },
+
+    async fetchEvents() {
+      try {
+        const r = await fetch('/api/ui/logs');
+        this.events = await r.json();
+      } catch(e) {}
+    },
+
+    async toggle(name) {
+      this.loading = name;
+      const m = this.models.find(x => x.name === name);
+      const ep = m?.running ? 'unload' : 'load';
+      try {
+        await fetch('/api/ui/' + ep + '/' + name, { method: 'POST' });
+      } catch(e) {}
+      this.loading = null;
+      // refresh immediately
+      await this.fetchModels();
+      await this.fetchVRAM();
+      await this.fetchEvents();
+    },
+
+    init() {
+      this.fetchVRAM();
+      this.fetchModels();
+      this.fetchEvents();
+      setInterval(() => { this.fetchVRAM(); this.fetchModels(); this.fetchEvents(); }, 4000);
+    }
+  }
+}
+</script>
 </body>
 </html>
