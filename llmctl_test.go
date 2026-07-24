@@ -335,7 +335,7 @@ func TestAutoswitchConfigParsing(t *testing.T) {
 	data := []byte(`{
 		"autoswitch": {"enabled": true, "total_vram_mb": 24576, "startup_timeout_sec": 90},
 		"models": {
-			"qwen": {"auto_load": true, "auto_unload": true, "force_auto_load": true, "vram_mb": 18000}
+			"qwen": {"auto_load": true, "auto_unload": true, "vram_mb": 18000}
 		}
 	}`)
 	if err := json.Unmarshal(data, &cfg); err != nil {
@@ -345,98 +345,28 @@ func TestAutoswitchConfigParsing(t *testing.T) {
 		t.Fatalf("autoswitch config = %+v", cfg.Autoswitch)
 	}
 	mc := cfg.Models["qwen"]
-	if !mc.AutoLoad || !mc.AutoUnload || !mc.ForceAutoLoad || mc.VramMB != 18000 {
+	if mc.AutoLoad && mc.AutoUnload && mc.VramMB == 18000 {
+		// good
+	} else {
 		t.Fatalf("model autoswitch config = %+v", mc)
 	}
 }
 
-func TestEstimateModelVramUsesOverride(t *testing.T) {
-	root := t.TempDir()
-	model := writeSizedModel(t, filepath.Join(root, "tiny.gguf"), 1024*1024)
+func TestValidateAutoswitchConfigRequiresVramMB(t *testing.T) {
+	cfg := Config{Autoswitch: AutoswitchConfig{Enabled: true}}
+	cfg.Models = map[string]ModelConfig{
+		"no-vram":   {AutoLoad: true, AutoUnload: true},
+		"with-vram": {AutoLoad: true, AutoUnload: true, VramMB: 12000},
+	}
+	err := validateAutoswitchConfig(cfg)
+	if err == nil {
+		t.Fatal("expected error for model without vram_mb")
+	}
 
-	got, err := estimateModelVramMB(model, 4096, 12345)
+	cfg.Models["no-vram"].VramMB = 8000
+	err = validateAutoswitchConfig(cfg)
 	if err != nil {
-		t.Fatal(err)
-	}
-	if got != 12345 {
-		t.Fatalf("estimateModelVramMB() = %d, want override", got)
-	}
-}
-
-func TestEstimateModelVramUsesFileSizeAndCtx(t *testing.T) {
-	root := t.TempDir()
-	model := writeSizedModel(t, filepath.Join(root, "model.gguf"), 64*1024*1024)
-
-	got, err := estimateModelVramMB(model, 65536, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got != 1088 {
-		t.Fatalf("estimateModelVramMB() = %d, want 1088", got)
-	}
-}
-
-func TestParseNvidiaSMIMemory(t *testing.T) {
-	got := parseNvidiaSMIMemory("24576\n8192 MiB\n")
-	if largestInt(got) != 24576 {
-		t.Fatalf("largest parsed nvidia memory = %d, want 24576 (all=%v)", largestInt(got), got)
-	}
-}
-
-func TestParseDarwinVRAM(t *testing.T) {
-	out := `{"SPDisplaysDataType":[{"sppci_model":"GPU A","spdisplays_vram":"8 GB"},{"sppci_model":"GPU B","spdisplays_vram":"24576 MB"}]}`
-	got := parseDarwinVRAM(out)
-	if largestInt(got) != 24576 {
-		t.Fatalf("largest parsed darwin memory = %d, want 24576 (all=%v)", largestInt(got), got)
-	}
-}
-
-func TestAutoswitchEvictionPlanEvictsLRUAutoUnloadOnly(t *testing.T) {
-	reg := Registry{Instances: []Instance{
-		{Name: "pinned", EstimatedVramMB: 6000, AutoUnload: false, LastUsedAt: 1},
-		{Name: "old", EstimatedVramMB: 5000, AutoUnload: true, LastUsedAt: 2},
-		{Name: "new", EstimatedVramMB: 5000, AutoUnload: true, LastUsedAt: 3},
-	}}
-
-	evict, free, ok := autoswitchEvictionPlan(reg, "target", 6000, 12000)
-	if !ok {
-		t.Fatalf("eviction plan did not fit; free=%d evict=%v", free, evict)
-	}
-	if len(evict) != 2 || evict[0].Name != "old" || evict[1].Name != "new" {
-		t.Fatalf("eviction order = %+v, want old,new", evict)
-	}
-}
-
-func TestAutoswitchEvictionPlanRefusesPinnedModels(t *testing.T) {
-	reg := Registry{Instances: []Instance{
-		{Name: "pinned", EstimatedVramMB: 9000, AutoUnload: false, LastUsedAt: 1},
-		{Name: "old", EstimatedVramMB: 1000, AutoUnload: true, LastUsedAt: 2},
-	}}
-
-	evict, free, ok := autoswitchEvictionPlan(reg, "target", 6000, 10000)
-	if ok {
-		t.Fatalf("eviction plan fit unexpectedly; free=%d evict=%v", free, evict)
-	}
-	if len(evict) != 1 || evict[0].Name != "old" {
-		t.Fatalf("eviction candidates = %+v, want only old", evict)
-	}
-}
-
-func TestAutoswitchEvictionDecisionAllowsForcedOverCapacity(t *testing.T) {
-	reg := Registry{Instances: []Instance{
-		{Name: "pinned", EstimatedVramMB: 9000, AutoUnload: false, LastUsedAt: 1},
-		{Name: "old", EstimatedVramMB: 1000, AutoUnload: true, LastUsedAt: 2},
-	}}
-
-	evict, free, err := autoswitchEvictionDecision(reg, "target", 6000, 10000, true)
-	if err != nil {
-		t.Fatalf("forced eviction decision returned error: %v", err)
-	}
-	if free != 1000 {
-		t.Fatalf("free = %d, want 1000", free)
-	}
-	if len(evict) != 1 || evict[0].Name != "old" {
-		t.Fatalf("eviction candidates = %+v, want only old", evict)
+		t.Fatalf("unexpected error: %v", err)
 	}
 }
 
