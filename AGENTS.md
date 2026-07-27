@@ -11,6 +11,8 @@ make build          # cross-compile all 4 targets (darwin/linux × amd64/arm64) 
 make lint           # go vet + golangci-lint (default config, no .golangci.yml)
 make test           # go test -v ./... (~28 tests in llmctl_test.go)
 make install        # build + copy current-platform binary to /usr/local/bin/llmctl
+make systemd-install    # install + enable systemd user service (~/.config/systemd/user/llmctl.service)
+make systemd-uninstall  # disable + remove systemd user service
 ```
 
 Build injects version via ldflags: `-X main.appVersion=<git-tag> -X main.buildTime=<ts>`.

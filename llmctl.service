@@ -1,0 +1,16 @@
+[Unit]
+Description=llmctl proxy
+Documentation=https://github.com/makkalot/llmctl
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/llmctl proxy
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

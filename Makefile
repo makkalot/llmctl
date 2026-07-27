@@ -1,4 +1,4 @@
-.PHONY: build clean install lint test
+.PHONY: build clean install lint test systemd-install systemd-uninstall
 
 BINARY_NAME=llmctl
 VERSION=$(shell git describe --always --tags 2>/dev/null || echo "0.2.0")
@@ -38,3 +38,21 @@ lint:
 
 test:
 	go test -v ./...
+
+SERVICE_FILE=llmctl.service
+SERVICE_DEST=$(HOME)/.config/systemd/user/llmctl.service
+
+systemd-install: install
+	@echo "Installing systemd user service..."
+	install -d $(HOME)/.config/systemd/user
+	install -m 644 $(SERVICE_FILE) $(SERVICE_DEST)
+	systemctl --user daemon-reload
+	systemctl --user enable --now llmctl.service
+	@echo "Service installed and started. Use 'systemctl --user status llmctl' to check."
+
+systemd-uninstall:
+	@echo "Removing systemd user service..."
+	systemctl --user disable --now llmctl.service 2>/dev/null || true
+	systemctl --user daemon-reload
+	rm -f $(SERVICE_DEST)
+	@echo "Service removed."

@@ -414,3 +414,16 @@ func TestHandleListModelsIncludesAutoLoadModels(t *testing.T) {
 		t.Fatalf("/v1/models ids = %v, want [autoload]", ids)
 	}
 }
+
+func TestSystemdUnitFile(t *testing.T) {
+	data, err := os.ReadFile("llmctl.service")
+	if err != nil {
+		t.Skipf("llmctl.service not found: %v", err)
+	}
+	content := string(data)
+	for _, want := range []string{"[Unit]", "[Service]", "[Install]", "ExecStart=/usr/local/bin/llmctl proxy", "Restart=always", "WantedBy=default.target"} {
+		if !strings.Contains(content, want) {
+			t.Errorf("unit file missing: %s", want)
+		}
+	}
+}
