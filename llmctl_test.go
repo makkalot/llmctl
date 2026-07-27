@@ -274,8 +274,8 @@ func TestGenerateAPIKey(t *testing.T) {
 	if !strings.HasPrefix(plain, "llmctl_") {
 		t.Fatalf("plain key missing prefix: %q", plain)
 	}
-	if len(plain) != 9+64 { // "llmctl_" + 32 bytes hex
-		t.Fatalf("plain key length = %d, want 73", len(plain))
+	if len(plain) != 7+64 { // "llmctl_" + 32 bytes hex
+		t.Fatalf("plain key length = %d, want 71", len(plain))
 	}
 	// Verify hash matches
 	expected := sha256.Sum256([]byte(plain))
