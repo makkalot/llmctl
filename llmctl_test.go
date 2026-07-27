@@ -1,8 +1,8 @@
 package main
 
 import (
+	"crypto/sha256"
 	"encoding/hex"
-	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
