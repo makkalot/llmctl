@@ -1,10 +1,15 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func intPtr(n int) *int {
@@ -257,5 +262,182 @@ func TestParsePullTargetNestedFile(t *testing.T) {
 	}
 	if user != "unsloth" || repoName != "Repo-GGUF" || repoID != "unsloth/Repo-GGUF" || file != "subdir/model.gguf" {
 		t.Fatalf("parsePullTarget() = %q %q %q %q", user, repoName, repoID, file)
+	}
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Auth tests
+// ═══════════════════════════════════════════════════════════════════════════
+
+func TestGenerateAPIKey(t *testing.T) {
+	plain, hashed := generateAPIKey()
+	if !strings.HasPrefix(plain, "llmctl_") {
+		t.Fatalf("plain key missing prefix: %q", plain)
+	}
+	if len(plain) != 7+64 { // "llmctl_" + 32 bytes hex
+		t.Fatalf("plain key length = %d, want 71", len(plain))
+	}
+	// Verify hash matches
+	expected := sha256.Sum256([]byte(plain))
+	wantHash := hex.EncodeToString(expected[:])
+	if hashed != wantHash {
+		t.Fatalf("hashed = %q, want %q", hashed, wantHash)
+	}
+}
+
+func TestFindAPIKeyByHash(t *testing.T) {
+	keys := []APIKey{
+		{Key: "abc123", Name: "dev"},
+		{Key: "def456", Name: "prod"},
+	}
+	got := findAPIKeyByHash(keys, "def456")
+	if got == nil || got.Name != "prod" {
+		t.Fatalf("findAPIKeyByHash() = %+v, want prod", got)
+	}
+	if findAPIKeyByHash(keys, "nonexistent") != nil {
+		t.Fatal("findAPIKeyByHash() should return nil for missing key")
+	}
+}
+
+func TestRateLimiterAllow(t *testing.T) {
+	rl := newRateLimiter(1*time.Minute, 3)
+
+	// First 3 requests should pass
+	for i := 0; i < 3; i++ {
+		if !rl.allow("key1", 3) {
+			t.Fatalf("request %d should be allowed", i+1)
+		}
+	}
+	// 4th should be blocked
+	if rl.allow("key1", 3) {
+		t.Fatal("4th request should be blocked")
+	}
+	// Different key should still be allowed
+	if !rl.allow("key2", 3) {
+		t.Fatal("different key should be allowed")
+	}
+}
+
+func TestRateLimiterUnlimited(t *testing.T) {
+	rl := newRateLimiter(1*time.Minute, 0)
+	for i := 0; i < 100; i++ {
+		if !rl.allow("key1", 0) {
+			t.Fatalf("unlimited key blocked at request %d", i+1)
+		}
+	}
+}
+
+func TestRateLimiterPerKeyStricterThanGlobal(t *testing.T) {
+	// Global limit = 10, per-key = 2 → should block after 2
+	rl := newRateLimiter(1*time.Minute, 10)
+	for i := 0; i < 2; i++ {
+		if !rl.allow("key1", 2) {
+			t.Fatalf("request %d should be allowed", i+1)
+		}
+	}
+	if rl.allow("key1", 2) {
+		t.Fatal("should use stricter per-key limit (2)")
+	}
+}
+
+func TestAuthMiddlewareRejectsMissingKey(t *testing.T) {
+	cfg := Config{}
+	handler := authMiddleware(cfg, nil, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+	}))
+
+	req := httptest.NewRequest("GET", "/v1/models", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != 401 {
+		t.Fatalf("authMiddleware() = %d, want 401", rec.Code)
+	}
+}
+
+func TestAuthMiddlewareAllowsHealth(t *testing.T) {
+	cfg := Config{}
+	called := false
+	handler := authMiddleware(cfg, nil, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+		w.WriteHeader(200)
+	}))
+
+	req := httptest.NewRequest("GET", "/health", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != 200 || !called {
+		t.Fatalf("health endpoint should bypass auth, got %d called=%v", rec.Code, called)
+	}
+}
+
+func TestAuthMiddlewareAcceptsValidKey(t *testing.T) {
+	plain, hashed := generateAPIKey()
+	cfg := Config{
+		ApiKeys: []APIKey{{Key: hashed, Name: "test", RateLimit: 0}},
+	}
+	called := false
+	handler := authMiddleware(cfg, nil, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+		w.WriteHeader(200)
+	}))
+
+	req := httptest.NewRequest("GET", "/v1/models", nil)
+	req.Header.Set("Authorization", "Bearer "+plain)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != 200 || !called {
+		t.Fatalf("valid key rejected, got %d called=%v", rec.Code, called)
+	}
+}
+
+func TestAuthMiddlewareEnforcesRateLimit(t *testing.T) {
+	plain, hashed := generateAPIKey()
+	cfg := Config{
+		ApiKeys: []APIKey{{Key: hashed, Name: "test", RateLimit: 2}},
+	}
+	rl := newRateLimiter(1*time.Minute, 0)
+	handler := authMiddleware(cfg, rl, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+	}))
+
+	// First 2 should pass
+	for i := 0; i < 2; i++ {
+		req := httptest.NewRequest("GET", "/v1/models", nil)
+		req.Header.Set("Authorization", "Bearer "+plain)
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		if rec.Code != 200 {
+			t.Fatalf("request %d blocked, want 200 got %d", i+1, rec.Code)
+		}
+	}
+	// 3rd should be rate-limited
+	req := httptest.NewRequest("GET", "/v1/models", nil)
+	req.Header.Set("Authorization", "Bearer "+plain)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != 429 {
+		t.Fatalf("rate limit not enforced, got %d want 429", rec.Code)
+	}
+}
+
+func TestAuthMiddlewareRejectsInvalidKey(t *testing.T) {
+	_, hashed := generateAPIKey()
+	cfg := Config{
+		ApiKeys: []APIKey{{Key: hashed, Name: "secret"}},
+	}
+	handler := authMiddleware(cfg, nil, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+	}))
+
+	req := httptest.NewRequest("GET", "/v1/models", nil)
+	req.Header.Set("Authorization", "Bearer llmctl_wrongkey123")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != 401 {
+		t.Fatalf("invalid key accepted, got %d want 401", rec.Code)
 	}
 }

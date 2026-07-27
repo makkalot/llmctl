@@ -226,6 +226,24 @@ llmctl load qwen27b       # instance "qwen27b", default params
 llmctl load qwen27b_code  # instance "qwen27b_code", code-specific params
 ```
 
+## Auth & rate limiting
+
+The proxy supports API key authentication and per-key rate limiting. Keys are stored as SHA-256 hashes in `~/.llmctl.json`.
+
+```sh
+llmctl auth generate <name>          # create a key (prints plain key once)
+llmctl auth list                     # list all keys
+llmctl auth revoke <name>            # remove a key
+```
+
+Pass the plain key as a Bearer token:
+
+```sh
+curl http://localhost:8080/v1/chat/completions   -H "Authorization: Bearer llmctl_xxxxx"   -d '{"model": "mistral", "messages": [...]}'
+```
+
+The `/health` endpoint is always open (no auth required). Per-key rate limits are configurable in `~/.llmctl.json` under `api_keys` (requests per minute, `0` = unlimited).
+
 ## API endpoints
 
 When the proxy is running:
