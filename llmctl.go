@@ -3,6 +3,9 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -45,6 +48,13 @@ type ModelConfig struct {
 	ExtraArgs []string `json:"extra_args,omitempty"`
 }
 
+type APIKey struct {
+	Key      string `json:"key"`       // hashed API key (SHA-256 hex)
+	Name     string `json:"name"`      // human-readable label
+	RateLimit int   `json:"rate_limit"` // requests per minute; 0 = unlimited
+	CreatedAt string `json:"created_at"` // ISO 8601 timestamp
+}
+
 type Config struct {
 	ModelsDir string                 `json:"models_dir"`
 	ServerBin string                 `json:"server_bin"`
@@ -56,6 +66,7 @@ type Config struct {
 	ExtraArgs []string               `json:"extra_args,omitempty"`
 	Aliases   map[string]string      `json:"aliases,omitempty"`
 	Models    map[string]ModelConfig `json:"models,omitempty"`
+	ApiKeys   []APIKey               `json:"api_keys,omitempty"`
 }
 
 func defaultConfig() Config {
@@ -98,6 +109,245 @@ func loadConfig() Config {
 func saveConfig(cfg Config) error {
 	data, _ := json.MarshalIndent(cfg, "", "  ")
 	return os.WriteFile(configPath(), data, 0644)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Auth — API key generation, hashing, validation
+// ═══════════════════════════════════════════════════════════════════════════
+
+func generateAPIKey() (plain string, hashed string) {
+	b := make([]byte, 32)
+	_, _ = rand.Read(b)
+	prefix := "llmctl_"
+	payload := hex.EncodeToString(b)
+	plain = prefix + payload
+	h := sha256.Sum256([]byte(plain))
+	return plain, hex.EncodeToString(h[:])
+}
+
+func findAPIKeyByHash(keys []APIKey, hashed string) *APIKey {
+	for i := range keys {
+		if keys[i].Key == hashed {
+			return &keys[i]
+		}
+	}
+	return nil
+}
+
+// rateLimiter tracks per-key request counts with a sliding window.
+type rateLimiter struct {
+	mu       sync.Mutex
+	records  map[string][]time.Time
+	window   time.Duration
+	maxReqs  int
+}
+
+func newRateLimiter(window time.Duration, maxReqs int) *rateLimiter {
+	return &rateLimiter{
+		records: make(map[string][]time.Time),
+		window:  window,
+		maxReqs: maxReqs,
+	}
+}
+
+// allow checks whether keyID may make a request now given maxReqs in the window.
+func (rl *rateLimiter) allow(keyID string, maxReqs int) bool {
+	if maxReqs <= 0 {
+		return true // unlimited
+	}
+	// Use the stricter of the two limits
+	effectiveLimit := maxReqs
+	if rl.maxReqs > 0 && rl.maxReqs < effectiveLimit {
+		effectiveLimit = rl.maxReqs
+	}
+	if effectiveLimit <= 0 {
+		return true
+	}
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+	now := time.Now()
+	cutoff := now.Add(-rl.window)
+	// Prune old records
+	recs := rl.records[keyID]
+	valid := make([]time.Time, 0, len(recs))
+	for _, t := range recs {
+		if t.After(cutoff) {
+			valid = append(valid, t)
+		}
+	}
+	if len(valid) >= effectiveLimit {
+		rl.records[keyID] = valid
+		return false
+	}
+	valid = append(valid, now)
+	rl.records[keyID] = valid
+	return true
+}
+
+// authMiddleware returns an http.Handler that validates the Authorization header
+// (Bearer <api-key>) against the config's API keys and enforces rate limits.
+func authMiddleware(cfg Config, limiter *rateLimiter, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Allow /health and unauthenticated OPTIONS
+		if r.URL.Path == "/health" || r.Method == "OPTIONS" {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		auth := r.Header.Get("Authorization")
+		if auth == "" {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(401)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"error": map[string]string{
+					"message": "API key required. Use `llmctl auth generate` to create one.",
+					"type":    "invalid_request_error",
+				},
+			})
+			return
+		}
+
+		// Support both "Bearer <key>" and raw key
+		plainKey := strings.TrimPrefix(auth, "Bearer ")
+		if strings.HasPrefix(plainKey, "Bearer ") {
+			plainKey = auth // wasn't Bearer, use as-is
+		}
+
+		h := sha256.Sum256([]byte(plainKey))
+		hashed := hex.EncodeToString(h[:])
+		key := findAPIKeyByHash(cfg.ApiKeys, hashed)
+		if key == nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(401)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"error": map[string]string{
+					"message": "Invalid API key.",
+					"type":    "invalid_request_error",
+				},
+			})
+			return
+		}
+
+		if limiter != nil && !limiter.allow(key.Key, key.RateLimit) {
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("Retry-After", "60")
+			w.WriteHeader(429)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"error": map[string]string{
+					"message": fmt.Sprintf("Rate limit exceeded (%d req/min).", key.RateLimit),
+					"type":    "rate_limit_error",
+				},
+			})
+			return
+		}
+
+		next.ServeHTTP(w, r)
+	})
+}
+
+// cmdAuth handles `llmctl auth <generate|list|revoke>`
+func cmdAuth(args []string) {
+	if len(args) < 1 {
+		fmt.Println("Usage: llmctl auth <generate|list|revoke>")
+		fmt.Println("  generate <name> [--limit N]  Create a new API key (N req/min, 0=unlimited)")
+		fmt.Println("  list                         List all API keys")
+		fmt.Println("  revoke <name>                Revoke an API key by name")
+		os.Exit(1)
+	}
+
+	cfg := loadConfig()
+	switch args[0] {
+	case "generate":
+		cmdAuthGenerate(cfg, args[1:])
+	case "list":
+		cmdAuthList(cfg)
+	case "revoke":
+		cmdAuthRevoke(cfg, args[1:])
+	default:
+		fmt.Fprintf(os.Stderr, "Unknown auth subcommand: %s\n", args[0])
+		os.Exit(1)
+	}
+}
+
+func cmdAuthGenerate(cfg Config, args []string) {
+	name := "default"
+	rateLimit := 60 // default 60 req/min
+	if len(args) > 0 {
+		name = args[0]
+	}
+	for i := 1; i < len(args); i++ {
+		if args[i] == "--limit" && i+1 < len(args) {
+			rateLimit, _ = strconv.Atoi(args[i+1])
+		}
+	}
+
+	// Check if name already exists
+	for _, k := range cfg.ApiKeys {
+		if k.Name == name {
+			fmt.Fprintf(os.Stderr, "Error: API key '%s' already exists. Use a different name or `llmctl auth revoke %s` first.\n", name, name)
+			os.Exit(1)
+		}
+	}
+
+	plain, hashed := generateAPIKey()
+	cfg.ApiKeys = append(cfg.ApiKeys, APIKey{
+		Key:       hashed,
+		Name:      name,
+		RateLimit: rateLimit,
+		CreatedAt: time.Now().UTC().Format(time.RFC3339),
+	})
+	if err := saveConfig(cfg); err != nil {
+		fmt.Fprintf(os.Stderr, "Error saving config: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Println("API key created:")
+	fmt.Printf("  Name:    %s\n", name)
+	fmt.Printf("  Key:     %s\n", plain)
+	fmt.Printf("  Limit:   %s\n", func() string { if rateLimit == 0 { return "unlimited" }; return fmt.Sprintf("%d req/min", rateLimit) }())
+	fmt.Println()
+	fmt.Println("⚠  Save this key now — it will not be shown again.")
+	fmt.Println("   Use it as: Authorization: Bearer <key>")
+}
+
+func cmdAuthList(cfg Config) {
+	if len(cfg.ApiKeys) == 0 {
+		fmt.Println("No API keys configured.")
+		fmt.Println("Run `llmctl auth generate <name>` to create one.")
+		return
+	}
+	fmt.Printf("%-15s %-15s %-10s %s\n", "Name", "Created", "Limit", "Hash (prefix)")
+	fmt.Println(strings.Repeat("-", 70))
+	for _, k := range cfg.ApiKeys {
+		fmt.Printf("%-15s %-15s %-10s %s...\n", k.Name, k.CreatedAt, func() string { if k.RateLimit == 0 { return "unlimited" }; return fmt.Sprintf("%d/min", k.RateLimit) }(), k.Key[:16])
+	}
+}
+
+func cmdAuthRevoke(cfg Config, args []string) {
+	if len(args) < 1 {
+		fmt.Fprintln(os.Stderr, "Usage: llmctl auth revoke <name>")
+		os.Exit(1)
+	}
+	name := args[0]
+	found := false
+	newKeys := make([]APIKey, 0, len(cfg.ApiKeys))
+	for _, k := range cfg.ApiKeys {
+		if k.Name == name {
+			found = true
+			continue
+		}
+		newKeys = append(newKeys, k)
+	}
+	if !found {
+		fmt.Fprintf(os.Stderr, "Error: API key '%s' not found.\n", name)
+		os.Exit(1)
+	}
+	cfg.ApiKeys = newKeys
+	if err := saveConfig(cfg); err != nil {
+		fmt.Fprintf(os.Stderr, "Error saving config: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Printf("Revoked API key '%s'.\n", name)
 }
 
 func mergeExtraArgs(global, perModel []string) []string {
@@ -750,7 +1000,9 @@ func startProxy(cfg Config) {
 		}
 	}()
 
-	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	// Auth middleware + per-key rate limiter
+	limiter := newRateLimiter(1*time.Minute, 0) // global limit disabled; per-key limits used
+	innerHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// GET /v1/models — OpenAI compatible model listing
 		if r.URL.Path == "/v1/models" && r.Method == "GET" {
 			handleListModels(w)
@@ -838,8 +1090,10 @@ func startProxy(cfg Config) {
 		proxy.ServeHTTP(w, r)
 	})
 
+	// Wrap with auth middleware (per-key rate limiting)
+	handler := authMiddleware(cfg, limiter, innerHandler)
+
 	addr := fmt.Sprintf("%s:%d", cfg.Host, cfg.Port)
-	fmt.Printf("Proxy listening on %s\n", addr)
 	fmt.Printf("  API: http://%s:%d/v1\n", displayHost(cfg.Host), cfg.Port)
 	fmt.Println("  Routes:")
 
@@ -1747,6 +2001,11 @@ Config:
   config                      Show config
   set <key> <value>           Update config
 
+Auth:
+  auth generate <name>        Create a new API key
+  auth list                   List all API keys
+  auth revoke <name>          Revoke an API key
+
 Workflow:
   llmctl load mistral                              # backend on :9100
   llmctl load llama3 --name chat                   # backend on :9101
@@ -1834,6 +2093,8 @@ func main() {
 			os.Exit(1)
 		}
 		cmdAlias(cfg, os.Args[2], os.Args[3])
+	case "auth":
+		cmdAuth(os.Args[2:])
 	case "config", "cfg":
 		cmdConfig(cfg)
 	case "set":
