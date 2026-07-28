@@ -7,6 +7,15 @@ on:
     branches: [main]
 
 jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+      - run: make build
+
   test:
     runs-on: ubuntu-latest
     steps:
@@ -24,12 +33,3 @@ jobs:
         with:
           go-version: "1.22"
       - run: go vet ./...
-
-  build:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with:
-          go-version: "1.22"
-      - run: make build
