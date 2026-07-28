@@ -1,6 +1,9 @@
 package main
 
 import (
+	"bytes"
+	"encoding/json"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -42,6 +45,36 @@ func writeLocalModel(t *testing.T, path string) string {
 	return path
 }
 
+func writeSizedModel(t *testing.T, path string, size int64) string {
+	t.Helper()
+	path = writeLocalModel(t, path)
+	if err := os.Truncate(path, size); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+type responseRecorder struct {
+	header http.Header
+	body   bytes.Buffer
+	status int
+}
+
+func (r *responseRecorder) Header() http.Header {
+	if r.header == nil {
+		r.header = http.Header{}
+	}
+	return r.header
+}
+
+func (r *responseRecorder) Write(b []byte) (int, error) {
+	return r.body.Write(b)
+}
+
+func (r *responseRecorder) WriteHeader(status int) {
+	r.status = status
+}
+
 func TestResolveModelDistinguishesSameHFFileNameByRepo(t *testing.T) {
 	root := t.TempDir()
 	cfg := testConfig(root)
@@ -63,6 +96,43 @@ func TestResolveModelDistinguishesSameHFFileNameByRepo(t *testing.T) {
 	}
 	if got != base {
 		t.Fatalf("base ref resolved to %q, want %q", got, base)
+	}
+}
+
+func TestValidateExtraArgsSuggestsLlamaCppPenaltyFlags(t *testing.T) {
+	err := validateExtraArgs([]string{"--temp", "0.6", "presence_penalty", "0.0"})
+	if err == nil {
+		t.Fatal("expected validation error")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "presence_penalty") || !strings.Contains(msg, "--presence-penalty") {
+		t.Fatalf("validation error = %q, want presence penalty suggestion", msg)
+	}
+
+	err = validateExtraArgs([]string{"repetition_penalty", "1.0"})
+	if err == nil {
+		t.Fatal("expected validation error")
+	}
+	if !strings.Contains(err.Error(), "--repeat-penalty") {
+		t.Fatalf("validation error = %q, want repeat penalty suggestion", err)
+	}
+
+	err = validateExtraArgs([]string{"--repetition-penalty", "1.0"})
+	if err == nil {
+		t.Fatal("expected validation error")
+	}
+	if !strings.Contains(err.Error(), "--repeat-penalty") {
+		t.Fatalf("validation error = %q, want repeat penalty suggestion", err)
+	}
+}
+
+func TestValidateExtraArgsAcceptsDashedPenaltyFlags(t *testing.T) {
+	err := validateExtraArgs([]string{
+		"--presence-penalty", "0.0",
+		"--repeat-penalty", "1.0",
+	})
+	if err != nil {
+		t.Fatalf("valid extra args rejected: %v", err)
 	}
 }
 
@@ -257,5 +327,90 @@ func TestParsePullTargetNestedFile(t *testing.T) {
 	}
 	if user != "unsloth" || repoName != "Repo-GGUF" || repoID != "unsloth/Repo-GGUF" || file != "subdir/model.gguf" {
 		t.Fatalf("parsePullTarget() = %q %q %q %q", user, repoName, repoID, file)
+	}
+}
+
+func TestAutoswitchConfigParsing(t *testing.T) {
+	var cfg Config
+	data := []byte(`{
+		"autoswitch": {"enabled": true, "total_vram_mb": 24576, "startup_timeout_sec": 90},
+		"models": {
+			"qwen": {"auto_load": true, "auto_unload": true, "vram_mb": 18000}
+		}
+	}`)
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Autoswitch.Enabled || cfg.Autoswitch.TotalVramMB != 24576 || cfg.Autoswitch.StartupTimeoutSec != 90 {
+		t.Fatalf("autoswitch config = %+v", cfg.Autoswitch)
+	}
+	mc := cfg.Models["qwen"]
+	if mc.AutoLoad && mc.AutoUnload && mc.VramMB == 18000 {
+		// good
+	} else {
+		t.Fatalf("model autoswitch config = %+v", mc)
+	}
+}
+
+func TestValidateAutoswitchConfigRequiresVramMB(t *testing.T) {
+	cfg := Config{Autoswitch: AutoswitchConfig{Enabled: true}}
+	cfg.Models = map[string]ModelConfig{
+		"no-vram":   {AutoLoad: true, AutoUnload: true},
+		"with-vram": {AutoLoad: true, AutoUnload: true, VramMB: 12000},
+	}
+	err := validateAutoswitchConfig(cfg)
+	if err == nil {
+		t.Fatal("expected error for model without vram_mb")
+	}
+
+	mc := cfg.Models["no-vram"]
+	mc.VramMB = 8000
+	cfg.Models["no-vram"] = mc
+	err = validateAutoswitchConfig(cfg)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestExplicitModelWithAutoswitchErrorDoesNotFallbackToDefault(t *testing.T) {
+	if shouldFallbackToDefault("qwen3627b_code", os.ErrNotExist) {
+		t.Fatal("explicit model with autoswitch error should not fall back to default")
+	}
+}
+
+func TestMissingModelCanFallbackToDefault(t *testing.T) {
+	if !shouldFallbackToDefault("", nil) {
+		t.Fatal("request without model should fall back to default")
+	}
+	if !shouldFallbackToDefault("loaded-model", nil) {
+		t.Fatal("request with no autoswitch error may use existing default fallback behavior")
+	}
+}
+
+func TestHandleListModelsIncludesAutoLoadModels(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	cfg := testConfig(t.TempDir())
+	cfg.Models = map[string]ModelConfig{
+		"autoload": {AutoLoad: true},
+		"manual":   {},
+	}
+
+	rec := &responseRecorder{}
+	handleListModels(rec, cfg)
+
+	var body struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(rec.body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	var ids []string
+	for _, m := range body.Data {
+		ids = append(ids, m.ID)
+	}
+	if strings.Join(ids, ",") != "autoload" {
+		t.Fatalf("/v1/models ids = %v, want [autoload]", ids)
 	}
 }

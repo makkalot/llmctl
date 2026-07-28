@@ -159,6 +159,50 @@ llmctl set ctx_size 4096
 | `gpu_layers` | `-1` (all) | Number of layers to offload to GPU |
 | `ctx_size` | `4096` | Context window size |
 
+### Autoswitching
+
+Autoswitching lets the proxy start configured models on demand. When the requested model does not fit in the detected GPU memory, the proxy unloads the least-recently-used running models that have `auto_unload: true` until the requested model fits.
+
+Enable it in `~/.llmctl.json`:
+
+```json
+{
+  "autoswitch": {
+    "enabled": true,
+    "total_vram_mb": 24576,
+    "startup_timeout_sec": 60
+  },
+  "aliases": {
+    "qwen": "Qwen3.5-27B-GGUF:UD-Q4_K_XL.gguf",
+    "coder": "Qwen3.5-Coder-GGUF:Q4_K_M.gguf"
+  },
+  "models": {
+    "qwen": {
+      "auto_load": true,
+      "auto_unload": true
+    },
+    "coder": {
+      "auto_load": true,
+      "auto_unload": false,
+      "force_auto_load": true,
+      "ctx_size": 32768
+    }
+  }
+}
+```
+
+`auto_load` allows the proxy to start a model when a request names it. `auto_unload` allows that running instance to be evicted later for another autoswitch request. Models without `auto_unload` are pinned. `force_auto_load` tells the proxy to start the model even when the memory estimate says it will not fit, which is useful when llama.cpp will offload part of the model to CPU.
+
+By default, llmctl estimates memory as GGUF file size plus a small `ctx_size` overhead. If the estimate is wrong for a model, set `vram_mb` on that model to override it. GPU memory is detected automatically on Linux with `nvidia-smi` and on macOS with `system_profiler`; set `autoswitch.total_vram_mb` when detection is unavailable or you want an explicit capacity.
+
+You can also set top-level autoswitch values with:
+
+```sh
+llmctl set autoswitch.enabled true
+llmctl set autoswitch.total_vram_mb 24576
+llmctl set autoswitch.startup_timeout_sec 90
+```
+
 ### Extra server arguments
 
 Add extra `llama-server` arguments in the config file directly (`~/.llmctl.json`):
@@ -233,7 +277,7 @@ When the proxy is running:
 | Endpoint | Method | Description |
 |----------|--------|-------------|
 | `/v1/chat/completions` | POST | Chat completions (routes by `model` field) |
-| `/v1/models` | GET | List loaded models |
+| `/v1/models` | GET | List loaded models and configured autoloadable models |
 | `/health` | GET | Health check |
 
 Requests can also specify a model via the `X-Model` HTTP header.

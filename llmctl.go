@@ -1,6 +1,7 @@
 package main
 
 import (
+	"embed"
 	"bufio"
 	"bytes"
 	"encoding/json"
@@ -38,24 +39,52 @@ const (
 // ═══════════════════════════════════════════════════════════════════════════
 
 type ModelConfig struct {
-	ServerBin *string  `json:"server_bin,omitempty"`
-	GpuLayers *int     `json:"gpu_layers,omitempty"`
-	CtxSize   *int     `json:"ctx_size,omitempty"`
-	Mmproj    string   `json:"mmproj,omitempty"`
-	ExtraArgs []string `json:"extra_args,omitempty"`
+	ServerBin  *string  `json:"server_bin,omitempty"`
+	GpuLayers  *int     `json:"gpu_layers,omitempty"`
+	CtxSize    *int     `json:"ctx_size,omitempty"`
+	Mmproj     string   `json:"mmproj,omitempty"`
+	ExtraArgs  []string `json:"extra_args,omitempty"`
+	AutoLoad   bool     `json:"auto_load,omitempty"`
+	AutoUnload bool     `json:"auto_unload,omitempty"`
+	VramMB     int      `json:"vram_mb,omitempty"`
+}
+
+type AutoswitchConfig struct {
+	Enabled           bool `json:"enabled,omitempty"`
+	TotalVramMB       int  `json:"total_vram_mb,omitempty"`
+	StartupTimeoutSec int  `json:"startup_timeout_sec,omitempty"`
+}
+
+func validateAutoswitchConfig(cfg Config) error {
+	if !cfg.Autoswitch.Enabled {
+		return nil
+	}
+	var errors []string
+	for name, mc := range cfg.Models {
+		if mc.AutoLoad || mc.AutoUnload {
+			if mc.VramMB <= 0 {
+				errors = append(errors, fmt.Sprintf("  model %q has auto_load/auto_unload but vram_mb is not set", name))
+			}
+		}
+	}
+	if len(errors) > 0 {
+		return fmt.Errorf("autoswitch config errors:\n%s", strings.Join(errors, "\n"))
+	}
+	return nil
 }
 
 type Config struct {
-	ModelsDir string                 `json:"models_dir"`
-	ServerBin string                 `json:"server_bin"`
-	Host      string                 `json:"host"`
-	Port      int                    `json:"port"`
-	GpuLayers int                    `json:"gpu_layers"`
-	CtxSize   int                    `json:"ctx_size"`
-	Mmproj    string                 `json:"mmproj,omitempty"`
-	ExtraArgs []string               `json:"extra_args,omitempty"`
-	Aliases   map[string]string      `json:"aliases,omitempty"`
-	Models    map[string]ModelConfig `json:"models,omitempty"`
+	ModelsDir  string                 `json:"models_dir"`
+	ServerBin  string                 `json:"server_bin"`
+	Host       string                 `json:"host"`
+	Port       int                    `json:"port"`
+	GpuLayers  int                    `json:"gpu_layers"`
+	CtxSize    int                    `json:"ctx_size"`
+	Mmproj     string                 `json:"mmproj,omitempty"`
+	ExtraArgs  []string               `json:"extra_args,omitempty"`
+	Aliases    map[string]string      `json:"aliases,omitempty"`
+	Models     map[string]ModelConfig `json:"models,omitempty"`
+	Autoswitch AutoswitchConfig       `json:"autoswitch,omitempty"`
 }
 
 func defaultConfig() Config {
@@ -167,6 +196,26 @@ func mergeExtraArgs(global, perModel []string) []string {
 	return result
 }
 
+func validateExtraArgs(args []string) error {
+	suggestions := map[string]string{
+		"presence_penalty":     "--presence-penalty",
+		"frequency_penalty":    "--frequency-penalty",
+		"repetition_penalty":   "--repeat-penalty",
+		"repeat_penalty":       "--repeat-penalty",
+		"--presence_penalty":   "--presence-penalty",
+		"--frequency_penalty":  "--frequency-penalty",
+		"--repetition_penalty": "--repeat-penalty",
+		"--repeat_penalty":     "--repeat-penalty",
+		"--repetition-penalty": "--repeat-penalty",
+	}
+	for _, a := range args {
+		if suggestion, ok := suggestions[a]; ok {
+			return fmt.Errorf("invalid extra_args entry %q; llama.cpp flags use dashes, try %q", a, suggestion)
+		}
+	}
+	return nil
+}
+
 // configForModel returns a copy of cfg with per-model overrides applied.
 // The modelKey is matched exactly against keys in cfg.Models.
 func configForModel(cfg Config, modelKey string) Config {
@@ -261,17 +310,20 @@ func findServerBin() string {
 // ═══════════════════════════════════════════════════════════════════════════
 
 type Instance struct {
-	Name      string   `json:"name"`
-	Model     string   `json:"model"` // full path to .gguf
-	Mmproj    string   `json:"mmproj,omitempty"`
-	PID       int      `json:"pid"`
-	Port      int      `json:"port"`
-	IsDefault bool     `json:"is_default"` // default model for unmatched requests
-	CtxSize   int      `json:"ctx_size"`
-	GpuLayers int      `json:"gpu_layers"`
-	ServerBin string   `json:"server_bin"`
-	ExtraArgs []string `json:"extra_args,omitempty"`
-	Aliases   []string `json:"aliases,omitempty"`
+	Name            string   `json:"name"`
+	Model           string   `json:"model"` // full path to .gguf
+	Mmproj          string   `json:"mmproj,omitempty"`
+	PID             int      `json:"pid"`
+	Port            int      `json:"port"`
+	IsDefault       bool     `json:"is_default"` // default model for unmatched requests
+	CtxSize         int      `json:"ctx_size"`
+	GpuLayers       int      `json:"gpu_layers"`
+	ServerBin       string   `json:"server_bin"`
+	ExtraArgs       []string `json:"extra_args,omitempty"`
+	Aliases         []string `json:"aliases,omitempty"`
+	AutoUnload      bool     `json:"auto_unload,omitempty"`
+	EstimatedVramMB int      `json:"estimated_vram_mb,omitempty"`
+	LastUsedAt      int64    `json:"last_used_at,omitempty"`
 }
 
 type Registry struct {
@@ -712,14 +764,315 @@ func deriveInstanceName(modelRef string) string {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// Autoswitch helpers
+// ═══════════════════════════════════════════════════════════════════════════
+
+func autoswitchStartupTimeout(cfg Config) time.Duration {
+	if cfg.Autoswitch.StartupTimeoutSec > 0 {
+		return time.Duration(cfg.Autoswitch.StartupTimeoutSec) * time.Second
+	}
+	return 60 * time.Second
+}
+
+// gpuTotalVramMB returns total VRAM of GPU 0 from nvidia-smi, or the config override.
+func gpuTotalVramMB(cfg Config) (int, error) {
+	if cfg.Autoswitch.TotalVramMB > 0 {
+		return cfg.Autoswitch.TotalVramMB, nil
+	}
+	out, err := exec.Command("nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits").Output()
+	if err != nil {
+		return 0, fmt.Errorf("cannot detect GPU VRAM (nvidia-smi failed: %v); set autoswitch.total_vram_mb in config", err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	if len(lines) == 0 || strings.TrimSpace(lines[0]) == "" {
+		return 0, fmt.Errorf("nvidia-smi returned empty output; set autoswitch.total_vram_mb in config")
+	}
+	val, err := strconv.Atoi(strings.TrimSpace(lines[0]))
+	if err != nil {
+		return 0, fmt.Errorf("cannot parse nvidia-smi output %q; set autoswitch.total_vram_mb in config", lines[0])
+	}
+	if val <= 0 {
+		return 0, fmt.Errorf("nvidia-smi reported %d MB for GPU 0, refusing; set autoswitch.total_vram_mb in config", val)
+	}
+	return val, nil
+}
+
+// gpuUsedVramMB returns currently used VRAM on GPU 0 from nvidia-smi.
+func gpuUsedVramMB() (int, error) {
+	out, err := exec.Command("nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits").Output()
+	if err != nil {
+		return 0, fmt.Errorf("cannot read GPU usage (nvidia-smi failed: %v)", err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	if len(lines) == 0 || strings.TrimSpace(lines[0]) == "" {
+		return 0, fmt.Errorf("nvidia-smi returned empty output for memory.used")
+	}
+	return strconv.Atoi(strings.TrimSpace(lines[0]))
+}
+
+// autoswitchAvailableMB returns available VRAM on GPU 0.
+func autoswitchAvailableMB(cfg Config) (int, error) {
+	total, err := gpuTotalVramMB(cfg)
+	if err != nil {
+		return 0, err
+	}
+	used, err := gpuUsedVramMB()
+	if err != nil {
+		return 0, err
+	}
+	avail := total - used
+	if avail < 0 {
+		avail = 0
+	}
+	return avail, nil
+}
+
+func formatRegistryTime(ts int64) string {
+	if ts > 1_000_000_000_000 {
+		return time.Unix(0, ts).Format(time.RFC3339)
+	}
+	return time.Unix(ts, 0).Format(time.RFC3339)
+}
+
+// autoswitchEvictionPlan checks if requiredMB fits in availableMB.
+// If not, returns a list of auto_unload instances to evict (sorted oldest first).
+func autoswitchEvictionPlan(reg Registry, targetName string, requiredMB, availableMB int) ([]Instance, bool) {
+	if availableMB >= requiredMB {
+		return nil, true
+	}
+
+	candidates := make([]Instance, 0)
+	for _, inst := range reg.Instances {
+		if inst.Name != targetName && inst.AutoUnload {
+			candidates = append(candidates, inst)
+		}
+	}
+	sort.Slice(candidates, func(i, j int) bool {
+		if candidates[i].LastUsedAt == candidates[j].LastUsedAt {
+			return candidates[i].Name < candidates[j].Name
+		}
+		return candidates[i].LastUsedAt < candidates[j].LastUsedAt
+	})
+
+	return candidates, len(candidates) > 0
+}
+
+func shouldFallbackToDefault(targetName string, autoswitchErr error) bool {
+	return targetName == "" || autoswitchErr == nil
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // Reverse Proxy — routes by "model" field in OpenAI requests
 // ═══════════════════════════════════════════════════════════════════════════
+
+func hasAutoLoadModels(cfg Config) bool {
+	if !cfg.Autoswitch.Enabled {
+		return false
+	}
+	for _, mc := range cfg.Models {
+		if mc.AutoLoad {
+			return true
+		}
+	}
+	return false
+}
+
+func writeOpenAIError(w http.ResponseWriter, status int, msg string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"error": map[string]string{
+			"message": msg,
+			"type":    "invalid_request_error",
+		},
+	})
+}
+
+func markInstanceUsed(name string) {
+	reg := loadRegistry()
+	for i := range reg.Instances {
+		if reg.Instances[i].Name == name {
+			reg.Instances[i].LastUsedAt = time.Now().UnixNano()
+			saveRegistry(reg)
+			return
+		}
+	}
+}
+
+func autoswitchModel(cfg Config, targetName string) (*url.URL, string, error) {
+	if !cfg.Autoswitch.Enabled {
+		return nil, "", fmt.Errorf("model %q is not loaded", targetName)
+	}
+
+	spec, err := resolveLoadSpec(cfg, loadOptions{ModelName: targetName})
+	if err != nil {
+		return nil, "", err
+	}
+	if spec.ConfigKey == "" {
+		return nil, "", fmt.Errorf("model %q is not configured for autoswitch", targetName)
+	}
+	mc := cfg.Models[spec.ConfigKey]
+	if !mc.AutoLoad {
+		return nil, "", fmt.Errorf("model %q is not configured with auto_load", targetName)
+	}
+	requiredMB := mc.VramMB
+
+	reg := loadRegistry()
+	reg.CleanDead()
+
+	availableMB, err := autoswitchAvailableMB(cfg)
+	if err != nil {
+		return nil, "", err
+	}
+
+	if availableMB < requiredMB {
+		candidates, hasCandidates := autoswitchEvictionPlan(reg, spec.InstanceName, requiredMB, availableMB)
+		if !hasCandidates {
+			return nil, "", fmt.Errorf("model %q needs %d MB but only %d MB available on GPU 0, no auto_unload models to evict", targetName, requiredMB, availableMB)
+		}
+		evicted := 0
+		for _, inst := range candidates {
+			if err := unloadInstance(inst.Name, false); err != nil {
+				return nil, "", fmt.Errorf("failed to evict %q: %w", inst.Name, err)
+			}
+			evicted++
+			newAvail, checkErr := autoswitchAvailableMB(cfg)
+			if checkErr == nil && newAvail >= requiredMB {
+				break
+			}
+		}
+		availableMB, err = autoswitchAvailableMB(cfg)
+		if err != nil {
+			return nil, "", err
+		}
+		if availableMB < requiredMB {
+			return nil, "", fmt.Errorf("model %q needs %d MB but only %d MB available after evicting %d auto_unload models", targetName, requiredMB, availableMB, evicted)
+		}
+	}
+
+	inst, healthy, err := loadInstance(cfg, loadOptions{
+		ModelName:       targetName,
+		WaitTimeout:     autoswitchStartupTimeout(cfg),
+		Verbose:         false,
+		AutoUnload:      mc.AutoUnload,
+		EstimatedVramMB: requiredMB,
+	})
+	if err != nil {
+		return nil, "", err
+	}
+	if !healthy {
+		stopProcess(inst.PID)
+		reg := loadRegistry()
+		reg.Remove(inst.Name)
+		saveRegistry(reg)
+		return nil, "", fmt.Errorf("model %q did not become healthy before timeout", inst.Name)
+	}
+	u, _ := url.Parse(fmt.Sprintf("http://127.0.0.1:%d", inst.Port))
+	return u, inst.Name, nil
+}
+
+//go:embed web/index.html
+var webFS embed.FS
+
+var proxyEvents []struct{ TS, Msg string }
+var eventsMu sync.Mutex
+
+func addEvent(msg string) {
+	eventsMu.Lock()
+	defer eventsMu.Unlock()
+	proxyEvents = append(proxyEvents, struct{ TS, Msg string }{time.Now().Format("15:04:05"), msg})
+	if len(proxyEvents) > 200 {
+		proxyEvents = proxyEvents[len(proxyEvents)-200:]
+	}
+}
+
+func jsonResp(w http.ResponseWriter, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(v)
+}
+
+func handleUIVRAM(w http.ResponseWriter, cfg Config) {
+	total, _ := gpuTotalVramMB(cfg)
+	used, _ := gpuUsedVramMB()
+	avail := total - used
+	if avail < 0 {
+		avail = 0
+	}
+	jsonResp(w, map[string]int{"total": total, "used": used, "avail": avail})
+}
+
+func handleUIModels(w http.ResponseWriter, cfg Config) {
+	reg := loadRegistry()
+	type row struct {
+		Name    string `json:"name"`
+		Running bool   `json:"running"`
+		Vram    int    `json:"vram"`
+		Port    int    `json:"port"`
+	}
+	out := make([]row, 0, len(reg.Instances))
+	for _, inst := range reg.Instances {
+		vram := inst.EstimatedVramMB
+		if vram == 0 {
+			vram = cfg.Models[inst.Name].VramMB
+		}
+		out = append(out, row{inst.Name, isRunning(inst.PID), vram, inst.Port})
+	}
+	jsonResp(w, out)
+}
+
+func handleUILoad(w http.ResponseWriter, r *http.Request, cfg Config) {
+	name := strings.TrimPrefix(r.URL.Path, "/api/ui/load/")
+	addEvent("Loading model " + name)
+	_, _, err := autoswitchModel(cfg, name)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(400)
+		jsonResp(w, map[string]string{"error": err.Error()})
+		return
+	}
+	addEvent("Loaded model " + name)
+	jsonResp(w, map[string]string{"status": "loaded"})
+}
+
+func handleUIUnload(w http.ResponseWriter, r *http.Request, cfg Config) {
+	name := strings.TrimPrefix(r.URL.Path, "/api/ui/unload/")
+	addEvent("Unloading model " + name)
+	reg := loadRegistry()
+	inst := reg.FindByName(name)
+	if inst == nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(404)
+		jsonResp(w, map[string]string{"error": "model not found"})
+		return
+	}
+	stopProcess(inst.PID)
+	reg.Remove(name)
+	saveRegistry(reg)
+	addEvent("Unloaded model " + name)
+	jsonResp(w, map[string]string{"status": "unloaded"})
+}
+
+func handleUILogs(w http.ResponseWriter, cfg Config) {
+	eventsMu.Lock()
+	defer eventsMu.Unlock()
+	type evt struct{ TS, Msg string }
+	out := make([]evt, len(proxyEvents))
+	for i, e := range proxyEvents {
+		out[i] = evt{e.TS, e.Msg}
+	}
+	jsonResp(w, out)
+}
 
 func startProxy(cfg Config) {
 	reg := loadRegistry()
 	reg.CleanDead()
 
-	if len(reg.Instances) == 0 {
+	if err := validateAutoswitchConfig(cfg); err != nil {
+		fmt.Fprintf(os.Stderr, "Config error: %v\n", err)
+		os.Exit(1)
+	}
+
+	if len(reg.Instances) == 0 && !hasAutoLoadModels(cfg) {
 		fmt.Fprintln(os.Stderr, "Error: no models loaded. Use `llmctl load <model>` first.")
 		os.Exit(1)
 	}
@@ -753,7 +1106,7 @@ func startProxy(cfg Config) {
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// GET /v1/models — OpenAI compatible model listing
 		if r.URL.Path == "/v1/models" && r.Method == "GET" {
-			handleListModels(w)
+			handleListModels(w, cfg)
 			return
 		}
 
@@ -761,6 +1114,34 @@ func startProxy(cfg Config) {
 		if r.URL.Path == "/health" {
 			w.Header().Set("Content-Type", "application/json")
 			w.Write([]byte(`{"status":"ok"}`))
+			return
+		}
+
+		// Web UI
+		if r.URL.Path == "/ui" || r.URL.Path == "/ui/" {
+			data, _ := webFS.ReadFile("web/index.html")
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			w.Write(data)
+			return
+		}
+		if strings.HasPrefix(r.URL.Path, "/api/ui/vram") {
+			handleUIVRAM(w, cfg)
+			return
+		}
+		if strings.HasPrefix(r.URL.Path, "/api/ui/models") {
+			handleUIModels(w, cfg)
+			return
+		}
+		if strings.HasPrefix(r.URL.Path, "/api/ui/load/") && r.Method == "POST" {
+			handleUILoad(w, r, cfg)
+			return
+		}
+		if strings.HasPrefix(r.URL.Path, "/api/ui/unload/") && r.Method == "POST" {
+			handleUIUnload(w, r, cfg)
+			return
+		}
+		if strings.HasPrefix(r.URL.Path, "/api/ui/logs") {
+			handleUILogs(w, cfg)
 			return
 		}
 
@@ -792,6 +1173,7 @@ func startProxy(cfg Config) {
 
 		mu.RLock()
 		target, ok := backends[targetName]
+		routedName := targetName
 
 		// Fuzzy match
 		if !ok && targetName != "" {
@@ -800,30 +1182,48 @@ func startProxy(cfg Config) {
 				if strings.Contains(strings.ToLower(name), lower) {
 					target = u
 					ok = true
+					routedName = name
 					break
 				}
 			}
 		}
+		mu.RUnlock()
+
+		if ok {
+			markInstanceUsed(routedName)
+		}
+
+		var autoswitchErr error
+		if !ok && targetName != "" {
+			u, name, err := autoswitchModel(cfg, targetName)
+			if err == nil {
+				target = u
+				ok = true
+				routedName = name
+				rebuildBackends()
+				markInstanceUsed(routedName)
+			} else {
+				autoswitchErr = err
+			}
+		}
 
 		// Fallback to default
-		if !ok {
+		if !ok && shouldFallbackToDefault(targetName, autoswitchErr) {
 			reg := loadRegistry()
 			if def := reg.Default(); def != nil {
 				target, _ = url.Parse(fmt.Sprintf("http://127.0.0.1:%d", def.Port))
 				ok = true
+				routedName = def.Name
+				markInstanceUsed(routedName)
 			}
 		}
-		mu.RUnlock()
 
 		if !ok {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(404)
-			json.NewEncoder(w).Encode(map[string]interface{}{
-				"error": map[string]string{
-					"message": fmt.Sprintf("model '%s' not loaded. Run: llmctl load <model>", targetName),
-					"type":    "invalid_request_error",
-				},
-			})
+			if autoswitchErr != nil {
+				writeOpenAIError(w, 503, autoswitchErr.Error())
+				return
+			}
+			writeOpenAIError(w, 404, fmt.Sprintf("model '%s' not loaded. Run: llmctl load <model>", targetName))
 			return
 		}
 
@@ -841,9 +1241,12 @@ func startProxy(cfg Config) {
 	addr := fmt.Sprintf("%s:%d", cfg.Host, cfg.Port)
 	fmt.Printf("Proxy listening on %s\n", addr)
 	fmt.Printf("  API: http://%s:%d/v1\n", displayHost(cfg.Host), cfg.Port)
+	fmt.Printf("  UI:  http://%s:%d/ui\n", displayHost(cfg.Host), cfg.Port)
+	addEvent("Proxy started")
 	fmt.Println("  Routes:")
 
 	mu.RLock()
+	routeCount := len(backends)
 	for name, u := range backends {
 		reg := loadRegistry()
 		def := ""
@@ -853,6 +1256,9 @@ func startProxy(cfg Config) {
 		fmt.Printf("    %-28s → %s%s\n", name, u.String(), def)
 	}
 	mu.RUnlock()
+	if routeCount == 0 && hasAutoLoadModels(cfg) {
+		fmt.Println("    (no loaded models; autoswitch will load configured models on demand)")
+	}
 
 	fmt.Println("\n  Ctrl+C to stop.")
 
@@ -878,7 +1284,7 @@ func startProxy(cfg Config) {
 	}
 }
 
-func handleListModels(w http.ResponseWriter) {
+func handleListModels(w http.ResponseWriter, cfg Config) {
 	reg := loadRegistry()
 	reg.CleanDead()
 
@@ -889,6 +1295,7 @@ func handleListModels(w http.ResponseWriter) {
 		OwnedBy string `json:"owned_by"`
 	}
 	var models []modelObj
+	seen := map[string]bool{}
 	for _, inst := range reg.Instances {
 		models = append(models, modelObj{
 			ID:      inst.Name,
@@ -896,7 +1303,20 @@ func handleListModels(w http.ResponseWriter) {
 			Created: time.Now().Unix(),
 			OwnedBy: "llmctl",
 		})
+		seen[inst.Name] = true
 	}
+	for name, mc := range cfg.Models {
+		if !mc.AutoLoad || seen[name] {
+			continue
+		}
+		models = append(models, modelObj{
+			ID:      name,
+			Object:  "model",
+			Created: time.Now().Unix(),
+			OwnedBy: "llmctl",
+		})
+	}
+	sort.Slice(models, func(i, j int) bool { return models[i].ID < models[j].ID })
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
@@ -952,25 +1372,47 @@ func resolveMmproj(cfg Config, modelPath, mmprojName string) (string, error) {
 	return path, nil
 }
 
-func cmdLoad(cfg Config, modelName string, instanceName string, hfRepo string, mmprojArg string) {
+type loadOptions struct {
+	ModelName       string
+	InstanceName    string
+	HFRepo          string
+	MmprojArg       string
+	WaitTimeout     time.Duration
+	Verbose         bool
+	AutoUnload      bool
+	EstimatedVramMB int
+}
+
+type loadSpec struct {
+	Config       Config
+	ModelName    string
+	InstanceName string
+	ModelPath    string
+	HFRepo       string
+	MmprojPath   string
+	AliasUsed    string
+	ConfigKey    string
+}
+
+func resolveLoadSpec(cfg Config, opts loadOptions) (loadSpec, error) {
 	var modelPath string
 	var err error
 
-	if hfRepo != "" {
-		modelPath = hfRepo
+	if opts.HFRepo != "" {
+		modelPath = opts.HFRepo
 	} else {
-		modelPath, err = resolveModel(cfg, modelName)
+		modelPath, err = resolveModel(cfg, opts.ModelName)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			os.Exit(1)
+			return loadSpec{}, err
 		}
 	}
 
 	aliasUsed := ""
-	if _, ok := cfg.Aliases[modelName]; ok {
-		aliasUsed = modelName
+	if _, ok := cfg.Aliases[opts.ModelName]; ok {
+		aliasUsed = opts.ModelName
 	}
 
+	instanceName := opts.InstanceName
 	if instanceName == "" {
 		if aliasUsed != "" {
 			instanceName = aliasUsed
@@ -979,50 +1421,87 @@ func cmdLoad(cfg Config, modelName string, instanceName string, hfRepo string, m
 		}
 	}
 
-	if configKey := modelConfigKey(cfg, modelName, instanceName, modelPath); configKey != "" {
+	configKey := modelConfigKey(cfg, opts.ModelName, instanceName, modelPath)
+	if configKey != "" {
 		cfg = configForModel(cfg, configKey)
 	}
 
 	var mmprojPath string
-	if mmprojArg != "" {
-		mmprojPath, err = resolveMmproj(cfg, modelPath, mmprojArg)
+	if opts.MmprojArg != "" {
+		mmprojPath, err = resolveMmproj(cfg, modelPath, opts.MmprojArg)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			os.Exit(1)
+			return loadSpec{}, err
 		}
 	} else if cfg.Mmproj != "" {
 		mmprojPath, err = resolveMmproj(cfg, modelPath, cfg.Mmproj)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			os.Exit(1)
+			return loadSpec{}, err
 		}
 	} else {
 		mmprojPath, _ = resolveMmproj(cfg, modelPath, "")
 	}
 
+	return loadSpec{
+		Config:       cfg,
+		ModelName:    opts.ModelName,
+		InstanceName: instanceName,
+		ModelPath:    modelPath,
+		HFRepo:       opts.HFRepo,
+		MmprojPath:   mmprojPath,
+		AliasUsed:    aliasUsed,
+		ConfigKey:    configKey,
+	}, nil
+}
+
+func loadInstance(cfg Config, opts loadOptions) (Instance, bool, error) {
+	spec, err := resolveLoadSpec(cfg, opts)
+	if err != nil {
+		return Instance{}, false, err
+	}
+	cfg = spec.Config
+	autoUnload := opts.AutoUnload
+	estimatedVramMB := opts.EstimatedVramMB
+	if spec.ConfigKey != "" {
+		if mc, ok := cfg.Models[spec.ConfigKey]; ok {
+			if !autoUnload {
+				autoUnload = mc.AutoUnload
+			}
+			if estimatedVramMB == 0 && mc.VramMB > 0 {
+				estimatedVramMB = mc.VramMB
+			}
+		}
+	}
+
 	reg := loadRegistry()
 	reg.CleanDead()
 
-	if existing := reg.FindByName(instanceName); existing != nil {
+	if existing := reg.FindByName(spec.InstanceName); existing != nil {
 		if isRunning(existing.PID) {
-			fmt.Printf("Replacing instance '%s'...\n", instanceName)
+			if opts.Verbose {
+				fmt.Printf("Replacing instance '%s'...\n", spec.InstanceName)
+			}
 			stopProcess(existing.PID)
 		}
-		reg.Remove(instanceName)
+		reg.Remove(spec.InstanceName)
 	}
 
 	backendPort := reg.NextPort()
-	displayName := modelPath
-	if hfRepo != "" {
-		displayName = hfRepo
+	displayName := spec.ModelPath
+	if spec.HFRepo != "" {
+		displayName = spec.HFRepo
 	}
-	fmt.Printf("Loading %s as '%s' (backend :%d)...\n", shortName(displayName), instanceName, backendPort)
+	if opts.Verbose {
+		fmt.Printf("Loading %s as '%s' (backend :%d)...\n", shortName(displayName), spec.InstanceName, backendPort)
+	}
+	if err := validateExtraArgs(cfg.ExtraArgs); err != nil {
+		return Instance{}, false, err
+	}
 
 	args := []string{}
-	if hfRepo != "" {
-		args = append(args, "-hf", hfRepo)
+	if spec.HFRepo != "" {
+		args = append(args, "-hf", spec.HFRepo)
 	} else {
-		args = append(args, "--model", modelPath)
+		args = append(args, "--model", spec.ModelPath)
 	}
 	args = append(args,
 		"--host", "127.0.0.1",
@@ -1032,9 +1511,11 @@ func cmdLoad(cfg Config, modelName string, instanceName string, hfRepo string, m
 	if cfg.GpuLayers != 0 {
 		args = append(args, "--n-gpu-layers", strconv.Itoa(cfg.GpuLayers))
 	}
-	if mmprojPath != "" {
-		args = append(args, "--mmproj", mmprojPath)
-		fmt.Printf("  mmproj: %s\n", shortName(mmprojPath))
+	if spec.MmprojPath != "" {
+		args = append(args, "--mmproj", spec.MmprojPath)
+		if opts.Verbose {
+			fmt.Printf("  mmproj: %s\n", shortName(spec.MmprojPath))
+		}
 	}
 	args = append(args, cfg.ExtraArgs...)
 
@@ -1043,14 +1524,12 @@ func cmdLoad(cfg Config, modelName string, instanceName string, hfRepo string, m
 
 	logDir := filepath.Join(homeDir(), ".llmctl-logs")
 	os.MkdirAll(logDir, 0755)
-	logFile, _ := os.Create(filepath.Join(logDir, instanceName+".log"))
+	logFile, _ := os.Create(filepath.Join(logDir, spec.InstanceName+".log"))
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
 
 	if err := cmd.Start(); err != nil {
-		fmt.Fprintf(os.Stderr, "Error starting server: %v\n", err)
-		fmt.Fprintf(os.Stderr, "Is '%s' installed and in PATH?\n", cfg.ServerBin)
-		os.Exit(1)
+		return Instance{}, false, fmt.Errorf("error starting server: %w; is %q installed and in PATH?", err, cfg.ServerBin)
 	}
 	exitCh := make(chan error, 1)
 	go func() {
@@ -1060,83 +1539,133 @@ func cmdLoad(cfg Config, modelName string, instanceName string, hfRepo string, m
 	isDefault := len(reg.Instances) == 0
 
 	inst := Instance{
-		Name:      instanceName,
-		Model:     modelPath,
-		Mmproj:    mmprojPath,
-		PID:       cmd.Process.Pid,
-		Port:      backendPort,
-		IsDefault: isDefault,
-		CtxSize:   cfg.CtxSize,
-		GpuLayers: cfg.GpuLayers,
-		ServerBin: cfg.ServerBin,
-		ExtraArgs: cfg.ExtraArgs,
+		Name:            spec.InstanceName,
+		Model:           spec.ModelPath,
+		Mmproj:          spec.MmprojPath,
+		PID:             cmd.Process.Pid,
+		Port:            backendPort,
+		IsDefault:       isDefault,
+		CtxSize:         cfg.CtxSize,
+		GpuLayers:       cfg.GpuLayers,
+		ServerBin:       cfg.ServerBin,
+		ExtraArgs:       cfg.ExtraArgs,
+		AutoUnload:      autoUnload,
+		EstimatedVramMB: estimatedVramMB,
+		LastUsedAt:      time.Now().UnixNano(),
 	}
-	if aliasUsed != "" {
-		inst.Aliases = []string{aliasUsed}
+	if spec.AliasUsed != "" {
+		inst.Aliases = []string{spec.AliasUsed}
 	}
 	reg.Instances = append(reg.Instances, inst)
 	saveRegistry(reg)
 
-	if waitForHealth(backendPort, 60*time.Second) {
-		fmt.Printf("✓ '%s' ready (PID %d, backend :%d)\n", instanceName, inst.PID, backendPort)
+	timeout := opts.WaitTimeout
+	if timeout <= 0 {
+		timeout = 60 * time.Second
+	}
+	if waitForHealth(backendPort, timeout) {
+		if opts.Verbose {
+			fmt.Printf("✓ '%s' ready (PID %d, backend :%d)\n", spec.InstanceName, inst.PID, backendPort)
+		}
 	} else {
 		if exitErr, exited := backendExited(exitCh); exited {
 			reg := loadRegistry()
-			reg.Remove(instanceName)
+			reg.Remove(spec.InstanceName)
 			if isDefault && len(reg.Instances) > 0 {
 				reg.Instances[0].IsDefault = true
 			}
 			saveRegistry(reg)
-			fmt.Fprintf(os.Stderr, "Error: '%s' exited before becoming healthy. Check: llmctl logs %s\n",
-				instanceName, instanceName)
-			if exitErr != nil {
-				fmt.Fprintf(os.Stderr, "Backend exit: %v\n", exitErr)
+			if opts.Verbose {
+				fmt.Fprintf(os.Stderr, "Error: '%s' exited before becoming healthy. Check: llmctl logs %s\n",
+					spec.InstanceName, spec.InstanceName)
+				if exitErr != nil {
+					fmt.Fprintf(os.Stderr, "Backend exit: %v\n", exitErr)
+				}
+				printLogTail(filepath.Join(logDir, spec.InstanceName+".log"), 20)
 			}
-			printLogTail(filepath.Join(logDir, instanceName+".log"), 20)
-			os.Exit(1)
+			return Instance{}, false, fmt.Errorf("%q exited before becoming healthy: %v", spec.InstanceName, exitErr)
 		}
-		fmt.Printf("⚠ '%s' started (PID %d) but not yet healthy. Check: llmctl logs %s\n",
-			instanceName, inst.PID, instanceName)
+		if opts.Verbose {
+			fmt.Printf("⚠ '%s' started (PID %d) but not yet healthy. Check: llmctl logs %s\n",
+				spec.InstanceName, inst.PID, spec.InstanceName)
+		}
+		return inst, false, nil
 	}
 
-	if isDefault {
+	if opts.Verbose && isDefault {
 		fmt.Printf("  ★ Set as default model\n")
 	}
-	fmt.Printf("\n  Proxy endpoint: http://%s:%d/v1\n", displayHost(cfg.Host), cfg.Port)
-	fmt.Printf("  Model name:     %s\n", instanceName)
-	fmt.Printf("  Direct backend: http://127.0.0.1:%d\n", backendPort)
+	if opts.Verbose {
+		fmt.Printf("\n  Proxy endpoint: http://%s:%d/v1\n", displayHost(cfg.Host), cfg.Port)
+		fmt.Printf("  Model name:     %s\n", spec.InstanceName)
+		fmt.Printf("  Direct backend: http://127.0.0.1:%d\n", backendPort)
+	}
+	return inst, true, nil
 }
 
-func cmdUnload(_ Config, name string) {
+func cmdLoad(cfg Config, modelName string, instanceName string, hfRepo string, mmprojArg string) {
+	_, _, err := loadInstance(cfg, loadOptions{
+		ModelName:    modelName,
+		InstanceName: instanceName,
+		HFRepo:       hfRepo,
+		MmprojArg:    mmprojArg,
+		WaitTimeout:  60 * time.Second,
+		Verbose:      true,
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+func findInstanceByNameFuzzy(reg Registry, name string) *Instance {
+	inst := reg.FindByName(name)
+	if inst != nil {
+		return inst
+	}
+	lower := strings.ToLower(name)
+	for i := range reg.Instances {
+		if strings.Contains(strings.ToLower(reg.Instances[i].Name), lower) {
+			return &reg.Instances[i]
+		}
+	}
+	return nil
+}
+
+func unloadInstance(name string, verbose bool) error {
 	reg := loadRegistry()
 	reg.CleanDead()
 
-	inst := reg.FindByName(name)
+	inst := findInstanceByNameFuzzy(reg, name)
 	if inst == nil {
-		lower := strings.ToLower(name)
-		for i := range reg.Instances {
-			if strings.Contains(strings.ToLower(reg.Instances[i].Name), lower) {
-				inst = &reg.Instances[i]
-				break
-			}
-		}
-	}
-	if inst == nil {
-		fmt.Fprintf(os.Stderr, "Error: no instance '%s'. Use `llmctl ps` to see loaded models.\n", name)
-		os.Exit(1)
+		return fmt.Errorf("no instance %q. Use `llmctl ps` to see loaded models", name)
 	}
 
-	fmt.Printf("Stopping '%s' (PID %d)...\n", inst.Name, inst.PID)
+	if verbose {
+		fmt.Printf("Stopping '%s' (PID %d)...\n", inst.Name, inst.PID)
+	}
 	stopProcess(inst.PID)
 	wasDefault := inst.IsDefault
 	reg.Remove(inst.Name)
 
 	if wasDefault && len(reg.Instances) > 0 {
 		reg.Instances[0].IsDefault = true
-		fmt.Printf("  New default: %s\n", reg.Instances[0].Name)
+		if verbose {
+			fmt.Printf("  New default: %s\n", reg.Instances[0].Name)
+		}
 	}
 	saveRegistry(reg)
-	fmt.Println("✓ Stopped.")
+	if verbose {
+		fmt.Println("✓ Stopped.")
+	}
+	return nil
+}
+
+func cmdUnload(_ Config, name string) {
+	if err := unloadInstance(name, true); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
 }
 
 func cmdStopAll() {
@@ -1224,6 +1753,9 @@ func cmdPS() {
 		}
 		fmt.Printf("  %s%-20s %-26s %-8d %-8d %-8s %s\n",
 			marker, inst.Name, model, inst.PID, inst.Port, ctxStr, status)
+		if inst.AutoUnload || inst.EstimatedVramMB > 0 {
+			fmt.Printf("    autoswitch: auto_unload=%t estimated_vram_mb=%d\n", inst.AutoUnload, inst.EstimatedVramMB)
+		}
 		if len(inst.Aliases) > 0 {
 			fmt.Printf("    aliases: %s\n", strings.Join(inst.Aliases, ", "))
 		}
@@ -1289,6 +1821,15 @@ func cmdInfo(name string) {
 	fmt.Printf("Server:     %s\n", inst.ServerBin)
 	fmt.Printf("Ctx size:   %d\n", inst.CtxSize)
 	fmt.Printf("GPU layers: %d\n", inst.GpuLayers)
+	if inst.AutoUnload || inst.EstimatedVramMB > 0 || inst.LastUsedAt > 0 {
+		fmt.Printf("Auto unload: %t\n", inst.AutoUnload)
+		if inst.EstimatedVramMB > 0 {
+			fmt.Printf("Est. VRAM:  %d MB\n", inst.EstimatedVramMB)
+		}
+		if inst.LastUsedAt > 0 {
+			fmt.Printf("Last used:  %s\n", formatRegistryTime(inst.LastUsedAt))
+		}
+	}
 	if len(inst.ExtraArgs) > 0 {
 		fmt.Println("Extra args:")
 		for i := 0; i < len(inst.ExtraArgs); i++ {
@@ -1609,6 +2150,16 @@ func cmdConfig(cfg Config) {
 	if len(cfg.ExtraArgs) > 0 {
 		fmt.Printf("  Extra args:  %s\n", strings.Join(cfg.ExtraArgs, " "))
 	}
+	if cfg.Autoswitch.Enabled || cfg.Autoswitch.TotalVramMB > 0 || cfg.Autoswitch.StartupTimeoutSec > 0 {
+		fmt.Println("  Autoswitch:")
+		fmt.Printf("    enabled:               %t\n", cfg.Autoswitch.Enabled)
+		if cfg.Autoswitch.TotalVramMB > 0 {
+			fmt.Printf("    total_vram_mb:         %d\n", cfg.Autoswitch.TotalVramMB)
+		}
+		if cfg.Autoswitch.StartupTimeoutSec > 0 {
+			fmt.Printf("    startup_timeout_sec:   %d\n", cfg.Autoswitch.StartupTimeoutSec)
+		}
+	}
 	if len(cfg.Aliases) > 0 {
 		fmt.Println("  Aliases:")
 		for k, v := range cfg.Aliases {
@@ -1630,6 +2181,15 @@ func cmdConfig(cfg Config) {
 			}
 			if mc.ExtraArgs != nil {
 				fmt.Printf("      extra_args:  %s\n", strings.Join(mc.ExtraArgs, " "))
+			}
+			if mc.AutoLoad {
+				fmt.Printf("      auto_load:   %t\n", mc.AutoLoad)
+			}
+			if mc.AutoUnload {
+				fmt.Printf("      auto_unload: %t\n", mc.AutoUnload)
+			}
+			if mc.VramMB > 0 {
+				fmt.Printf("      vram_mb:     %d\n", mc.VramMB)
 			}
 		}
 	}
@@ -1664,6 +2224,27 @@ func cmdSet(cfg Config, key, value string) {
 			os.Exit(1)
 		}
 		cfg.CtxSize = n
+	case "autoswitch.enabled":
+		v, err := strconv.ParseBool(value)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Error: must be true or false")
+			os.Exit(1)
+		}
+		cfg.Autoswitch.Enabled = v
+	case "autoswitch.total_vram_mb":
+		n, err := strconv.Atoi(value)
+		if err != nil || n < 0 {
+			fmt.Fprintln(os.Stderr, "Error: must be a non-negative number")
+			os.Exit(1)
+		}
+		cfg.Autoswitch.TotalVramMB = n
+	case "autoswitch.startup_timeout_sec":
+		n, err := strconv.Atoi(value)
+		if err != nil || n < 0 {
+			fmt.Fprintln(os.Stderr, "Error: must be a non-negative number")
+			os.Exit(1)
+		}
+		cfg.Autoswitch.StartupTimeoutSec = n
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown key: %s\n", key)
 		os.Exit(1)
