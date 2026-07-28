@@ -427,3 +427,34 @@ func TestSystemdUnitFile(t *testing.T) {
 		}
 	}
 }
+
+func TestHandleUIModelsIncludesDiskModels(t *testing.T) {
+	tmp := t.TempDir()
+	cfg := testConfig(tmp)
+
+	// Create a model file on disk
+	writeHFModel(t, tmp, "test", "disk-model", "abc123", "disk-model.Q4.gguf")
+
+	rec := &responseRecorder{}
+	handleUIModels(rec, cfg)
+
+	var models []struct {
+		Name    string `json:"name"`
+		Running bool   `json:"running"`
+	}
+	if err := json.Unmarshal(rec.body.Bytes(), &models); err != nil {
+		t.Fatal(err)
+	}
+
+	// Should include the disk model as Available (not running)
+	found := false
+	for _, m := range models {
+		if strings.Contains(m.Name, "disk-model") && !m.Running {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected disk model in UI models list, got: %s", rec.body.String())
+	}
+}

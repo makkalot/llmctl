@@ -1003,20 +1003,52 @@ func handleUIVRAM(w http.ResponseWriter, cfg Config) {
 
 func handleUIModels(w http.ResponseWriter, cfg Config) {
 	reg := loadRegistry()
+	reg.CleanDead()
 	type row struct {
 		Name    string `json:"name"`
 		Running bool   `json:"running"`
 		Vram    int    `json:"vram"`
 		Port    int    `json:"port"`
 	}
-	out := make([]row, 0, len(reg.Instances))
+
+	// Build set of all known model names from disk
+	models := listModelFiles(cfg.ModelsDir)
+	filtered := make([]string, 0, len(models))
+	for _, m := range models {
+		if !isMmprojFile(m) {
+			filtered = append(filtered, m)
+		}
+	}
+	loadedByPath := loadedModelsByPath(reg)
+
+	// Track which names are already in the output
+	seen := make(map[string]bool)
+	out := make([]row, 0)
+
+	// First pass: registry instances (loaded models)
 	for _, inst := range reg.Instances {
 		vram := inst.EstimatedVramMB
 		if vram == 0 {
 			vram = cfg.Models[inst.Name].VramMB
 		}
 		out = append(out, row{inst.Name, isRunning(inst.PID), vram, inst.Port})
+		seen[inst.Name] = true
 	}
+
+	// Second pass: models on disk not already in registry
+	for _, m := range filtered {
+		full := filepath.Join(cfg.ModelsDir, m)
+		displayName := modelRef(cfg.ModelsDir, full)
+		if seen[displayName] {
+			continue
+		}
+		// Check if this model file is loaded under any name
+		_, isLoaded := loadedByPath[filepath.Clean(full)]
+		vram := cfg.Models[displayName].VramMB
+		out = append(out, row{Name: displayName, Running: isLoaded, Vram: vram})
+		seen[displayName] = true
+	}
+
 	jsonResp(w, out)
 }
 
