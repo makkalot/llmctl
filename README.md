@@ -9,18 +9,18 @@ A CLI tool for managing multiple local [llama.cpp](https://github.com/ggerganov/
 
 ## Installation
 
-### Systemd user service
+### Systemd service
 
-Install the proxy as a systemd user service (auto-starts on login, restarts on crash):
+Install the proxy as a systemd system service (auto-starts on boot, restarts on crash). The service runs as the invoking user (`$SUDO_USER`), so model state stays in that user's home:
 
 ```sh
-make systemd-install    # builds, installs binary, sets up service
-systemctl --user status llmctl   # check status
-journalctl --user -u llmctl -f   # follow logs
+sudo make systemd-install     # builds, installs binary, sets up service
+sudo systemctl status llmctl  # check status
+journalctl -u llmctl -f       # follow logs
 ```
 
-The unit file is installed to `~/.config/systemd/user/llmctl.service`.
-Run `make systemd-uninstall` to remove it.
+The unit file is installed to `/etc/systemd/system/llmctl.service`.
+Run `sudo make systemd-uninstall` to remove it.
 
 #### From source
 

@@ -40,19 +40,22 @@ test:
 	go test -v ./...
 
 SERVICE_FILE=llmctl.service
-SERVICE_DEST=$(HOME)/.config/systemd/user/llmctl.service
+SERVICE_DEST=/etc/systemd/system/llmctl.service
+SERVICE_USER=$(or $(SUDO_USER),$(USER))
 
 systemd-install: install
-	@echo "Installing systemd user service..."
-	install -d $(HOME)/.config/systemd/user
-	install -m 644 $(SERVICE_FILE) $(SERVICE_DEST)
-	systemctl --user daemon-reload
-	systemctl --user enable --now llmctl.service
-	@echo "Service installed and started. Use 'systemctl --user status llmctl' to check."
+	@echo "Installing systemd system service (user: $(SERVICE_USER))..."
+	sed 's/@SERVICE_USER@/$(SERVICE_USER)/' $(SERVICE_FILE) > $(SERVICE_DEST)
+	systemctl daemon-reload
+	systemctl enable --now llmctl.service
+	@echo "Service installed and started."
+	@echo "  sudo systemctl status llmctl   # check status"
+	@echo "  journalctl -u llmctl -f        # follow logs"
+	@echo "  journalctl -u llmctl -n 100    # last 100 lines"
 
 systemd-uninstall:
-	@echo "Removing systemd user service..."
-	systemctl --user disable --now llmctl.service 2>/dev/null || true
-	systemctl --user daemon-reload
+	@echo "Removing systemd system service..."
+	-systemctl disable --now llmctl.service
 	rm -f $(SERVICE_DEST)
+	systemctl daemon-reload
 	@echo "Service removed."
