@@ -421,7 +421,7 @@ func TestSystemdUnitFile(t *testing.T) {
 		t.Skipf("llmctl.service not found: %v", err)
 	}
 	content := string(data)
-	for _, want := range []string{"[Unit]", "[Service]", "[Install]", "ExecStart=/usr/local/bin/llmctl proxy", "Restart=always", "WantedBy=default.target"} {
+	for _, want := range []string{"[Unit]", "[Service]", "[Install]", "ExecStart=/usr/local/bin/llmctl proxy", "Restart=always", "WantedBy=multi-user.target"} {
 		if !strings.Contains(content, want) {
 			t.Errorf("unit file missing: %s", want)
 		}
