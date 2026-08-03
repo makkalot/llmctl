@@ -65,6 +65,16 @@ td{padding:.55rem .5rem;border-top:1px solid #1e293b;font-size:.85rem}
     <div class="bar"><div class="fill" :class="barClass" :style="'width:' + pct + '%'"></div></div>
   </div>
 
+  <!-- Token Summary -->
+  <div class="card">
+    <h2>Token Usage</h2>
+    <div class="grid3">
+      <div class="stat"><div class="val" x-text="formatTokens(tokenSummary.input_tokens)"></div><div class="lbl">Input Tokens</div></div>
+      <div class="stat"><div class="val" x-text="formatTokens(tokenSummary.output_tokens)"></div><div class="lbl">Output Tokens</div></div>
+      <div class="stat"><div class="val" x-text="tokenSummary.requests ?? 0"></div><div class="lbl">Requests</div></div>
+    </div>
+  </div>
+
   <!-- Models -->
   <div class="card">
     <h2>Models</h2>
@@ -87,6 +97,26 @@ td{padding:.55rem .5rem;border-top:1px solid #1e293b;font-size:.85rem}
               <span x-text="m.running ? 'Unload' : 'Load'"></span>
             </button>
           </td>
+        </tr>
+      </template>
+    </table>
+  </div>
+
+  <!-- Token Stats per model -->
+  <div class="card">
+    <h2>Token Stats</h2>
+    <template x-if="Object.keys(tokenStats).length === 0">
+      <div class="empty">No token data yet (starts tracking when proxy receives requests)</div>
+    </template>
+    <table x-show="Object.keys(tokenStats).length > 0">
+      <tr><th>Model</th><th>Input</th><th>Output</th><th>Total</th><th>Requests</th></tr>
+      <template x-for="(s, name) in tokenStats" :key="name">
+        <tr>
+          <td x-text="name"></td>
+          <td x-text="formatTokens(s.input_tokens)"></td>
+          <td x-text="formatTokens(s.output_tokens)"></td>
+          <td x-text="formatTokens(s.total_tokens)"></td>
+          <td x-text="s.requests"></td>
         </tr>
       </template>
     </table>
@@ -115,6 +145,15 @@ function dashboard() {
     models: [],
     events: [],
     loading: null,
+    tokenStats: {},
+    tokenSummary: { input_tokens: 0, output_tokens: 0, requests: 0 },
+
+    formatTokens(n) {
+      if (!n || n === 0) return '0';
+      if (n >= 1000000) return (n / 1000000).toFixed(1) + 'M';
+      if (n >= 1000) return (n / 1000).toFixed(1) + 'K';
+      return n.toString();
+    },
 
     get pct() {
       if (!this.vram.total || this.vram.total === 0) return 0;
@@ -149,6 +188,22 @@ function dashboard() {
       } catch(e) {}
     },
 
+    async fetchTokens() {
+      try {
+        const r = await fetch('/api/ui/tokens');
+        const data = await r.json();
+        this.tokenStats = data;
+        // Compute summary from per-model stats
+        let input = 0, output = 0, reqs = 0;
+        for (const s of Object.values(data)) {
+          input += s.input_tokens || 0;
+          output += s.output_tokens || 0;
+          reqs += s.requests || 0;
+        }
+        this.tokenSummary = { input_tokens: input, output_tokens: output, requests: reqs };
+      } catch(e) {}
+    },
+
     async toggle(name) {
       this.loading = name;
       const m = this.models.find(x => x.name === name);
@@ -167,7 +222,8 @@ function dashboard() {
       this.fetchVRAM();
       this.fetchModels();
       this.fetchEvents();
-      setInterval(() => { this.fetchVRAM(); this.fetchModels(); this.fetchEvents(); }, 4000);
+      this.fetchTokens();
+      setInterval(() => { this.fetchVRAM(); this.fetchModels(); this.fetchEvents(); this.fetchTokens(); }, 4000);
     }
   }
 }
