@@ -47,7 +47,8 @@ systemd-install: install
 	@echo "Installing systemd system service (user: $(SERVICE_USER))..."
 	sed 's/@SERVICE_USER@/$(SERVICE_USER)/' $(SERVICE_FILE) > $(SERVICE_DEST)
 	systemctl daemon-reload
-	systemctl enable --now llmctl.service
+	systemctl enable llmctl.service
+	systemctl restart llmctl.service
 	@echo "Service installed and started."
 	@echo "  sudo systemctl status llmctl   # check status"
 	@echo "  journalctl -u llmctl -f        # follow logs"

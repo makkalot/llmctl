@@ -1011,42 +1011,45 @@ func handleUIModels(w http.ResponseWriter, cfg Config) {
 		Port    int    `json:"port"`
 	}
 
-	// Build set of all known model names from disk
-	models := listModelFiles(cfg.ModelsDir)
-	filtered := make([]string, 0, len(models))
-	for _, m := range models {
-		if !isMmprojFile(m) {
-			filtered = append(filtered, m)
+	// The universe of models shown in the UI is exactly what the user
+	// configured: every alias plus every key in the models map. We do NOT
+	// scan the disk, so arbitrary .gguf files (or unknown subdirectory
+	// layouts) never leak into the dashboard.
+	names := make([]string, 0, len(cfg.Aliases)+len(cfg.Models))
+	seen := make(map[string]bool, len(cfg.Aliases)+len(cfg.Models))
+	for name := range cfg.Aliases {
+		if !seen[name] {
+			seen[name] = true
+			names = append(names, name)
 		}
 	}
-	loadedByPath := loadedModelsByPath(reg)
-
-	// Track which names are already in the output
-	seen := make(map[string]bool)
-	out := make([]row, 0)
-
-	// First pass: registry instances (loaded models)
-	for _, inst := range reg.Instances {
-		vram := inst.EstimatedVramMB
-		if vram == 0 {
-			vram = cfg.Models[inst.Name].VramMB
+	for name := range cfg.Models {
+		if !seen[name] {
+			seen[name] = true
+			names = append(names, name)
 		}
-		out = append(out, row{inst.Name, isRunning(inst.PID), vram, inst.Port})
-		seen[inst.Name] = true
+	}
+	sort.Strings(names)
+
+	// Registry instances keyed by name so loaded models can be enriched
+	// with port/running/vram from the live process.
+	instByName := make(map[string]*Instance, len(reg.Instances))
+	for i := range reg.Instances {
+		instByName[reg.Instances[i].Name] = &reg.Instances[i]
 	}
 
-	// Second pass: models on disk not already in registry
-	for _, m := range filtered {
-		full := filepath.Join(cfg.ModelsDir, m)
-		displayName := modelRef(cfg.ModelsDir, full)
-		if seen[displayName] {
+	out := make([]row, 0, len(names))
+	for _, name := range names {
+		if inst := instByName[name]; inst != nil {
+			vram := inst.EstimatedVramMB
+			if vram == 0 {
+				vram = cfg.Models[name].VramMB
+			}
+			out = append(out, row{name, isRunning(inst.PID), vram, inst.Port})
 			continue
 		}
-		// Check if this model file is loaded under any name
-		_, isLoaded := loadedByPath[filepath.Clean(full)]
-		vram := cfg.Models[displayName].VramMB
-		out = append(out, row{Name: displayName, Running: isLoaded, Vram: vram})
-		seen[displayName] = true
+		// Configured but not currently loaded.
+		out = append(out, row{Name: name, Running: false, Vram: cfg.Models[name].VramMB})
 	}
 
 	jsonResp(w, out)
