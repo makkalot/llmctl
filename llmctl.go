@@ -1003,20 +1003,55 @@ func handleUIVRAM(w http.ResponseWriter, cfg Config) {
 
 func handleUIModels(w http.ResponseWriter, cfg Config) {
 	reg := loadRegistry()
+	reg.CleanDead()
 	type row struct {
 		Name    string `json:"name"`
 		Running bool   `json:"running"`
 		Vram    int    `json:"vram"`
 		Port    int    `json:"port"`
 	}
-	out := make([]row, 0, len(reg.Instances))
-	for _, inst := range reg.Instances {
-		vram := inst.EstimatedVramMB
-		if vram == 0 {
-			vram = cfg.Models[inst.Name].VramMB
+
+	// The universe of models shown in the UI is exactly what the user
+	// configured: every alias plus every key in the models map. We do NOT
+	// scan the disk, so arbitrary .gguf files (or unknown subdirectory
+	// layouts) never leak into the dashboard.
+	names := make([]string, 0, len(cfg.Aliases)+len(cfg.Models))
+	seen := make(map[string]bool, len(cfg.Aliases)+len(cfg.Models))
+	for name := range cfg.Aliases {
+		if !seen[name] {
+			seen[name] = true
+			names = append(names, name)
 		}
-		out = append(out, row{inst.Name, isRunning(inst.PID), vram, inst.Port})
 	}
+	for name := range cfg.Models {
+		if !seen[name] {
+			seen[name] = true
+			names = append(names, name)
+		}
+	}
+	sort.Strings(names)
+
+	// Registry instances keyed by name so loaded models can be enriched
+	// with port/running/vram from the live process.
+	instByName := make(map[string]*Instance, len(reg.Instances))
+	for i := range reg.Instances {
+		instByName[reg.Instances[i].Name] = &reg.Instances[i]
+	}
+
+	out := make([]row, 0, len(names))
+	for _, name := range names {
+		if inst := instByName[name]; inst != nil {
+			vram := inst.EstimatedVramMB
+			if vram == 0 {
+				vram = cfg.Models[name].VramMB
+			}
+			out = append(out, row{name, isRunning(inst.PID), vram, inst.Port})
+			continue
+		}
+		// Configured but not currently loaded.
+		out = append(out, row{Name: name, Running: false, Vram: cfg.Models[name].VramMB})
+	}
+
 	jsonResp(w, out)
 }
 

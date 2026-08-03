@@ -427,3 +427,58 @@ func TestSystemdUnitFile(t *testing.T) {
 		}
 	}
 }
+
+func TestHandleUIModelsListsOnlyConfiguredModels(t *testing.T) {
+	tmp := t.TempDir()
+	cfg := testConfig(tmp)
+	cfg.Aliases = map[string]string{
+		"qwen27b":     "Qwen3.5-27B-GGUF/UD-Q4_K_XL.gguf",
+		"qwen27b_code": "Qwen3.5-27B-GGUF/UD-Q4_K_XL.gguf", // same target, distinct alias
+	}
+	cfg.Models = map[string]ModelConfig{
+		"qwen27b":     {VramMB: 18000},
+		"qwen27b_code": {VramMB: 16000},
+	}
+
+	// A stray model file on disk that is NOT referenced by any alias/model
+	// in config must NOT appear in the UI list.
+	writeHFModel(t, tmp, "test", "stray-model", "abc123", "stray-model.Q4.gguf")
+
+	rec := &responseRecorder{}
+	handleUIModels(rec, cfg)
+
+	var models []struct {
+		Name    string `json:"name"`
+		Running bool   `json:"running"`
+		Vram    int    `json:"vram"`
+	}
+	if err := json.Unmarshal(rec.body.Bytes(), &models); err != nil {
+		t.Fatal(err)
+	}
+
+	got := make(map[string]int) // name -> vram
+	for _, m := range models {
+		got[m.Name] = m.Vram
+	}
+	if len(got) != 2 {
+		t.Fatalf("expected 2 configured models, got %d: %v", len(got), got)
+	}
+	for name := range cfg.Aliases {
+		if _, ok := got[name]; !ok {
+			t.Errorf("expected configured alias %q in UI list, got: %v", name, got)
+		}
+	}
+	if got["qwen27b"] != 18000 {
+		t.Errorf("qwen27b vram = %d, want 18000", got["qwen27b"])
+	}
+	if got["qwen27b_code"] != 16000 {
+		t.Errorf("qwen27b_code vram = %d, want 16000", got["qwen27b_code"])
+	}
+
+	// The stray on-disk model must never leak in.
+	for name := range got {
+		if strings.Contains(name, "stray-model") {
+			t.Errorf("stray disk model leaked into UI list: %q", name)
+		}
+	}
+}

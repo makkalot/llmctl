@@ -69,16 +69,16 @@ td{padding:.55rem .5rem;border-top:1px solid #1e293b;font-size:.85rem}
   <div class="card">
     <h2>Models</h2>
     <template x-if="models.length === 0">
-      <div class="empty">No models loaded</div>
+      <div class="empty">No models found</div>
     </template>
     <table x-show="models.length > 0">
       <tr><th>Name</th><th>Status</th><th>VRAM</th><th>Port</th><th></th></tr>
       <template x-for="m in models" :key="m.name">
         <tr>
           <td x-text="m.name"></td>
-          <td><span class="badge" :class="m.running ? 'on' : 'off'" x-text="m.running ? 'Loaded' : 'Unloaded'"></span></td>
+          <td><span class="badge" :class="m.running ? 'on' : 'off'" x-text="m.running ? 'Loaded' : 'Available'"></span></td>
           <td x-text="m.vram + ' MB'"></td>
-          <td x-text="m.port"></td>
+          <td x-text="m.port || '—'"></td>
           <td>
             <button class="btn" :class="m.running ? 'stop' : 'go'"
                     :disabled="loading === m.name"
