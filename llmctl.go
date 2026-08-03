@@ -104,6 +104,65 @@ func homeDir() string {
 	return h
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// Token Stats
+// ═══════════════════════════════════════════════════════════════════════════
+
+type TokenStats struct {
+	InputTokens    int64     `json:"input_tokens"`
+	OutputTokens   int64     `json:"output_tokens"`
+	TotalTokens    int64     `json:"total_tokens"`
+	Requests       int       `json:"requests"`
+	FirstSeen      time.Time `json:"first_seen"`
+	LastSeen       time.Time `json:"last_seen"`
+}
+
+var tokenMu sync.RWMutex
+var tokenStats = map[string]*TokenStats{}
+
+func recordTokens(model string, promptTokens, completionTokens int64) {
+	tokenMu.Lock()
+	defer tokenMu.Unlock()
+	s, ok := tokenStats[model]
+	if !ok {
+		s = &TokenStats{FirstSeen: time.Now()}
+		tokenStats[model] = s
+	}
+	s.InputTokens += promptTokens
+	s.OutputTokens += completionTokens
+	s.TotalTokens = s.InputTokens + s.OutputTokens
+	s.Requests++
+	s.LastSeen = time.Now()
+}
+
+func getTokenStats() map[string]*TokenStats {
+	tokenMu.RLock()
+	defer tokenMu.RUnlock()
+	out := make(map[string]*TokenStats, len(tokenStats))
+	for k, v := range tokenStats {
+		copy := *v
+		out[k] = &copy
+	}
+	return out
+}
+
+func getTokenSummary() *TokenStats {
+	tokenMu.RLock()
+	defer tokenMu.RUnlock()
+	var s TokenStats
+	for _, v := range tokenStats {
+		s.InputTokens += v.InputTokens
+		s.OutputTokens += v.OutputTokens
+		s.TotalTokens += v.TotalTokens
+		s.Requests += v.Requests
+	}
+	if s.TotalTokens > 0 {
+		s.FirstSeen = time.Time{}
+		s.LastSeen = time.Now()
+	}
+	return &s
+}
+
 func configPath() string   { return filepath.Join(homeDir(), configFile) }
 func modelsDir() string    { return filepath.Join(homeDir(), defaultModels) }
 func registryPath() string { return filepath.Join(homeDir(), registryFile) }
@@ -1098,6 +1157,12 @@ func handleUILogs(w http.ResponseWriter, cfg Config) {
 	jsonResp(w, out)
 }
 
+func handleUITokens(w http.ResponseWriter) {
+	stats := getTokenStats()
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(stats)
+}
+
 func startProxy(cfg Config) {
 	reg := loadRegistry()
 	reg.CleanDead()
@@ -1177,6 +1242,10 @@ func startProxy(cfg Config) {
 		}
 		if strings.HasPrefix(r.URL.Path, "/api/ui/logs") {
 			handleUILogs(w, cfg)
+			return
+		}
+		if strings.HasPrefix(r.URL.Path, "/api/ui/tokens") {
+			handleUITokens(w)
 			return
 		}
 
@@ -1269,9 +1338,35 @@ func startProxy(cfg Config) {
 				req.URL.Host = target.Host
 				req.Host = target.Host
 			},
+			ModifyResponse: func(resp *http.Response) error {
+				if resp.Header.Get("Content-Type") == "application/json" {
+					body, err := io.ReadAll(resp.Body)
+					if err == nil {
+						extractTokensFromResponse(body, routedName)
+					}
+					resp.Body = io.NopCloser(bytes.NewReader(body))
+					resp.ContentLength = int64(len(body))
+				}
+				return nil
+			},
 		}
 		proxy.ServeHTTP(w, r)
 	})
+
+	func extractTokensFromResponse(body []byte, model string) {
+		var resp struct {
+			Usage *struct {
+				PromptTokens     int64 `json:"prompt_tokens"`
+				CompletionTokens int64 `json:"completion_tokens"`
+			} `json:"usage"`
+		}
+		if err := json.Unmarshal(body, &resp); err != nil {
+			return
+		}
+		if resp.Usage != nil && (resp.Usage.PromptTokens > 0 || resp.Usage.CompletionTokens > 0) {
+			recordTokens(model, resp.Usage.PromptTokens, resp.Usage.CompletionTokens)
+		}
+	}
 
 	addr := fmt.Sprintf("%s:%d", cfg.Host, cfg.Port)
 	fmt.Printf("Proxy listening on %s\n", addr)
