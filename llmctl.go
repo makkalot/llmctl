@@ -135,6 +135,21 @@ func recordTokens(model string, promptTokens, completionTokens int64) {
 	s.LastSeen = time.Now()
 }
 
+func extractTokensFromResponse(body []byte, model string) {
+	var resp struct {
+		Usage *struct {
+			PromptTokens     int64 `json:"prompt_tokens"`
+			CompletionTokens int64 `json:"completion_tokens"`
+		} `json:"usage"`
+	}
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return
+	}
+	if resp.Usage != nil && (resp.Usage.PromptTokens > 0 || resp.Usage.CompletionTokens > 0) {
+		recordTokens(model, resp.Usage.PromptTokens, resp.Usage.CompletionTokens)
+	}
+}
+
 func getTokenStats() map[string]*TokenStats {
 	tokenMu.RLock()
 	defer tokenMu.RUnlock()
@@ -1352,21 +1367,6 @@ func startProxy(cfg Config) {
 		}
 		proxy.ServeHTTP(w, r)
 	})
-
-	func extractTokensFromResponse(body []byte, model string) {
-		var resp struct {
-			Usage *struct {
-				PromptTokens     int64 `json:"prompt_tokens"`
-				CompletionTokens int64 `json:"completion_tokens"`
-			} `json:"usage"`
-		}
-		if err := json.Unmarshal(body, &resp); err != nil {
-			return
-		}
-		if resp.Usage != nil && (resp.Usage.PromptTokens > 0 || resp.Usage.CompletionTokens > 0) {
-			recordTokens(model, resp.Usage.PromptTokens, resp.Usage.CompletionTokens)
-		}
-	}
 
 	addr := fmt.Sprintf("%s:%d", cfg.Host, cfg.Port)
 	fmt.Printf("Proxy listening on %s\n", addr)
