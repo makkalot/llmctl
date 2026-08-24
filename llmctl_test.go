@@ -2,12 +2,16 @@ package main
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func intPtr(n int) *int {
@@ -40,15 +44,6 @@ func writeLocalModel(t *testing.T, path string) string {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(path, []byte("gguf"), 0644); err != nil {
-		t.Fatal(err)
-	}
-	return path
-}
-
-func writeSizedModel(t *testing.T, path string, size int64) string {
-	t.Helper()
-	path = writeLocalModel(t, path)
-	if err := os.Truncate(path, size); err != nil {
 		t.Fatal(err)
 	}
 	return path
@@ -394,9 +389,12 @@ func TestHandleListModelsIncludesAutoLoadModels(t *testing.T) {
 		"autoload": {AutoLoad: true},
 		"manual":   {},
 	}
+	if err := saveConfig(cfg); err != nil {
+		t.Fatal(err)
+	}
 
 	rec := &responseRecorder{}
-	handleListModels(rec, cfg)
+	handleListModels(rec, nil)
 
 	var body struct {
 		Data []struct {
@@ -428,15 +426,77 @@ func TestSystemdUnitFile(t *testing.T) {
 	}
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// Auth tests
+// ═══════════════════════════════════════════════════════════════════════════
+
+func TestGenerateAPIKey(t *testing.T) {
+	plain, hashed := generateAPIKey()
+	if !strings.HasPrefix(plain, "llmctl_") {
+		t.Fatalf("plain key missing prefix: %q", plain)
+	}
+	if len(plain) != 7+64 { // "llmctl_" + 32 bytes hex
+		t.Fatalf("plain key length = %d, want 71", len(plain))
+	}
+	// Verify hash matches
+	expected := sha256.Sum256([]byte(plain))
+	wantHash := hex.EncodeToString(expected[:])
+	if hashed != wantHash {
+		t.Fatalf("hashed = %q, want %q", hashed, wantHash)
+	}
+}
+
+func TestFindAPIKeyByHash(t *testing.T) {
+	keys := []APIKey{
+		{Key: "abc123", Name: "dev"},
+		{Key: "def456", Name: "prod"},
+	}
+	got := findAPIKeyByHash(keys, "def456")
+	if got == nil || got.Name != "prod" {
+		t.Fatalf("findAPIKeyByHash() = %+v, want prod", got)
+	}
+	if findAPIKeyByHash(keys, "nonexistent") != nil {
+		t.Fatal("findAPIKeyByHash() should return nil for missing key")
+	}
+}
+
+func TestRateLimiterAllow(t *testing.T) {
+	rl := newRateLimiter(1*time.Minute, 3)
+
+	// First 3 requests should pass
+	for i := 0; i < 3; i++ {
+		if !rl.allow("key1", 3) {
+			t.Fatalf("request %d should be allowed", i+1)
+		}
+	}
+	// 4th should be blocked
+	if rl.allow("key1", 3) {
+		t.Fatal("4th request should be blocked")
+	}
+	// Different key should still be allowed
+	if !rl.allow("key2", 3) {
+		t.Fatal("different key should be allowed")
+	}
+}
+
+func TestRateLimiterUnlimited(t *testing.T) {
+	rl := newRateLimiter(1*time.Minute, 0)
+	for i := 0; i < 100; i++ {
+		if !rl.allow("key1", 0) {
+			t.Fatalf("unlimited key blocked at request %d", i+1)
+		}
+	}
+}
+
 func TestHandleUIModelsListsOnlyConfiguredModels(t *testing.T) {
 	tmp := t.TempDir()
 	cfg := testConfig(tmp)
 	cfg.Aliases = map[string]string{
-		"qwen27b":     "Qwen3.5-27B-GGUF/UD-Q4_K_XL.gguf",
+		"qwen27b":      "Qwen3.5-27B-GGUF/UD-Q4_K_XL.gguf",
 		"qwen27b_code": "Qwen3.5-27B-GGUF/UD-Q4_K_XL.gguf", // same target, distinct alias
 	}
 	cfg.Models = map[string]ModelConfig{
-		"qwen27b":     {VramMB: 18000},
+		"qwen27b":      {VramMB: 18000},
 		"qwen27b_code": {VramMB: 16000},
 	}
 
@@ -481,4 +541,322 @@ func TestHandleUIModelsListsOnlyConfiguredModels(t *testing.T) {
 			t.Errorf("stray disk model leaked into UI list: %q", name)
 		}
 	}
+}
+
+func TestRateLimiterPerKeyStricterThanGlobal(t *testing.T) {
+	// Global limit = 10, per-key = 2 → should block after 2
+	rl := newRateLimiter(1*time.Minute, 10)
+	for i := 0; i < 2; i++ {
+		if !rl.allow("key1", 2) {
+			t.Fatalf("request %d should be allowed", i+1)
+		}
+	}
+	if rl.allow("key1", 2) {
+		t.Fatal("should use stricter per-key limit (2)")
+	}
+}
+
+func TestAuthMiddlewareRejectsMissingKey(t *testing.T) {
+	cfg := Config{}
+	handler := authMiddleware(cfg, nil, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+	}))
+
+	req := httptest.NewRequest("GET", "/v1/models", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != 401 {
+		t.Fatalf("authMiddleware() = %d, want 401", rec.Code)
+	}
+}
+
+func TestAuthMiddlewareAllowsHealth(t *testing.T) {
+	cfg := Config{}
+	called := false
+	handler := authMiddleware(cfg, nil, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+		w.WriteHeader(200)
+	}))
+
+	req := httptest.NewRequest("GET", "/health", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != 200 || !called {
+		t.Fatalf("health endpoint should bypass auth, got %d called=%v", rec.Code, called)
+	}
+}
+
+func TestAuthMiddlewareAcceptsValidKey(t *testing.T) {
+	plain, hashed := generateAPIKey()
+	cfg := Config{
+		ApiKeys: []APIKey{{Key: hashed, Name: "test", RateLimit: 0}},
+	}
+	called := false
+	handler := authMiddleware(cfg, nil, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+		w.WriteHeader(200)
+	}))
+
+	req := httptest.NewRequest("GET", "/v1/models", nil)
+	req.Header.Set("Authorization", "Bearer "+plain)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != 200 || !called {
+		t.Fatalf("valid key rejected, got %d called=%v", rec.Code, called)
+	}
+}
+
+func TestAuthMiddlewareEnforcesRateLimit(t *testing.T) {
+	plain, hashed := generateAPIKey()
+	cfg := Config{
+		ApiKeys: []APIKey{{Key: hashed, Name: "test", RateLimit: 2}},
+	}
+	rl := newRateLimiter(1*time.Minute, 0)
+	handler := authMiddleware(cfg, rl, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+	}))
+
+	// First 2 should pass
+	for i := 0; i < 2; i++ {
+		req := httptest.NewRequest("GET", "/v1/models", nil)
+		req.Header.Set("Authorization", "Bearer "+plain)
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		if rec.Code != 200 {
+			t.Fatalf("request %d blocked, want 200 got %d", i+1, rec.Code)
+		}
+	}
+	// 3rd should be rate-limited
+	req := httptest.NewRequest("GET", "/v1/models", nil)
+	req.Header.Set("Authorization", "Bearer "+plain)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != 429 {
+		t.Fatalf("rate limit not enforced, got %d want 429", rec.Code)
+	}
+}
+
+func TestAuthMiddlewareRejectsInvalidKey(t *testing.T) {
+	_, hashed := generateAPIKey()
+	cfg := Config{
+		ApiKeys: []APIKey{{Key: hashed, Name: "secret"}},
+	}
+	handler := authMiddleware(cfg, nil, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+	}))
+
+	req := httptest.NewRequest("GET", "/v1/models", nil)
+	req.Header.Set("Authorization", "Bearer llmctl_wrongkey123")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != 401 {
+		t.Fatalf("invalid key accepted, got %d want 401", rec.Code)
+	}
+}
+
+func TestAuthMiddlewareSetsKeyContext(t *testing.T) {
+	plain, hashed := generateAPIKey()
+	cfg := Config{
+		ApiKeys: []APIKey{{Key: hashed, Name: "scoped", Models: []string{"a"}}},
+	}
+	handler := authMiddleware(cfg, nil, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		k := apiKeyFromRequest(r)
+		if k == nil || k.Name != "scoped" || len(k.Models) != 1 {
+			w.WriteHeader(500)
+			return
+		}
+		w.WriteHeader(200)
+	}))
+
+	req := httptest.NewRequest("GET", "/v1/models", nil)
+	req.Header.Set("Authorization", "Bearer "+plain)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != 200 {
+		t.Fatalf("authenticated key not attached to context, got %d", rec.Code)
+	}
+}
+
+// scopeTestConfig builds a config with two models (a.gguf, b.gguf) and an
+// alias "fast" → a.gguf, in a temp dir.
+func scopeTestConfig(t *testing.T) (Config, string) {
+	t.Helper()
+	modelsDir := t.TempDir()
+	for _, f := range []string{"a.gguf", "b.gguf"} {
+		if err := os.WriteFile(filepath.Join(modelsDir, f), nil, 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cfg := testConfig(modelsDir)
+	cfg.Aliases["fast"] = "a.gguf"
+	return cfg, modelsDir
+}
+
+func TestKeyAllowsModel(t *testing.T) {
+	cfg, modelsDir := scopeTestConfig(t)
+	instA := Instance{Name: "fast", Model: filepath.Join(modelsDir, "a.gguf")}
+	instB := Instance{Name: "b", Model: filepath.Join(modelsDir, "b.gguf")}
+
+	tests := []struct {
+		name string
+		key  *APIKey
+		inst Instance
+		want bool
+	}{
+		{"nil key allows everything", nil, instA, true},
+		{"empty scope allows everything", &APIKey{Name: "dev"}, instA, true},
+		{"exact instance name match", &APIKey{Models: []string{"fast"}}, instA, true},
+		{"model file match", &APIKey{Models: []string{"a.gguf"}}, instA, true},
+		{"alias resolves to same weights", &APIKey{Models: []string{"fast"}}, instB, false},
+		{"different model denied", &APIKey{Models: []string{"b.gguf"}}, instA, false},
+		{"multiple scopes one matches", &APIKey{Models: []string{"b.gguf", "a"}}, instA, true},
+		{"no model path, name mismatch denied", &APIKey{Models: []string{"a.gguf"}}, Instance{Name: "other"}, false},
+		{"no model path, name match allowed", &APIKey{Models: []string{"other"}}, Instance{Name: "other"}, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := keyAllowsModel(tt.key, cfg, tt.inst); got != tt.want {
+				t.Fatalf("keyAllowsModel() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestValidateModelScopeRefs(t *testing.T) {
+	cfg, _ := scopeTestConfig(t)
+
+	if problems := validateModelScopeRefs(cfg, []string{"fast", "b.gguf"}); len(problems) != 0 {
+		t.Fatalf("valid refs reported problems: %v", problems)
+	}
+
+	problems := validateModelScopeRefs(cfg, []string{"nope"})
+	if len(problems) == 0 {
+		t.Fatal("invalid ref should produce problems")
+	}
+	if !strings.Contains(problems[0], "nope") {
+		t.Fatalf("problems should name the bad ref: %v", problems)
+	}
+	if !strings.Contains(problems[len(problems)-1], "Valid names") {
+		t.Fatalf("problems should list valid names: %v", problems)
+	}
+}
+
+func TestCmdAuthGenerateWithModelScope(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	modelsDir := filepath.Join(tmp, "models")
+	if err := os.MkdirAll(modelsDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(modelsDir, "a.gguf"), nil, 0644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := testConfig(modelsDir)
+	cfg.Aliases["fast"] = "a.gguf"
+
+	cmdAuthGenerate(cfg, []string{"dev", "--model", "fast", "--limit", "10"})
+
+	reloaded := loadConfig()
+	if len(reloaded.ApiKeys) != 1 {
+		t.Fatalf("expected 1 key, got %d", len(reloaded.ApiKeys))
+	}
+	k := reloaded.ApiKeys[0]
+	if k.Name != "dev" || k.RateLimit != 10 {
+		t.Fatalf("key = %+v, want name=dev limit=10", k)
+	}
+	if len(k.Models) != 1 || k.Models[0] != "fast" {
+		t.Fatalf("key.Models = %v, want [fast]", k.Models)
+	}
+}
+
+func TestCmdAuthModelsSetAndClear(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	cfg, _ := scopeTestConfig(t)
+	cfg.ApiKeys = []APIKey{{Key: "hash", Name: "dev"}}
+
+	cmdAuthModels(cfg, []string{"dev", "fast"})
+	if len(cfg.ApiKeys[0].Models) != 1 || cfg.ApiKeys[0].Models[0] != "fast" {
+		t.Fatalf("Models = %v, want [fast]", cfg.ApiKeys[0].Models)
+	}
+
+	// No refs clears the restriction
+	cmdAuthModels(cfg, []string{"dev"})
+	if len(cfg.ApiKeys[0].Models) != 0 {
+		t.Fatalf("Models = %v, want empty", cfg.ApiKeys[0].Models)
+	}
+
+	// Persists to config file
+	reloaded := loadConfig()
+	if len(reloaded.ApiKeys) != 1 || len(reloaded.ApiKeys[0].Models) != 0 {
+		t.Fatalf("reloaded key = %+v, want 1 key with no scope", reloaded.ApiKeys)
+	}
+}
+
+func TestHandleListModelsFiltersByScope(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	modelsDir := filepath.Join(tmp, "models")
+	if err := os.MkdirAll(modelsDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range []string{"a.gguf", "b.gguf"} {
+		if err := os.WriteFile(filepath.Join(modelsDir, f), nil, 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	reg := Registry{Instances: []Instance{
+		{Name: "fast", Model: filepath.Join(modelsDir, "a.gguf"), PID: os.Getpid(), Port: 9100},
+		{Name: "b", Model: filepath.Join(modelsDir, "b.gguf"), PID: os.Getpid(), Port: 9101},
+	}}
+	if err := saveRegistry(reg); err != nil {
+		t.Fatal(err)
+	}
+	cfg := testConfig(modelsDir)
+	cfg.Aliases["fast"] = "a.gguf"
+	if err := saveConfig(cfg); err != nil {
+		t.Fatal(err)
+	}
+
+	listIDs := func(key *APIKey) []string {
+		rec := httptest.NewRecorder()
+		handleListModels(rec, key)
+		var resp struct {
+			Data []struct {
+				ID string `json:"id"`
+			} `json:"data"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+			t.Fatal(err)
+		}
+		var ids []string
+		for _, m := range resp.Data {
+			ids = append(ids, m.ID)
+		}
+		return ids
+	}
+
+	t.Run("unrestricted key sees all", func(t *testing.T) {
+		if ids := listIDs(nil); len(ids) != 2 {
+			t.Fatalf("ids = %v, want 2 models", ids)
+		}
+	})
+
+	t.Run("scoped key sees only in-scope model", func(t *testing.T) {
+		if ids := listIDs(&APIKey{Name: "dev", Models: []string{"fast"}}); len(ids) != 1 || ids[0] != "fast" {
+			t.Fatalf("ids = %v, want [fast]", ids)
+		}
+	})
+
+	t.Run("scope by model file matches alias instance", func(t *testing.T) {
+		if ids := listIDs(&APIKey{Name: "dev", Models: []string{"a.gguf"}}); len(ids) != 1 || ids[0] != "fast" {
+			t.Fatalf("ids = %v, want [fast]", ids)
+		}
+	})
 }

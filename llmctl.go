@@ -1,9 +1,13 @@
 package main
 
 import (
-	"embed"
 	"bufio"
 	"bytes"
+	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"embed"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -73,6 +77,14 @@ func validateAutoswitchConfig(cfg Config) error {
 	return nil
 }
 
+type APIKey struct {
+	Key       string   `json:"key"`              // hashed API key (SHA-256 hex)
+	Name      string   `json:"name"`             // human-readable label
+	RateLimit int      `json:"rate_limit"`       // requests per minute; 0 = unlimited
+	CreatedAt string   `json:"created_at"`       // ISO 8601 timestamp
+	Models    []string `json:"models,omitempty"` // allowed aliases/model names; empty = all
+}
+
 type Config struct {
 	ModelsDir  string                 `json:"models_dir"`
 	ServerBin  string                 `json:"server_bin"`
@@ -85,6 +97,7 @@ type Config struct {
 	Aliases    map[string]string      `json:"aliases,omitempty"`
 	Models     map[string]ModelConfig `json:"models,omitempty"`
 	Autoswitch AutoswitchConfig       `json:"autoswitch,omitempty"`
+	ApiKeys    []APIKey               `json:"api_keys,omitempty"`
 }
 
 func defaultConfig() Config {
@@ -127,6 +140,390 @@ func loadConfig() Config {
 func saveConfig(cfg Config) error {
 	data, _ := json.MarshalIndent(cfg, "", "  ")
 	return os.WriteFile(configPath(), data, 0644)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Auth — API key generation, hashing, validation
+// ═══════════════════════════════════════════════════════════════════════════
+
+func generateAPIKey() (plain string, hashed string) {
+	b := make([]byte, 32)
+	_, _ = rand.Read(b)
+	prefix := "llmctl_"
+	payload := hex.EncodeToString(b)
+	plain = prefix + payload
+	h := sha256.Sum256([]byte(plain))
+	return plain, hex.EncodeToString(h[:])
+}
+
+func findAPIKeyByHash(keys []APIKey, hashed string) *APIKey {
+	for i := range keys {
+		if keys[i].Key == hashed {
+			return &keys[i]
+		}
+	}
+	return nil
+}
+
+// apiKeyContextKey is the context key under which authMiddleware stores the
+// authenticated API key for downstream handlers.
+type apiKeyContextKey struct{}
+
+// apiKeyFromRequest returns the authenticated API key set by authMiddleware,
+// or nil when the request bypassed auth (e.g. /health).
+func apiKeyFromRequest(r *http.Request) *APIKey {
+	if k, ok := r.Context().Value(apiKeyContextKey{}).(*APIKey); ok {
+		return k
+	}
+	return nil
+}
+
+// keyAllowsModel reports whether key may access the given model instance.
+// Matching is at the model level: a scope entry matches if it equals the
+// instance name or resolves (via alias/config lookup) to the same .gguf
+// file as the instance. An empty scope means unrestricted access.
+func keyAllowsModel(key *APIKey, cfg Config, inst Instance) bool {
+	if key == nil || len(key.Models) == 0 {
+		return true
+	}
+	allowedPaths := make(map[string]bool)
+	allowedNames := make(map[string]bool, len(key.Models))
+	for _, ref := range key.Models {
+		allowedNames[ref] = true
+		if p, err := resolveModel(cfg, ref); err == nil {
+			allowedPaths[filepath.Clean(p)] = true
+		}
+	}
+	if allowedNames[inst.Name] {
+		return true
+	}
+	if inst.Model != "" {
+		return allowedPaths[filepath.Clean(inst.Model)]
+	}
+	return false
+}
+
+// validateModelScopeRefs ensures every ref resolves to a known model.
+// Returns one line per invalid ref (empty when all refs are valid).
+func validateModelScopeRefs(cfg Config, refs []string) []string {
+	var problems []string
+	for _, ref := range refs {
+		if _, err := resolveModel(cfg, ref); err != nil {
+			problems = append(problems, fmt.Sprintf("  %s: %v", ref, err))
+		}
+	}
+	if len(problems) > 0 {
+		problems = append(problems, "  Valid names: "+strings.Join(validModelNames(cfg), ", "))
+	}
+	return problems
+}
+
+// validModelNames lists model names usable in API key scopes: aliases,
+// per-model config keys, and discoverable .gguf model refs.
+func validModelNames(cfg Config) []string {
+	seen := map[string]bool{}
+	var names []string
+	add := func(n string) {
+		if n != "" && !seen[n] {
+			seen[n] = true
+			names = append(names, n)
+		}
+	}
+	for a := range cfg.Aliases {
+		add(a)
+	}
+	for m := range cfg.Models {
+		add(m)
+	}
+	for _, rel := range listModelFiles(cfg.ModelsDir) {
+		add(modelRef(cfg.ModelsDir, filepath.Join(cfg.ModelsDir, rel)))
+	}
+	sort.Strings(names)
+	return names
+}
+
+// rateLimiter tracks per-key request counts with a sliding window.
+type rateLimiter struct {
+	mu      sync.Mutex
+	records map[string][]time.Time
+	window  time.Duration
+	maxReqs int
+}
+
+func newRateLimiter(window time.Duration, maxReqs int) *rateLimiter {
+	return &rateLimiter{
+		records: make(map[string][]time.Time),
+		window:  window,
+		maxReqs: maxReqs,
+	}
+}
+
+// allow checks whether keyID may make a request now given maxReqs in the window.
+func (rl *rateLimiter) allow(keyID string, maxReqs int) bool {
+	if maxReqs <= 0 {
+		return true // unlimited
+	}
+	// Use the stricter of the two limits
+	effectiveLimit := maxReqs
+	if rl.maxReqs > 0 && rl.maxReqs < effectiveLimit {
+		effectiveLimit = rl.maxReqs
+	}
+	if effectiveLimit <= 0 {
+		return true
+	}
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+	now := time.Now()
+	cutoff := now.Add(-rl.window)
+	// Prune old records
+	recs := rl.records[keyID]
+	valid := make([]time.Time, 0, len(recs))
+	for _, t := range recs {
+		if t.After(cutoff) {
+			valid = append(valid, t)
+		}
+	}
+	if len(valid) >= effectiveLimit {
+		rl.records[keyID] = valid
+		return false
+	}
+	valid = append(valid, now)
+	rl.records[keyID] = valid
+	return true
+}
+
+// authMiddleware returns an http.Handler that validates the Authorization header
+// (Bearer <api-key>) against the config's API keys and enforces rate limits.
+func authMiddleware(cfg Config, limiter *rateLimiter, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Allow /health and unauthenticated OPTIONS
+		if r.URL.Path == "/health" || r.Method == "OPTIONS" {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		auth := r.Header.Get("Authorization")
+		if auth == "" {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(401)
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"error": map[string]string{
+					"message": "API key required. Use `llmctl auth generate` to create one.",
+					"type":    "invalid_request_error",
+				},
+			})
+			return
+		}
+
+		// Support both "Bearer <key>" and raw key
+		plainKey := strings.TrimPrefix(auth, "Bearer ")
+		if strings.HasPrefix(plainKey, "Bearer ") {
+			plainKey = auth // wasn't Bearer, use as-is
+		}
+
+		h := sha256.Sum256([]byte(plainKey))
+		hashed := hex.EncodeToString(h[:])
+		key := findAPIKeyByHash(cfg.ApiKeys, hashed)
+		if key == nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(401)
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"error": map[string]string{
+					"message": "Invalid API key.",
+					"type":    "invalid_request_error",
+				},
+			})
+			return
+		}
+
+		// Attach the authenticated key for downstream model-scope checks.
+		r = r.WithContext(context.WithValue(r.Context(), apiKeyContextKey{}, key))
+
+		if limiter != nil && !limiter.allow(key.Key, key.RateLimit) {
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("Retry-After", "60")
+			w.WriteHeader(429)
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"error": map[string]string{
+					"message": fmt.Sprintf("Rate limit exceeded (%d req/min).", key.RateLimit),
+					"type":    "rate_limit_error",
+				},
+			})
+			return
+		}
+
+		next.ServeHTTP(w, r)
+	})
+}
+
+// cmdAuth handles `llmctl auth <generate|list|revoke>`
+func cmdAuth(args []string) {
+	if len(args) < 1 {
+		fmt.Println("Usage: llmctl auth <generate|list|revoke|models>")
+		fmt.Println("  generate <name> [--limit N] [--model <ref>]...  Create a new API key (N req/min, 0=unlimited)")
+		fmt.Println("  list                         List all API keys")
+		fmt.Println("  revoke <name>                Revoke an API key by name")
+		fmt.Println("  models <name> [ref]...       Set which models a key may use (no refs = all)")
+		os.Exit(1)
+	}
+
+	cfg := loadConfig()
+	switch args[0] {
+	case "generate":
+		cmdAuthGenerate(cfg, args[1:])
+	case "list":
+		cmdAuthList(cfg)
+	case "revoke":
+		cmdAuthRevoke(cfg, args[1:])
+	case "models":
+		cmdAuthModels(cfg, args[1:])
+	default:
+		fmt.Fprintf(os.Stderr, "Unknown auth subcommand: %s\n", args[0])
+		os.Exit(1)
+	}
+}
+
+func cmdAuthGenerate(cfg Config, args []string) {
+	name := "default"
+	rateLimit := 60 // default 60 req/min
+	var modelRefs []string
+	if len(args) > 0 {
+		name = args[0]
+	}
+	for i := 1; i < len(args); i++ {
+		if args[i] == "--limit" && i+1 < len(args) {
+			rateLimit, _ = strconv.Atoi(args[i+1])
+		} else if args[i] == "--model" && i+1 < len(args) {
+			modelRefs = append(modelRefs, args[i+1])
+		}
+	}
+
+	// Check if name already exists
+	for _, k := range cfg.ApiKeys {
+		if k.Name == name {
+			fmt.Fprintf(os.Stderr, "Error: API key '%s' already exists. Use a different name or `llmctl auth revoke %s` first.\n", name, name)
+			os.Exit(1)
+		}
+	}
+
+	// Validate model scope refs
+	if problems := validateModelScopeRefs(cfg, modelRefs); len(problems) > 0 {
+		fmt.Fprintf(os.Stderr, "Error: invalid --model refs:\n%s\n", strings.Join(problems, "\n"))
+		os.Exit(1)
+	}
+
+	plain, hashed := generateAPIKey()
+	cfg.ApiKeys = append(cfg.ApiKeys, APIKey{
+		Key:       hashed,
+		Name:      name,
+		RateLimit: rateLimit,
+		CreatedAt: time.Now().UTC().Format(time.RFC3339),
+		Models:    modelRefs,
+	})
+	if err := saveConfig(cfg); err != nil {
+		fmt.Fprintf(os.Stderr, "Error saving config: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Println("API key created:")
+	fmt.Printf("  Name:    %s\n", name)
+	fmt.Printf("  Key:     %s\n", plain)
+	fmt.Printf("  Limit:   %s\n", func() string {
+		if rateLimit == 0 {
+			return "unlimited"
+		}
+		return fmt.Sprintf("%d req/min", rateLimit)
+	}())
+	if len(modelRefs) > 0 {
+		fmt.Printf("  Models:  %s\n", strings.Join(modelRefs, ", "))
+	} else {
+		fmt.Println("  Models:  all")
+	}
+	fmt.Println()
+	fmt.Println("⚠  Save this key now — it will not be shown again.")
+	fmt.Println("   Use it as: Authorization: Bearer <key>")
+}
+
+func cmdAuthList(cfg Config) {
+	if len(cfg.ApiKeys) == 0 {
+		fmt.Println("No API keys configured.")
+		fmt.Println("Run `llmctl auth generate <name>` to create one.")
+		return
+	}
+	fmt.Printf("%-15s %-15s %-10s %-24s %s\n", "Name", "Created", "Limit", "Models", "Hash (prefix)")
+	fmt.Println(strings.Repeat("-", 90))
+	for _, k := range cfg.ApiKeys {
+		models := "all"
+		if len(k.Models) > 0 {
+			models = strings.Join(k.Models, ",")
+		}
+		fmt.Printf("%-15s %-15s %-10s %-24s %s...\n", k.Name, k.CreatedAt, func() string {
+			if k.RateLimit == 0 {
+				return "unlimited"
+			}
+			return fmt.Sprintf("%d/min", k.RateLimit)
+		}(), models, k.Key[:16])
+	}
+}
+
+func cmdAuthRevoke(cfg Config, args []string) {
+	if len(args) < 1 {
+		fmt.Fprintln(os.Stderr, "Usage: llmctl auth revoke <name>")
+		os.Exit(1)
+	}
+	name := args[0]
+	found := false
+	newKeys := make([]APIKey, 0, len(cfg.ApiKeys))
+	for _, k := range cfg.ApiKeys {
+		if k.Name == name {
+			found = true
+			continue
+		}
+		newKeys = append(newKeys, k)
+	}
+	if !found {
+		fmt.Fprintf(os.Stderr, "Error: API key '%s' not found.\n", name)
+		os.Exit(1)
+	}
+	cfg.ApiKeys = newKeys
+	if err := saveConfig(cfg); err != nil {
+		fmt.Fprintf(os.Stderr, "Error saving config: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Printf("Revoked API key '%s'.\n", name)
+}
+
+func cmdAuthModels(cfg Config, args []string) {
+	if len(args) < 1 {
+		fmt.Fprintln(os.Stderr, "Usage: llmctl auth models <name> [ref]...")
+		fmt.Fprintln(os.Stderr, "  Set which models an API key may use. No refs = unrestricted.")
+		os.Exit(1)
+	}
+	name := args[0]
+	refs := args[1:]
+
+	if problems := validateModelScopeRefs(cfg, refs); len(problems) > 0 {
+		fmt.Fprintf(os.Stderr, "Error: invalid model refs:\n%s\n", strings.Join(problems, "\n"))
+		os.Exit(1)
+	}
+
+	for i := range cfg.ApiKeys {
+		if cfg.ApiKeys[i].Name == name {
+			cfg.ApiKeys[i].Models = refs
+			if err := saveConfig(cfg); err != nil {
+				fmt.Fprintf(os.Stderr, "Error saving config: %v\n", err)
+				os.Exit(1)
+			}
+			if len(refs) == 0 {
+				fmt.Printf("API key '%s' now has access to all models.\n", name)
+			} else {
+				fmt.Printf("API key '%s' now has access to: %s\n", name, strings.Join(refs, ", "))
+			}
+			return
+		}
+	}
+	fmt.Fprintf(os.Stderr, "Error: API key '%s' not found.\n", name)
+	os.Exit(1)
 }
 
 func mergeExtraArgs(global, perModel []string) []string {
@@ -421,14 +818,14 @@ func stopProcess(pid int) {
 	if err != nil {
 		return
 	}
-	proc.Signal(syscall.SIGTERM)
+	_ = proc.Signal(syscall.SIGTERM)
 	for i := 0; i < 50; i++ {
 		if !isRunning(pid) {
 			return
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
-	proc.Signal(syscall.SIGKILL)
+	_ = proc.Signal(syscall.SIGKILL)
 	time.Sleep(200 * time.Millisecond)
 }
 
@@ -438,7 +835,7 @@ func waitForHealth(port int, timeout time.Duration) bool {
 	for time.Now().Before(deadline) {
 		resp, err := http.Get(addr)
 		if err == nil {
-			resp.Body.Close()
+			_ = resp.Body.Close()
 			if resp.StatusCode == 200 {
 				return true
 			}
@@ -880,7 +1277,7 @@ func hasAutoLoadModels(cfg Config) bool {
 func writeOpenAIError(w http.ResponseWriter, status int, msg string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(map[string]interface{}{
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
 		"error": map[string]string{
 			"message": msg,
 			"type":    "invalid_request_error",
@@ -893,7 +1290,7 @@ func markInstanceUsed(name string) {
 	for i := range reg.Instances {
 		if reg.Instances[i].Name == name {
 			reg.Instances[i].LastUsedAt = time.Now().UnixNano()
-			saveRegistry(reg)
+			_ = saveRegistry(reg)
 			return
 		}
 	}
@@ -964,7 +1361,7 @@ func autoswitchModel(cfg Config, targetName string) (*url.URL, string, error) {
 		stopProcess(inst.PID)
 		reg := loadRegistry()
 		reg.Remove(inst.Name)
-		saveRegistry(reg)
+		_ = saveRegistry(reg)
 		return nil, "", fmt.Errorf("model %q did not become healthy before timeout", inst.Name)
 	}
 	u, _ := url.Parse(fmt.Sprintf("http://127.0.0.1:%d", inst.Port))
@@ -988,7 +1385,7 @@ func addEvent(msg string) {
 
 func jsonResp(w http.ResponseWriter, v any) {
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(v)
+	_ = json.NewEncoder(w).Encode(v)
 }
 
 func handleUIVRAM(w http.ResponseWriter, cfg Config) {
@@ -1082,7 +1479,7 @@ func handleUIUnload(w http.ResponseWriter, r *http.Request, cfg Config) {
 	}
 	stopProcess(inst.PID)
 	reg.Remove(name)
-	saveRegistry(reg)
+	_ = saveRegistry(reg)
 	addEvent("Unloaded model " + name)
 	jsonResp(w, map[string]string{"status": "unloaded"})
 }
@@ -1138,17 +1535,21 @@ func startProxy(cfg Config) {
 		}
 	}()
 
-	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	// Auth middleware + per-key rate limiter
+	limiter := newRateLimiter(1*time.Minute, 0) // global limit disabled; per-key limits used
+	innerHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		key := apiKeyFromRequest(r)
+
 		// GET /v1/models — OpenAI compatible model listing
 		if r.URL.Path == "/v1/models" && r.Method == "GET" {
-			handleListModels(w, cfg)
+			handleListModels(w, key)
 			return
 		}
 
 		// GET /health
 		if r.URL.Path == "/health" {
 			w.Header().Set("Content-Type", "application/json")
-			w.Write([]byte(`{"status":"ok"}`))
+			_, _ = w.Write([]byte(`{"status":"ok"}`))
 			return
 		}
 
@@ -1156,7 +1557,7 @@ func startProxy(cfg Config) {
 		if r.URL.Path == "/ui" || r.URL.Path == "/ui/" {
 			data, _ := webFS.ReadFile("web/index.html")
 			w.Header().Set("Content-Type", "text/html; charset=utf-8")
-			w.Write(data)
+			_, _ = w.Write(data)
 			return
 		}
 		if strings.HasPrefix(r.URL.Path, "/api/ui/vram") {
@@ -1216,6 +1617,7 @@ func startProxy(cfg Config) {
 			for name, u := range backends {
 				if strings.Contains(strings.ToLower(name), lower) {
 					target = u
+					targetName = name
 					ok = true
 					routedName = name
 					break
@@ -1247,6 +1649,7 @@ func startProxy(cfg Config) {
 			reg := loadRegistry()
 			if def := reg.Default(); def != nil {
 				target, _ = url.Parse(fmt.Sprintf("http://127.0.0.1:%d", def.Port))
+				targetName = def.Name
 				ok = true
 				routedName = def.Name
 				markInstanceUsed(routedName)
@@ -1262,6 +1665,23 @@ func startProxy(cfg Config) {
 			return
 		}
 
+		// Enforce per-key model scope (model-level: same .gguf = same model)
+		if key != nil && len(key.Models) > 0 {
+			reg := loadRegistry()
+			inst := reg.FindByName(targetName)
+			if inst == nil || !keyAllowsModel(key, cfg, *inst) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(403)
+				_ = json.NewEncoder(w).Encode(map[string]interface{}{
+					"error": map[string]string{
+						"message": fmt.Sprintf("API key '%s' is not allowed to use model '%s'", key.Name, targetName),
+						"type":    "permission_error",
+					},
+				})
+				return
+			}
+		}
+
 		// Proxy the request
 		proxy := &httputil.ReverseProxy{
 			Director: func(req *http.Request) {
@@ -1273,8 +1693,10 @@ func startProxy(cfg Config) {
 		proxy.ServeHTTP(w, r)
 	})
 
+	// Wrap with auth middleware (per-key rate limiting)
+	handler := authMiddleware(cfg, limiter, innerHandler)
+
 	addr := fmt.Sprintf("%s:%d", cfg.Host, cfg.Port)
-	fmt.Printf("Proxy listening on %s\n", addr)
 	fmt.Printf("  API: http://%s:%d/v1\n", displayHost(cfg.Host), cfg.Port)
 	fmt.Printf("  UI:  http://%s:%d/ui\n", displayHost(cfg.Host), cfg.Port)
 	addEvent("Proxy started")
@@ -1300,7 +1722,7 @@ func startProxy(cfg Config) {
 	// Save proxy PID
 	reg = loadRegistry()
 	reg.ProxyPID = os.Getpid()
-	saveRegistry(reg)
+	_ = saveRegistry(reg)
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
@@ -1309,7 +1731,7 @@ func startProxy(cfg Config) {
 		fmt.Println("\n✓ Proxy stopped.")
 		reg := loadRegistry()
 		reg.ProxyPID = 0
-		saveRegistry(reg)
+		_ = saveRegistry(reg)
 		os.Exit(0)
 	}()
 
@@ -1319,7 +1741,8 @@ func startProxy(cfg Config) {
 	}
 }
 
-func handleListModels(w http.ResponseWriter, cfg Config) {
+func handleListModels(w http.ResponseWriter, key *APIKey) {
+	cfg := loadConfig()
 	reg := loadRegistry()
 	reg.CleanDead()
 
@@ -1332,6 +1755,9 @@ func handleListModels(w http.ResponseWriter, cfg Config) {
 	var models []modelObj
 	seen := map[string]bool{}
 	for _, inst := range reg.Instances {
+		if key != nil && len(key.Models) > 0 && !keyAllowsModel(key, cfg, inst) {
+			continue
+		}
 		models = append(models, modelObj{
 			ID:      inst.Name,
 			Object:  "model",
@@ -1354,7 +1780,7 @@ func handleListModels(w http.ResponseWriter, cfg Config) {
 	sort.Slice(models, func(i, j int) bool { return models[i].ID < models[j].ID })
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
 		"object": "list",
 		"data":   models,
 	})
@@ -1558,7 +1984,7 @@ func loadInstance(cfg Config, opts loadOptions) (Instance, bool, error) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 
 	logDir := filepath.Join(homeDir(), ".llmctl-logs")
-	os.MkdirAll(logDir, 0755)
+	_ = os.MkdirAll(logDir, 0755)
 	logFile, _ := os.Create(filepath.Join(logDir, spec.InstanceName+".log"))
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
@@ -1592,7 +2018,7 @@ func loadInstance(cfg Config, opts loadOptions) (Instance, bool, error) {
 		inst.Aliases = []string{spec.AliasUsed}
 	}
 	reg.Instances = append(reg.Instances, inst)
-	saveRegistry(reg)
+	_ = saveRegistry(reg)
 
 	timeout := opts.WaitTimeout
 	if timeout <= 0 {
@@ -1609,7 +2035,7 @@ func loadInstance(cfg Config, opts loadOptions) (Instance, bool, error) {
 			if isDefault && len(reg.Instances) > 0 {
 				reg.Instances[0].IsDefault = true
 			}
-			saveRegistry(reg)
+			_ = saveRegistry(reg)
 			if opts.Verbose {
 				fmt.Fprintf(os.Stderr, "Error: '%s' exited before becoming healthy. Check: llmctl logs %s\n",
 					spec.InstanceName, spec.InstanceName)
@@ -1689,7 +2115,7 @@ func unloadInstance(name string, verbose bool) error {
 			fmt.Printf("  New default: %s\n", reg.Instances[0].Name)
 		}
 	}
-	saveRegistry(reg)
+	_ = saveRegistry(reg)
 	if verbose {
 		fmt.Println("✓ Stopped.")
 	}
@@ -1718,7 +2144,7 @@ func cmdStopAll() {
 	}
 	reg.Instances = nil
 	reg.ProxyPID = 0
-	saveRegistry(reg)
+	_ = saveRegistry(reg)
 	fmt.Println("✓ All stopped.")
 }
 
@@ -1740,14 +2166,14 @@ func cmdDefault(name string) {
 		fmt.Fprintf(os.Stderr, "Error: no instance '%s'\n", name)
 		os.Exit(1)
 	}
-	saveRegistry(reg)
+	_ = saveRegistry(reg)
 	fmt.Printf("✓ Default model: '%s'\n", name)
 }
 
 func cmdPS() {
 	reg := loadRegistry()
 	reg.CleanDead()
-	saveRegistry(reg)
+	_ = saveRegistry(reg)
 
 	if len(reg.Instances) == 0 {
 		fmt.Println("No models loaded. Use `llmctl load <model>` to start one.")
@@ -1768,7 +2194,7 @@ func cmdPS() {
 		if isRunning(inst.PID) {
 			resp, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d/health", inst.Port))
 			if err == nil {
-				resp.Body.Close()
+				_ = resp.Body.Close()
 				if resp.StatusCode == 200 {
 					status = "healthy"
 				} else {
@@ -1807,7 +2233,7 @@ func cmdPS() {
 func cmdInfo(name string) {
 	reg := loadRegistry()
 	reg.CleanDead()
-	saveRegistry(reg)
+	_ = saveRegistry(reg)
 
 	inst := reg.FindByName(name)
 	if inst == nil {
@@ -1828,7 +2254,7 @@ func cmdInfo(name string) {
 	if isRunning(inst.PID) {
 		resp, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d/health", inst.Port))
 		if err == nil {
-			resp.Body.Close()
+			_ = resp.Body.Close()
 			if resp.StatusCode == 200 {
 				status = "healthy"
 			} else {
@@ -1999,7 +2425,10 @@ func cmdAlias(cfg Config, alias, model string) {
 	}
 	model = modelRef(cfg.ModelsDir, modelPath)
 	cfg.Aliases[alias] = model
-	saveConfig(cfg)
+	if err := saveConfig(cfg); err != nil {
+		fmt.Fprintf(os.Stderr, "Error saving config: %v\n", err)
+		os.Exit(1)
+	}
 	fmt.Printf("✓ Alias '%s' → %s\n", alias, model)
 }
 
@@ -2045,14 +2474,17 @@ func cmdPull(cfg Config, repo string) {
 			os.Exit(1)
 		}
 		body, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
+		_ = resp.Body.Close()
 
 		var repoInfo struct {
 			Siblings []struct {
 				Filename string `json:"rfilename"`
 			} `json:"siblings"`
 		}
-		json.Unmarshal(body, &repoInfo)
+		if err := json.Unmarshal(body, &repoInfo); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			return
+		}
 
 		var ggufFiles []string
 		for _, s := range repoInfo.Siblings {
@@ -2134,7 +2566,7 @@ func cmdPull(cfg Config, repo string) {
 		wasCancelled = true
 		fmt.Println("\nCancelled.")
 		if cmd.Process != nil {
-			cmd.Process.Kill()
+			_ = cmd.Process.Kill()
 		}
 	}()
 
@@ -2170,7 +2602,10 @@ func cmdRM(cfg Config, modelName string) {
 	if strings.TrimSpace(strings.ToLower(input)) != "y" {
 		return
 	}
-	os.Remove(modelPath)
+	if err := os.Remove(modelPath); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
 	fmt.Printf("✓ Deleted %s\n", shortName(modelPath))
 }
 
@@ -2284,7 +2719,10 @@ func cmdSet(cfg Config, key, value string) {
 		fmt.Fprintf(os.Stderr, "Unknown key: %s\n", key)
 		os.Exit(1)
 	}
-	saveConfig(cfg)
+	if err := saveConfig(cfg); err != nil {
+		fmt.Fprintf(os.Stderr, "Error saving config: %v\n", err)
+		os.Exit(1)
+	}
 	fmt.Printf("✓ %s = %s\n", key, value)
 }
 
@@ -2362,6 +2800,12 @@ Proxy:
 Config:
   config                      Show config
   set <key> <value>           Update config
+
+Auth:
+  auth generate <name>        Create a new API key
+  auth list                   List all API keys
+  auth revoke <name>          Revoke an API key
+  auth models <name> [ref]... Set which models a key may use
 
 Workflow:
   llmctl load mistral                              # backend on :9100
@@ -2450,6 +2894,8 @@ func main() {
 			os.Exit(1)
 		}
 		cmdAlias(cfg, os.Args[2], os.Args[3])
+	case "auth":
+		cmdAuth(os.Args[2:])
 	case "config", "cfg":
 		cmdConfig(cfg)
 	case "set":

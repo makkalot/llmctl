@@ -283,6 +283,43 @@ llmctl load qwen27b       # instance "qwen27b", default params
 llmctl load qwen27b_code  # instance "qwen27b_code", code-specific params
 ```
 
+## Auth & rate limiting
+
+The proxy supports API key authentication, per-key rate limiting, and per-key model scoping. Keys are stored as SHA-256 hashes in `~/.llmctl.json`.
+
+```sh
+llmctl auth generate <name>          # create a key (prints plain key once)
+llmctl auth generate <name> --model <ref>...   # restrict a key to specific models
+llmctl auth list                     # list all keys
+llmctl auth revoke <name>            # remove a key
+llmctl auth models <name> [ref]...   # change a key's model scope (no refs = all)
+```
+
+Pass the plain key as a Bearer token:
+
+```sh
+curl http://localhost:8080/v1/chat/completions   -H "Authorization: Bearer llmctl_xxxxx"   -d '{"model": "mistral", "messages": [...]}'
+```
+
+### Model scoping
+
+A key with no `--model` flags can use every loaded model. A scoped key may only use the models it was granted — requests to other models return `403` (`permission_error`), and `/v1/models` only lists the models the key can use.
+
+Scoping is at the **model** level, not the instance level: a scope entry matches any instance serving the same weights. So scoping a key to an alias (e.g. `fast`) also allows the same model loaded under its full name, and vice versa. Scope entries accept any model ref the CLI understands — an alias, a per-model config key, or a `.gguf` filename (aliases are resolved at check time).
+
+```sh
+# Key that may only use the "fast" alias (and anything with the same weights)
+llmctl auth generate dev --model fast
+
+# Later: widen, narrow, or clear the scope without regenerating the key
+llmctl auth models dev fast mistral
+llmctl auth models dev          # no refs → unrestricted again
+```
+
+Unknown refs are rejected at the CLI with the list of valid names. Scoping is read from the config at proxy startup — restart the proxy after changing a key's scope.
+
+The `/health` endpoint is always open (no auth required). Per-key rate limits are configurable in `~/.llmctl.json` under `api_keys` (requests per minute, `0` = unlimited).
+
 ## API endpoints
 
 When the proxy is running:
