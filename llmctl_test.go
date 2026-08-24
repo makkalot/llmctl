@@ -49,15 +49,6 @@ func writeLocalModel(t *testing.T, path string) string {
 	return path
 }
 
-func writeSizedModel(t *testing.T, path string, size int64) string {
-	t.Helper()
-	path = writeLocalModel(t, path)
-	if err := os.Truncate(path, size); err != nil {
-		t.Fatal(err)
-	}
-	return path
-}
-
 type responseRecorder struct {
 	header http.Header
 	body   bytes.Buffer

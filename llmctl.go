@@ -306,7 +306,7 @@ func authMiddleware(cfg Config, limiter *rateLimiter, next http.Handler) http.Ha
 		if auth == "" {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(401)
-			json.NewEncoder(w).Encode(map[string]interface{}{
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
 				"error": map[string]string{
 					"message": "API key required. Use `llmctl auth generate` to create one.",
 					"type":    "invalid_request_error",
@@ -327,7 +327,7 @@ func authMiddleware(cfg Config, limiter *rateLimiter, next http.Handler) http.Ha
 		if key == nil {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(401)
-			json.NewEncoder(w).Encode(map[string]interface{}{
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
 				"error": map[string]string{
 					"message": "Invalid API key.",
 					"type":    "invalid_request_error",
@@ -343,7 +343,7 @@ func authMiddleware(cfg Config, limiter *rateLimiter, next http.Handler) http.Ha
 			w.Header().Set("Content-Type", "application/json")
 			w.Header().Set("Retry-After", "60")
 			w.WriteHeader(429)
-			json.NewEncoder(w).Encode(map[string]interface{}{
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
 				"error": map[string]string{
 					"message": fmt.Sprintf("Rate limit exceeded (%d req/min).", key.RateLimit),
 					"type":    "rate_limit_error",
@@ -818,14 +818,14 @@ func stopProcess(pid int) {
 	if err != nil {
 		return
 	}
-	proc.Signal(syscall.SIGTERM)
+	_ = proc.Signal(syscall.SIGTERM)
 	for i := 0; i < 50; i++ {
 		if !isRunning(pid) {
 			return
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
-	proc.Signal(syscall.SIGKILL)
+	_ = proc.Signal(syscall.SIGKILL)
 	time.Sleep(200 * time.Millisecond)
 }
 
@@ -835,7 +835,7 @@ func waitForHealth(port int, timeout time.Duration) bool {
 	for time.Now().Before(deadline) {
 		resp, err := http.Get(addr)
 		if err == nil {
-			resp.Body.Close()
+			_ = resp.Body.Close()
 			if resp.StatusCode == 200 {
 				return true
 			}
@@ -1277,7 +1277,7 @@ func hasAutoLoadModels(cfg Config) bool {
 func writeOpenAIError(w http.ResponseWriter, status int, msg string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(map[string]interface{}{
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
 		"error": map[string]string{
 			"message": msg,
 			"type":    "invalid_request_error",
@@ -1290,7 +1290,7 @@ func markInstanceUsed(name string) {
 	for i := range reg.Instances {
 		if reg.Instances[i].Name == name {
 			reg.Instances[i].LastUsedAt = time.Now().UnixNano()
-			saveRegistry(reg)
+			_ = saveRegistry(reg)
 			return
 		}
 	}
@@ -1361,7 +1361,7 @@ func autoswitchModel(cfg Config, targetName string) (*url.URL, string, error) {
 		stopProcess(inst.PID)
 		reg := loadRegistry()
 		reg.Remove(inst.Name)
-		saveRegistry(reg)
+		_ = saveRegistry(reg)
 		return nil, "", fmt.Errorf("model %q did not become healthy before timeout", inst.Name)
 	}
 	u, _ := url.Parse(fmt.Sprintf("http://127.0.0.1:%d", inst.Port))
@@ -1385,7 +1385,7 @@ func addEvent(msg string) {
 
 func jsonResp(w http.ResponseWriter, v any) {
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(v)
+	_ = json.NewEncoder(w).Encode(v)
 }
 
 func handleUIVRAM(w http.ResponseWriter, cfg Config) {
@@ -1479,7 +1479,7 @@ func handleUIUnload(w http.ResponseWriter, r *http.Request, cfg Config) {
 	}
 	stopProcess(inst.PID)
 	reg.Remove(name)
-	saveRegistry(reg)
+	_ = saveRegistry(reg)
 	addEvent("Unloaded model " + name)
 	jsonResp(w, map[string]string{"status": "unloaded"})
 }
@@ -1549,7 +1549,7 @@ func startProxy(cfg Config) {
 		// GET /health
 		if r.URL.Path == "/health" {
 			w.Header().Set("Content-Type", "application/json")
-			w.Write([]byte(`{"status":"ok"}`))
+			_, _ = w.Write([]byte(`{"status":"ok"}`))
 			return
 		}
 
@@ -1557,7 +1557,7 @@ func startProxy(cfg Config) {
 		if r.URL.Path == "/ui" || r.URL.Path == "/ui/" {
 			data, _ := webFS.ReadFile("web/index.html")
 			w.Header().Set("Content-Type", "text/html; charset=utf-8")
-			w.Write(data)
+			_, _ = w.Write(data)
 			return
 		}
 		if strings.HasPrefix(r.URL.Path, "/api/ui/vram") {
@@ -1672,7 +1672,7 @@ func startProxy(cfg Config) {
 			if inst == nil || !keyAllowsModel(key, cfg, *inst) {
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(403)
-				json.NewEncoder(w).Encode(map[string]interface{}{
+				_ = json.NewEncoder(w).Encode(map[string]interface{}{
 					"error": map[string]string{
 						"message": fmt.Sprintf("API key '%s' is not allowed to use model '%s'", key.Name, targetName),
 						"type":    "permission_error",
@@ -1722,7 +1722,7 @@ func startProxy(cfg Config) {
 	// Save proxy PID
 	reg = loadRegistry()
 	reg.ProxyPID = os.Getpid()
-	saveRegistry(reg)
+	_ = saveRegistry(reg)
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
@@ -1731,7 +1731,7 @@ func startProxy(cfg Config) {
 		fmt.Println("\n✓ Proxy stopped.")
 		reg := loadRegistry()
 		reg.ProxyPID = 0
-		saveRegistry(reg)
+		_ = saveRegistry(reg)
 		os.Exit(0)
 	}()
 
@@ -1780,7 +1780,7 @@ func handleListModels(w http.ResponseWriter, key *APIKey) {
 	sort.Slice(models, func(i, j int) bool { return models[i].ID < models[j].ID })
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
 		"object": "list",
 		"data":   models,
 	})
@@ -1984,7 +1984,7 @@ func loadInstance(cfg Config, opts loadOptions) (Instance, bool, error) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 
 	logDir := filepath.Join(homeDir(), ".llmctl-logs")
-	os.MkdirAll(logDir, 0755)
+	_ = os.MkdirAll(logDir, 0755)
 	logFile, _ := os.Create(filepath.Join(logDir, spec.InstanceName+".log"))
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
@@ -2018,7 +2018,7 @@ func loadInstance(cfg Config, opts loadOptions) (Instance, bool, error) {
 		inst.Aliases = []string{spec.AliasUsed}
 	}
 	reg.Instances = append(reg.Instances, inst)
-	saveRegistry(reg)
+	_ = saveRegistry(reg)
 
 	timeout := opts.WaitTimeout
 	if timeout <= 0 {
@@ -2035,7 +2035,7 @@ func loadInstance(cfg Config, opts loadOptions) (Instance, bool, error) {
 			if isDefault && len(reg.Instances) > 0 {
 				reg.Instances[0].IsDefault = true
 			}
-			saveRegistry(reg)
+			_ = saveRegistry(reg)
 			if opts.Verbose {
 				fmt.Fprintf(os.Stderr, "Error: '%s' exited before becoming healthy. Check: llmctl logs %s\n",
 					spec.InstanceName, spec.InstanceName)
@@ -2115,7 +2115,7 @@ func unloadInstance(name string, verbose bool) error {
 			fmt.Printf("  New default: %s\n", reg.Instances[0].Name)
 		}
 	}
-	saveRegistry(reg)
+	_ = saveRegistry(reg)
 	if verbose {
 		fmt.Println("✓ Stopped.")
 	}
@@ -2144,7 +2144,7 @@ func cmdStopAll() {
 	}
 	reg.Instances = nil
 	reg.ProxyPID = 0
-	saveRegistry(reg)
+	_ = saveRegistry(reg)
 	fmt.Println("✓ All stopped.")
 }
 
@@ -2166,14 +2166,14 @@ func cmdDefault(name string) {
 		fmt.Fprintf(os.Stderr, "Error: no instance '%s'\n", name)
 		os.Exit(1)
 	}
-	saveRegistry(reg)
+	_ = saveRegistry(reg)
 	fmt.Printf("✓ Default model: '%s'\n", name)
 }
 
 func cmdPS() {
 	reg := loadRegistry()
 	reg.CleanDead()
-	saveRegistry(reg)
+	_ = saveRegistry(reg)
 
 	if len(reg.Instances) == 0 {
 		fmt.Println("No models loaded. Use `llmctl load <model>` to start one.")
@@ -2194,7 +2194,7 @@ func cmdPS() {
 		if isRunning(inst.PID) {
 			resp, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d/health", inst.Port))
 			if err == nil {
-				resp.Body.Close()
+				_ = resp.Body.Close()
 				if resp.StatusCode == 200 {
 					status = "healthy"
 				} else {
@@ -2233,7 +2233,7 @@ func cmdPS() {
 func cmdInfo(name string) {
 	reg := loadRegistry()
 	reg.CleanDead()
-	saveRegistry(reg)
+	_ = saveRegistry(reg)
 
 	inst := reg.FindByName(name)
 	if inst == nil {
@@ -2254,7 +2254,7 @@ func cmdInfo(name string) {
 	if isRunning(inst.PID) {
 		resp, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d/health", inst.Port))
 		if err == nil {
-			resp.Body.Close()
+			_ = resp.Body.Close()
 			if resp.StatusCode == 200 {
 				status = "healthy"
 			} else {
@@ -2425,7 +2425,10 @@ func cmdAlias(cfg Config, alias, model string) {
 	}
 	model = modelRef(cfg.ModelsDir, modelPath)
 	cfg.Aliases[alias] = model
-	saveConfig(cfg)
+	if err := saveConfig(cfg); err != nil {
+		fmt.Fprintf(os.Stderr, "Error saving config: %v\n", err)
+		os.Exit(1)
+	}
 	fmt.Printf("✓ Alias '%s' → %s\n", alias, model)
 }
 
@@ -2471,14 +2474,17 @@ func cmdPull(cfg Config, repo string) {
 			os.Exit(1)
 		}
 		body, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
+		_ = resp.Body.Close()
 
 		var repoInfo struct {
 			Siblings []struct {
 				Filename string `json:"rfilename"`
 			} `json:"siblings"`
 		}
-		json.Unmarshal(body, &repoInfo)
+		if err := json.Unmarshal(body, &repoInfo); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			return
+		}
 
 		var ggufFiles []string
 		for _, s := range repoInfo.Siblings {
@@ -2560,7 +2566,7 @@ func cmdPull(cfg Config, repo string) {
 		wasCancelled = true
 		fmt.Println("\nCancelled.")
 		if cmd.Process != nil {
-			cmd.Process.Kill()
+			_ = cmd.Process.Kill()
 		}
 	}()
 
@@ -2596,7 +2602,10 @@ func cmdRM(cfg Config, modelName string) {
 	if strings.TrimSpace(strings.ToLower(input)) != "y" {
 		return
 	}
-	os.Remove(modelPath)
+	if err := os.Remove(modelPath); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
 	fmt.Printf("✓ Deleted %s\n", shortName(modelPath))
 }
 
@@ -2710,7 +2719,10 @@ func cmdSet(cfg Config, key, value string) {
 		fmt.Fprintf(os.Stderr, "Unknown key: %s\n", key)
 		os.Exit(1)
 	}
-	saveConfig(cfg)
+	if err := saveConfig(cfg); err != nil {
+		fmt.Fprintf(os.Stderr, "Error saving config: %v\n", err)
+		os.Exit(1)
+	}
 	fmt.Printf("✓ %s = %s\n", key, value)
 }
 
