@@ -171,6 +171,7 @@ llmctl set ctx_size 4096
 | `port` | `8080` | Proxy listen port |
 | `gpu_layers` | `-1` (all) | Number of layers to offload to GPU |
 | `ctx_size` | `4096` | Context window size |
+| `concurrency` | unset | Maximum simultaneous requests per model; unset means unlimited |
 
 ### Autoswitching
 
@@ -226,6 +227,11 @@ Add extra `llama-server` arguments in the config file directly (`~/.llmctl.json`
 }
 ```
 
+`--parallel` is managed by llmctl when a model sets `concurrency`; do not put
+`--parallel` in global or per-model `extra_args` in that case. A conflict is
+reported as an error when the model is loaded, rather than silently allowing
+the backend slot count and proxy queue to disagree.
+
 ### Per-model overrides
 
 Override settings for specific models by adding a `models` section to `~/.llmctl.json`. Per-model `extra_args` are merged with global `extra_args` — matching flags are replaced, new flags are appended:
@@ -237,13 +243,50 @@ Override settings for specific models by adding a `models` section to `~/.llmctl
     "codellama": {
       "gpu_layers": 20,
       "ctx_size": 8192,
+      "concurrency": 2,
       "extra_args": ["--temp", "0.2"]
     }
   }
 }
 ```
 
-In this example, `codellama` would use `--flash-attn on --temp 0.2` (global `--temp 0.6` is replaced by the per-model override).
+In this example, `codellama` would use `--flash-attn on --temp 0.2` (global `--temp 0.6` is replaced by the per-model override). Its `concurrency: 2` setting allows two requests at once; additional requests for that model wait in a queue. llmctl also passes `--parallel 2` to that model's `llama-server`, keeping backend slots synchronized with the proxy limit.
+
+### Concurrency, queueing, and context
+
+Set `concurrency` to a positive integer in a model override to limit how many
+requests for that model are processed simultaneously:
+
+```json
+{
+  "models": {
+    "large-context": {
+      "ctx_size": 65536,
+      "concurrency": 1
+    }
+  }
+}
+```
+
+The proxy uses one semaphore/queue per resolved model name. Up to
+`concurrency` requests run at once and later requests wait until a slot is
+released. Aliases and fuzzy request names that resolve to the same model share
+that queue, including during autoswitching. If `concurrency` is unset, request
+parallelism is unlimited and llmctl does not add a `--parallel` argument
+(preserving the default behavior).
+
+When configured, `concurrency` is the single source of truth: llmctl
+automatically starts `llama-server` with `--parallel <concurrency>`. Supplying
+`--parallel` yourself through `extra_args` is rejected to prevent a mismatch
+between queueing and backend slots.
+
+Each backend slot shares the model's KV cache. Increasing concurrency can
+increase VRAM use (llama.cpp reserves context for multiple slots), while the
+usable context per slot (and therefore approximately per request) is
+`ctx_size / concurrency`. Use a lower concurrency or a larger context when
+prompts need more context; account for the additional VRAM when configuring
+autoswitch limits. This trade-off is per model: more slots improve throughput
+but divide the available context and reserve more VRAM.
 
 ### Aliases
 
