@@ -2,7 +2,7 @@
 
 ## What this is
 
-`llmctl` is a single-file Go CLI (`llmctl.go`) that manages local llama.cpp model servers and exposes an OpenAI-compatible reverse proxy. Zero external Go dependencies — standard library only.
+`llmctl` is a Go CLI that manages local llama.cpp model servers and exposes an OpenAI-compatible reverse proxy. Zero external Go dependencies — standard library only.
 
 ## Commands
 
@@ -19,19 +19,24 @@ Build injects version via ldflags: `-X main.appVersion=<git-tag> -X main.buildTi
 
 ## Architecture
 
-Everything lives in `llmctl.go` under `package main`. Sections are separated by comment banners:
+Code is split into same-package module files, all under `package main` (no sub-packages). Use this grouping when adding code:
 
-- **Config** (~L36–185): JSON config at `~/.llmctl.json`, per-model overrides, `mergeExtraArgs`
-- **Instance Registry** (~L203–240): tracks running backends in `~/.llmctl.registry.json`, includes resolved config (ctx_size, gpu_layers, extra_args, aliases)
-- **Process helpers** (~L242–290): start/stop/health-check of detached llama-server processes
-- **Model helpers** (~L292–530): .gguf file discovery, HuggingFace cache layout support (`:` and `/` separators), fuzzy matching, `hfRepoParts`, `findHFSnapshot`
-- **Reverse Proxy** (~L555–760): OpenAI-compatible `/v1/models`, `/v1/chat/completions`, `/health`
-- **CLI Commands** (~L760–1190): `load`, `unload`, `ps`, `info`, `proxy`, `pull`, `list`, `logs`, `alias`, etc.
-- **Main** (~L1350–1500): CLI dispatch via switch statement
+- **`config.go`**: shared constants, `Config`/`ModelConfig`/`AutoswitchConfig`, JSON config at `~/.llmctl.json`, load/save, per-model overrides, `mergeExtraArgs`, validation, key matching, `findServerBin`
+- **`registry.go`**: `Instance`/`Registry` types, persistence in `~/.llmctl.registry.json`, registry query/mutation helpers, plus process lifecycle primitives (`isRunning`, `stopProcess`, `waitForHealth`)
+- **`process.go`**: log-tail and backend-exit checks
+- **`models.go`**: .gguf file discovery, HuggingFace cache layout support (`:` and `/` separators), fuzzy matching, `hfRepoParts`, `findHFSnapshot`, naming helpers
+- **`autoswitch.go`**: VRAM accounting (nvidia-smi), eviction planning, fallback decisions
+- **`proxy.go`**: OpenAI-compatible `/v1/models`, `/v1/chat/completions`, `/health`, UI handlers, embedded `web/index.html`, event state, `startProxy`
+- **`load.go`**: `loadOptions`/`loadSpec`, mmproj resolution, `loadInstance` lifecycle
+- **`commands.go`**: one function per CLI command (`cmdLoad`, `cmdPull`, `cmdPS`, `cmdSet`, …)
+- **`helpers.go`**: small generic host/IP/flag helpers
+- **`main.go`**: usage text and thin CLI dispatch switch
+
+`llmctl.go` keeps only the package declaration and this module map.
 
 ## Conventions an agent should know
 
-- **No sub-packages.** Do not create new Go files or packages — all code goes in `llmctl.go`.
+- **No sub-packages.** All code lives in same-`package main` files using the module grouping above — do not create sub-packages or add new directories.
 - **No third-party deps.** Do not add `require` entries to `go.mod`. Use only the standard library.
 - **Tests** live in `llmctl_test.go` in the root (~28 tests). Covers model resolution, HF cache layout, alias/config key matching, pull target parsing, autoswitch VRAM estimation & eviction logic, and proxy model listing. Add new tests there — same `package main`, no external deps.
 - **Runtime state** is file-based JSON in `$HOME` (`~/.llmctl.json`, `~/.llmctl.registry.json`, `~/.llmctl-logs/`).

@@ -295,6 +295,24 @@ When the proxy is running:
 
 Requests can also specify a model via the `X-Model` HTTP header.
 
+## Project structure
+
+All source files live in `package main` at the repository root, using only the standard library:
+
+| File | Contents |
+|------|----------|
+| `config.go` | Constants, `Config`/`ModelConfig`, load/save, extra-args merging and validation, per-model key matching |
+| `registry.go` | `Instance`/`Registry` persistence and query helpers, process lifecycle primitives (`isRunning`, `stopProcess`, `waitForHealth`) |
+| `process.go` | Log-tail and backend-exit helpers |
+| `models.go` | `.gguf` discovery, HuggingFace cache layout, model resolution (`:` and `/` separators), naming |
+| `autoswitch.go` | VRAM accounting, eviction planning, fallback decisions |
+| `proxy.go` | OpenAI-compatible reverse proxy, UI handlers, embedded `web/index.html` |
+| `load.go` | Load options/spec resolution, mmproj handling, backend instance lifecycle |
+| `commands.go` | CLI command implementations |
+| `helpers.go` | Host/IP and flag parsing helpers |
+| `main.go` | Usage text and CLI dispatch |
+| `llmctl_test.go` | Tests (same package) |
+
 ## Runtime files
 
 | Path | Description |
