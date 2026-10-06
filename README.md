@@ -295,6 +295,25 @@ When the proxy is running:
 
 Requests can also specify a model via the `X-Model` HTTP header.
 
+## Project structure
+
+The public API is the root `package main` (`main.go`: usage text + CLI dispatch, and the `AppVersion` var injected by Makefile ldflags). All implementation lives in `internal/llmctl` (`package llmctl`, invisible to other Go modules), using only the standard library:
+
+| File | Contents |
+|------|----------|
+| `main.go` | Entry point: usage text and CLI dispatch |
+| `internal/llmctl/config.go` | Constants, `Config`/`ModelConfig`, load/save, extra-args merging and validation, per-model key matching |
+| `internal/llmctl/registry.go` | `Instance`/`Registry` persistence and query helpers, process lifecycle primitives (`isRunning`, `stopProcess`, `waitForHealth`) |
+| `internal/llmctl/process.go` | Log-tail and backend-exit helpers |
+| `internal/llmctl/models.go` | `.gguf` discovery, HuggingFace cache layout, model resolution (`:` and `/` separators), naming |
+| `internal/llmctl/autoswitch.go` | VRAM accounting, eviction planning, fallback decisions |
+| `internal/llmctl/proxy.go` | OpenAI-compatible reverse proxy, UI handlers, embedded `web/index.html` |
+| `internal/llmctl/load.go` | Load options/spec resolution, mmproj handling, backend instance lifecycle |
+| `internal/llmctl/commands.go` | CLI command implementations |
+| `internal/llmctl/helpers.go` | Host/IP and flag parsing helpers |
+| `internal/llmctl/llmctl_test.go` | Tests (same package) |
+| `internal/llmctl/web/` | UI assets embedded into the proxy |
+
 ## Runtime files
 
 | Path | Description |
