@@ -1,4 +1,4 @@
-package main
+package llmctl
 
 import (
 	"bytes"
@@ -432,11 +432,11 @@ func TestHandleUIModelsListsOnlyConfiguredModels(t *testing.T) {
 	tmp := t.TempDir()
 	cfg := testConfig(tmp)
 	cfg.Aliases = map[string]string{
-		"qwen27b":     "Qwen3.5-27B-GGUF/UD-Q4_K_XL.gguf",
+		"qwen27b":      "Qwen3.5-27B-GGUF/UD-Q4_K_XL.gguf",
 		"qwen27b_code": "Qwen3.5-27B-GGUF/UD-Q4_K_XL.gguf", // same target, distinct alias
 	}
 	cfg.Models = map[string]ModelConfig{
-		"qwen27b":     {VramMB: 18000},
+		"qwen27b":      {VramMB: 18000},
 		"qwen27b_code": {VramMB: 16000},
 	}
 

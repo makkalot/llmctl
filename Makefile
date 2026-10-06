@@ -3,7 +3,7 @@
 BINARY_NAME=llmctl
 VERSION=$(shell git describe --always --tags 2>/dev/null || echo "0.2.0")
 BUILD_TIME=$(shell date -u '+%Y-%m-%d_%H:%M:%S')
-LDFLAGS=-ldflags "-X main.appVersion=$(VERSION) -X main.buildTime=$(BUILD_TIME)"
+LDFLAGS=-ldflags "-X main.AppVersion=$(VERSION) -X main.BuildTime=$(BUILD_TIME)"
 OUTPUT_DIR=./bin
 
 build: build-darwin-amd64 build-darwin-arm64 build-linux-amd64 build-linux-arm64
