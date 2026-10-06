@@ -1,4 +1,4 @@
-package main
+package llmctl
 
 import (
 	"bufio"
@@ -16,7 +16,7 @@ import (
 	"time"
 )
 
-func cmdLoad(cfg Config, modelName string, instanceName string, hfRepo string, mmprojArg string) {
+func CmdLoad(cfg Config, modelName string, instanceName string, hfRepo string, mmprojArg string) {
 	_, _, err := loadInstance(cfg, loadOptions{
 		ModelName:    modelName,
 		InstanceName: instanceName,
@@ -74,14 +74,14 @@ func unloadInstance(name string, verbose bool) error {
 	return nil
 }
 
-func cmdUnload(_ Config, name string) {
+func CmdUnload(_ Config, name string) {
 	if err := unloadInstance(name, true); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
 }
 
-func cmdStopAll() {
+func CmdStopAll() {
 	reg := loadRegistry()
 
 	if reg.ProxyPID > 0 && isRunning(reg.ProxyPID) {
@@ -100,7 +100,7 @@ func cmdStopAll() {
 	fmt.Println("✓ All stopped.")
 }
 
-func cmdDefault(name string) {
+func CmdDefault(name string) {
 	reg := loadRegistry()
 	reg.CleanDead()
 
@@ -122,7 +122,7 @@ func cmdDefault(name string) {
 	fmt.Printf("✓ Default model: '%s'\n", name)
 }
 
-func cmdPS() {
+func CmdPS() {
 	reg := loadRegistry()
 	reg.CleanDead()
 	saveRegistry(reg)
@@ -182,7 +182,7 @@ func cmdPS() {
 	}
 }
 
-func cmdInfo(name string) {
+func CmdInfo(name string) {
 	reg := loadRegistry()
 	reg.CleanDead()
 	saveRegistry(reg)
@@ -260,7 +260,7 @@ func cmdInfo(name string) {
 	}
 }
 
-func cmdStatus(cfg Config) {
+func CmdStatus(cfg Config) {
 	reg := loadRegistry()
 	reg.CleanDead()
 
@@ -273,7 +273,7 @@ func cmdStatus(cfg Config) {
 	}
 	if len(reg.Instances) > 0 {
 		fmt.Println()
-		cmdPS()
+		CmdPS()
 	}
 }
 
@@ -301,7 +301,7 @@ func aliasesByResolvedPath(cfg Config) map[string][]string {
 	return revAlias
 }
 
-func cmdList(cfg Config) {
+func CmdList(cfg Config) {
 	models := listModelFiles(cfg.ModelsDir)
 	filtered := make([]string, 0, len(models))
 	for _, m := range models {
@@ -339,7 +339,7 @@ func cmdList(cfg Config) {
 	fmt.Println()
 }
 
-func cmdLogs(name string) {
+func CmdLogs(name string) {
 	logDir := filepath.Join(homeDir(), ".llmctl-logs")
 	logPath := filepath.Join(logDir, name+".log")
 
@@ -369,7 +369,7 @@ func cmdLogs(name string) {
 	}
 }
 
-func cmdAlias(cfg Config, alias, model string) {
+func CmdAlias(cfg Config, alias, model string) {
 	modelPath, err := resolveModel(cfg, model)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
@@ -408,7 +408,7 @@ func parsePullTarget(target string) (user string, repoName string, repoID string
 	return user, repoName, repoID, specificFile, nil
 }
 
-func cmdPull(cfg Config, repo string) {
+func CmdPull(cfg Config, repo string) {
 	user, repoName, repoID, specificFile, err := parsePullTarget(repo)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "Usage: llmctl pull <user/repo>[:<file>]")
@@ -529,7 +529,7 @@ func cmdPull(cfg Config, repo string) {
 	fmt.Printf("  llmctl load %s:%s\n", repoID, specificFile)
 }
 
-func cmdRM(cfg Config, modelName string) {
+func CmdRM(cfg Config, modelName string) {
 	modelPath, err := resolveModel(cfg, modelName)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
@@ -552,7 +552,7 @@ func cmdRM(cfg Config, modelName string) {
 	fmt.Printf("✓ Deleted %s\n", shortName(modelPath))
 }
 
-func cmdConfig(cfg Config) {
+func CmdConfig(cfg Config) {
 	fmt.Println("Configuration:")
 	fmt.Printf("  Config:      %s\n", configPath())
 	fmt.Printf("  Models dir:  %s\n", cfg.ModelsDir)
@@ -608,7 +608,7 @@ func cmdConfig(cfg Config) {
 	}
 }
 
-func cmdSet(cfg Config, key, value string) {
+func CmdSet(cfg Config, key, value string) {
 	switch key {
 	case "models_dir":
 		cfg.ModelsDir = value

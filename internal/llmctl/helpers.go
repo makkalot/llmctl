@@ -1,4 +1,4 @@
-package main
+package llmctl
 
 import (
 	"net"
@@ -22,7 +22,7 @@ func getLocalIP() string {
 	return "127.0.0.1"
 }
 
-func extractFlag(args []string, flag string) (string, []string) {
+func ExtractFlag(args []string, flag string) (string, []string) {
 	var remaining []string
 	value := ""
 	skip := false

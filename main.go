@@ -4,6 +4,16 @@ import (
 	"fmt"
 	"os"
 	"runtime"
+
+	"github.com/llmctl/llmctl/internal/llmctl"
+)
+
+// AppVersion and BuildTime are overridden at build time via ldflags
+// (-X main.AppVersion=... -X main.BuildTime=...); they default to the
+// fallback values from the internal package.
+var (
+	AppVersion = llmctl.AppVersion
+	BuildTime  = llmctl.BuildTime
 )
 
 func printUsage() {
@@ -49,7 +59,7 @@ Workflow:
   curl http://server:8080/v1/models
 
 Platform: %s/%s
-`, appVersion, runtime.GOOS, runtime.GOARCH)
+`, AppVersion, runtime.GOOS, runtime.GOARCH)
 }
 
 func main() {
@@ -58,80 +68,80 @@ func main() {
 		os.Exit(0)
 	}
 
-	cfg := loadConfig()
+	cfg := llmctl.LoadConfig()
 
 	switch os.Args[1] {
 	case "list", "ls":
-		cmdList(cfg)
+		llmctl.CmdList(cfg)
 	case "load", "run":
 		if len(os.Args) < 3 {
 			fmt.Fprintln(os.Stderr, "Usage: llmctl load <model> [-hf <huggingface_repo>] [--name NAME] [--mmproj <path>]")
 			os.Exit(1)
 		}
-		name, args := extractFlag(os.Args[3:], "--name")
-		hf, _ := extractFlag(args, "-hf")
-		mmproj, _ := extractFlag(args, "--mmproj")
-		cmdLoad(cfg, os.Args[2], name, hf, mmproj)
+		name, args := llmctl.ExtractFlag(os.Args[3:], "--name")
+		hf, _ := llmctl.ExtractFlag(args, "-hf")
+		mmproj, _ := llmctl.ExtractFlag(args, "--mmproj")
+		llmctl.CmdLoad(cfg, os.Args[2], name, hf, mmproj)
 	case "unload":
 		if len(os.Args) < 3 {
 			fmt.Fprintln(os.Stderr, "Usage: llmctl unload <name>")
 			os.Exit(1)
 		}
-		cmdUnload(cfg, os.Args[2])
+		llmctl.CmdUnload(cfg, os.Args[2])
 	case "stop", "kill":
-		cmdStopAll()
+		llmctl.CmdStopAll()
 	case "default":
 		if len(os.Args) < 3 {
 			fmt.Fprintln(os.Stderr, "Usage: llmctl default <name>")
 			os.Exit(1)
 		}
-		cmdDefault(os.Args[2])
+		llmctl.CmdDefault(os.Args[2])
 	case "ps":
-		cmdPS()
+		llmctl.CmdPS()
 	case "info":
 		if len(os.Args) < 3 {
 			fmt.Fprintln(os.Stderr, "Usage: llmctl info <name>")
 			os.Exit(1)
 		}
-		cmdInfo(os.Args[2])
+		llmctl.CmdInfo(os.Args[2])
 	case "proxy", "serve":
-		startProxy(cfg)
+		llmctl.StartProxy(cfg)
 	case "status":
-		cmdStatus(cfg)
+		llmctl.CmdStatus(cfg)
 	case "logs", "log":
 		if len(os.Args) < 3 {
 			fmt.Fprintln(os.Stderr, "Usage: llmctl logs <name>")
 			os.Exit(1)
 		}
-		cmdLogs(os.Args[2])
+		llmctl.CmdLogs(os.Args[2])
 	case "pull", "download":
 		if len(os.Args) < 3 {
 			fmt.Fprintln(os.Stderr, "Usage: llmctl pull <user/repo>")
 			os.Exit(1)
 		}
-		cmdPull(cfg, os.Args[2])
+		llmctl.CmdPull(cfg, os.Args[2])
 	case "rm", "remove", "delete":
 		if len(os.Args) < 3 {
 			fmt.Fprintln(os.Stderr, "Usage: llmctl rm <model>")
 			os.Exit(1)
 		}
-		cmdRM(cfg, os.Args[2])
+		llmctl.CmdRM(cfg, os.Args[2])
 	case "alias":
 		if len(os.Args) < 4 {
 			fmt.Fprintln(os.Stderr, "Usage: llmctl alias <name> <model>")
 			os.Exit(1)
 		}
-		cmdAlias(cfg, os.Args[2], os.Args[3])
+		llmctl.CmdAlias(cfg, os.Args[2], os.Args[3])
 	case "config", "cfg":
-		cmdConfig(cfg)
+		llmctl.CmdConfig(cfg)
 	case "set":
 		if len(os.Args) < 4 {
 			fmt.Fprintln(os.Stderr, "Usage: llmctl set <key> <value>")
 			os.Exit(1)
 		}
-		cmdSet(cfg, os.Args[2], os.Args[3])
+		llmctl.CmdSet(cfg, os.Args[2], os.Args[3])
 	case "version", "-v", "--version":
-		fmt.Printf("llmctl v%s (%s/%s)\n", appVersion, runtime.GOOS, runtime.GOARCH)
+		fmt.Printf("llmctl v%s (%s/%s)\n", AppVersion, runtime.GOOS, runtime.GOARCH)
 	case "help", "-h", "--help":
 		printUsage()
 	default:

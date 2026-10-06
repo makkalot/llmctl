@@ -1,4 +1,4 @@
-package main
+package llmctl
 
 import (
 	"encoding/json"

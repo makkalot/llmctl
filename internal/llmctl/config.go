@@ -1,4 +1,4 @@
-package main
+package llmctl
 
 import (
 	"encoding/json"
@@ -11,7 +11,9 @@ import (
 )
 
 const (
-	appVersion    = "0.2.0"
+	// AppVersion is the fallback version; main overrides it via ldflags.
+	AppVersion    = "0.2.0"
+	BuildTime     = "" // build timestamp, injected via ldflags (main only)
 	defaultPort   = 8080
 	defaultHost   = "0.0.0.0"
 	registryFile  = ".llmctl.registry.json"
@@ -94,7 +96,7 @@ func configPath() string   { return filepath.Join(homeDir(), configFile) }
 func modelsDir() string    { return filepath.Join(homeDir(), defaultModels) }
 func registryPath() string { return filepath.Join(homeDir(), registryFile) }
 
-func loadConfig() Config {
+func LoadConfig() Config {
 	cfg := defaultConfig()
 	data, err := os.ReadFile(configPath())
 	if err != nil {

@@ -1,4 +1,4 @@
-package main
+package llmctl
 
 import (
 	"bytes"
@@ -252,7 +252,7 @@ func handleUILogs(w http.ResponseWriter, cfg Config) {
 	jsonResp(w, out)
 }
 
-func startProxy(cfg Config) {
+func StartProxy(cfg Config) {
 	reg := loadRegistry()
 	reg.CleanDead()
 
