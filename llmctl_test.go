@@ -3,11 +3,18 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"reflect"
+	"regexp"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 func intPtr(n int) *int {
@@ -330,6 +337,251 @@ func TestParsePullTargetNestedFile(t *testing.T) {
 	}
 }
 
+func TestModelConcurrencyJSONParsingAndInheritance(t *testing.T) {
+	var cfg Config
+	if err := json.Unmarshal([]byte(`{"models":{"big":{"concurrency":2}}}`), &cfg); err != nil {
+		t.Fatal(err)
+	}
+	mc := cfg.Models["big"]
+	field, ok := reflect.TypeOf(mc).FieldByName("Concurrency")
+	if !ok || field.Type != reflect.TypeOf((*int)(nil)) {
+		t.Fatalf("ModelConfig.Concurrency must be *int, got %v", field.Type)
+	}
+	value := reflect.ValueOf(mc).FieldByName("Concurrency")
+	if value.IsNil() || value.Elem().Int() != 2 {
+		t.Fatalf("decoded concurrency = %v, want pointer to 2", value.Interface())
+	}
+	base := testConfig(t.TempDir())
+	base.Models = map[string]ModelConfig{"big": mc}
+	inherited := reflect.ValueOf(configForModel(base, "big")).FieldByName("Concurrency")
+	if !inherited.IsValid() || inherited.IsNil() || inherited.Elem().Int() != 2 {
+		t.Fatalf("configForModel did not inherit concurrency: %v", inherited)
+	}
+	unset := reflect.ValueOf(configForModel(base, "missing")).FieldByName("Concurrency")
+	if unset.IsValid() && !unset.IsNil() {
+		t.Fatalf("unset model concurrency = %v, want nil", unset.Interface())
+	}
+}
+
+func TestModelConcurrencySemaphoreConfigUsesResolvedAlias(t *testing.T) {
+	cfg := testConfig(t.TempDir())
+	cfg.Aliases = map[string]string{"code": "backend"}
+	cfg.Models = map[string]ModelConfig{"code": {Concurrency: intPtr(2)}}
+	if got := concurrencyConfigKey(cfg, "code"); got != "code" {
+		t.Fatalf("alias route config key = %q, want code", got)
+	}
+	if got := concurrencyConfigKey(cfg, "backend"); got != "" {
+		t.Fatalf("resolved backend without matching model key = %q, want empty", got)
+	}
+}
+
+func TestConcurrencyParallelConflictIsRejected(t *testing.T) {
+	for _, extraArgs := range [][]string{
+		{"--parallel", "9"},
+		{"--parallel=9"},
+	} {
+		cfg := testConfig(t.TempDir())
+		cfg.Models = map[string]ModelConfig{"model": {Concurrency: intPtr(2), ExtraArgs: extraArgs}}
+		model := writeLocalModel(t, filepath.Join(t.TempDir(), "model.gguf"))
+		cfg.ServerBin = filepath.Join(t.TempDir(), "unused")
+		_, _, err := loadInstance(cfg, loadOptions{ModelName: model, InstanceName: "model"})
+		if err == nil || !strings.Contains(err.Error(), "must not contain --parallel") {
+			t.Fatalf("extra args %v: expected configured parallel conflict, got %v", extraArgs, err)
+		}
+	}
+}
+
+func TestConcurrencyAddsParallelAndUnsetPreservesArgs(t *testing.T) {
+	root := t.TempDir()
+	model := writeLocalModel(t, filepath.Join(root, "model.gguf"))
+	cfg := testConfig(root)
+	cfg.Models = map[string]ModelConfig{"model": {Concurrency: intPtr(3), ExtraArgs: []string{"--foo", "bar"}}}
+	spec, err := resolveLoadSpec(cfg, loadOptions{ModelName: model, InstanceName: "model"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if spec.Config.Concurrency == nil || *spec.Config.Concurrency != 3 {
+		t.Fatalf("resolved concurrency = %v", spec.Config.Concurrency)
+	}
+	if !containsArgPair(spec.Config.ExtraArgs, "--foo", "bar") {
+		t.Fatalf("resolved extra args = %v", spec.Config.ExtraArgs)
+	}
+	unset, err := resolveLoadSpec(testConfig(root), loadOptions{ModelName: model, InstanceName: "unset"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if unset.Config.Concurrency != nil {
+		t.Fatal("unset model gained concurrency")
+	}
+}
+
+func containsArgPair(args []string, flag, value string) bool {
+	for i := 0; i+1 < len(args); i++ {
+		if args[i] == flag && args[i+1] == value {
+			return true
+		}
+	}
+	return false
+}
+
+func TestConcurrencyDocumentationDescribesQueueAndUnlimitedBehavior(t *testing.T) {
+	data, err := os.ReadFile("README.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(data)
+	for _, want := range []string{
+		"concurrency",
+		"wait in a queue",
+		"aliases",
+		"unlimited",
+		"--parallel <concurrency>",
+		"ctx_size / concurrency",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("README is missing concurrency documentation %q", want)
+		}
+	}
+}
+
+func TestConcurrencyRouteUsesResolvedNameBeforeAutoswitch(t *testing.T) {
+	cfg := testConfig(t.TempDir())
+	cfg.Aliases = map[string]string{"alias": "model"}
+	cfg.Models = map[string]ModelConfig{"alias": {Concurrency: intPtr(1)}}
+	if got := concurrencyConfigKey(cfg, "alias"); got != "alias" {
+		t.Fatalf("route key = %q", got)
+	}
+	// A resolved route must still identify the alias-owned configuration.
+	if got := concurrencyConfigKey(cfg, "model"); got != "" {
+		t.Fatalf("raw target incorrectly selected config: %q", got)
+	}
+}
+
+func TestConcurrencyAliasesAndResolvedFuzzyNamesShareQueueKey(t *testing.T) {
+	root := t.TempDir()
+	model := writeLocalModel(t, filepath.Join(root, "canonical-model.gguf"))
+	cfg := testConfig(root)
+	cfg.Aliases = map[string]string{"code": model}
+	cfg.Models = map[string]ModelConfig{"code": {Concurrency: intPtr(1)}}
+
+	aliasKey := concurrencyConfigKey(cfg, "code")
+	resolvedName := deriveInstanceName(model)
+	resolvedKey := concurrencyConfigKey(cfg, resolvedName)
+	if aliasKey == "" {
+		t.Fatal("alias did not resolve to a configured concurrency key")
+	}
+	if resolvedKey != aliasKey {
+		t.Fatalf("alias key %q and resolved/fuzzy key %q differ; requests can bypass one semaphore", aliasKey, resolvedKey)
+	}
+
+	// A request for the unloaded canonical model must use the same queue key
+	// before autoswitch resolves it, rather than bypassing the alias semaphore.
+	canonicalKey := concurrencyConfigKey(cfg, model)
+	if canonicalKey != aliasKey {
+		t.Fatalf("canonical key %q and alias key %q differ for unloaded request", canonicalKey, aliasKey)
+	}
+}
+
+func TestConcurrencyResolvedQueueKeyIsStableAcrossFuzzySpellings(t *testing.T) {
+	root := t.TempDir()
+	model := writeLocalModel(t, filepath.Join(root, "Qwen3.5-27B-Q4_K_M.gguf"))
+	cfg := testConfig(root)
+	cfg.Aliases = map[string]string{"big": model}
+	cfg.Models = map[string]ModelConfig{"big": {Concurrency: intPtr(1)}}
+
+	want := concurrencyConfigKey(cfg, "big")
+	for _, route := range []string{
+		model,
+		deriveInstanceName(model),
+		"qwen3.5-27b-q4_k_m",
+		"QWEN3.5-27B-Q4_K_M",
+	} {
+		if got := concurrencyConfigKey(cfg, route); got != want {
+			t.Fatalf("route %q got queue key %q, want canonical key %q", route, got, want)
+		}
+	}
+}
+
+func TestConcurrencyQueueKeyUsesConfiguredAliasForCanonicalAndFuzzyRoutes(t *testing.T) {
+	root := t.TempDir()
+	model := writeLocalModel(t, filepath.Join(root, "models", "Qwen3.5-27B-Q4_K_M.gguf"))
+	cfg := testConfig(filepath.Join(root, "models"))
+	cfg.Aliases = map[string]string{"big": model}
+	cfg.Models = map[string]ModelConfig{"big": {Concurrency: intPtr(2)}}
+
+	want := "big"
+	routes := []string{
+		"big",                     // alias
+		model,                     // canonical path before autoswitch
+		deriveInstanceName(model), // loaded instance name
+		"qwen3.5-27b-q4_k_m",      // fuzzy basename
+		"QWEN3.5-27B-Q4_K_M",      // case-insensitive fuzzy name
+	}
+	for _, route := range routes {
+		if got := concurrencyConfigKey(cfg, route); got != want {
+			t.Fatalf("route %q got queue key %q, want %q; route can bypass shared semaphore", route, got, want)
+		}
+	}
+}
+
+func TestLoadInstanceFinalArgumentsAutoPassParallelAndPreserveUnset(t *testing.T) {
+	root := t.TempDir()
+	capture := filepath.Join(root, "args")
+	server := filepath.Join(root, "fake-server.sh")
+	script := "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"" + capture + "\"\n"
+	if err := os.WriteFile(server, []byte(script), 0755); err != nil {
+		t.Fatal(err)
+	}
+	model := writeLocalModel(t, filepath.Join(root, "model.gguf"))
+
+	cfg := testConfig(root)
+	cfg.ServerBin = server
+	cfg.Models = map[string]ModelConfig{"model": {Concurrency: intPtr(3), ExtraArgs: []string{"--foo", "bar"}}}
+	_, _, _ = loadInstance(cfg, loadOptions{ModelName: model, InstanceName: "model", WaitTimeout: time.Millisecond})
+	data, err := os.ReadFile(capture)
+	if err != nil {
+		t.Fatal(err)
+	}
+	args := strings.Split(strings.TrimSpace(string(data)), "\n")
+	for _, pair := range [][2]string{
+		{"--model", model},
+		{"--ctx-size", "0"},
+		{"--parallel", "3"},
+		{"--foo", "bar"},
+	} {
+		if !containsArgPair(args, pair[0], pair[1]) {
+			t.Fatalf("final llama-server args = %v, missing %s %s", args, pair[0], pair[1])
+		}
+	}
+	parallelCount := 0
+	for _, arg := range args {
+		if arg == "--parallel" || strings.HasPrefix(arg, "--parallel=") {
+			parallelCount++
+		}
+	}
+	if parallelCount != 1 {
+		t.Fatalf("final llama-server args = %v, want exactly one automatic --parallel", args)
+	}
+
+	captureUnset := filepath.Join(root, "args-unset")
+	serverUnset := filepath.Join(root, "fake-server-unset.sh")
+	scriptUnset := "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"" + captureUnset + "\"\n"
+	if err := os.WriteFile(serverUnset, []byte(scriptUnset), 0755); err != nil {
+		t.Fatal(err)
+	}
+	unset := testConfig(root)
+	unset.ServerBin = serverUnset
+	unset.ExtraArgs = []string{"--foo", "bar"}
+	_, _, _ = loadInstance(unset, loadOptions{ModelName: model, InstanceName: "unset", WaitTimeout: time.Millisecond})
+	unsetData, err := os.ReadFile(captureUnset)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if containsArgPair(strings.Split(strings.TrimSpace(string(unsetData)), "\n"), "--parallel", "3") {
+		t.Fatal("unset concurrency unexpectedly added --parallel")
+	}
+}
+
 func TestAutoswitchConfigParsing(t *testing.T) {
 	var cfg Config
 	data := []byte(`{
@@ -387,6 +639,275 @@ func TestMissingModelCanFallbackToDefault(t *testing.T) {
 	}
 }
 
+func startProxyForConcurrencyTest(t *testing.T, cfg Config, reg Registry) (string, func()) {
+	t.Helper()
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	cfgData, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home, configFile), cfgData, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := saveRegistry(reg); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("go", "run", "llmctl.go", "proxy")
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	cleanup := func() {
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
+		_ = cmd.Wait()
+	}
+	addr := net.JoinHostPort(cfg.Host, strconv.Itoa(cfg.Port))
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		resp, err := http.Get("http://" + addr + "/health")
+		if err == nil {
+			resp.Body.Close()
+			return "http://" + addr, cleanup
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	cleanup()
+	t.Fatal("proxy did not become ready")
+	return "", func() {}
+}
+
+func TestProxyConcurrencyQueuesResolvedRoutesAndDefaultFallback(t *testing.T) {
+	backendBlock := make(chan struct{})
+	backendStarted := make(chan struct{}, 4)
+	var backendCalls chan struct{}
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		backendStarted <- struct{}{}
+		if backendCalls != nil {
+			backendCalls <- struct{}{}
+		}
+		<-backendBlock
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"ok"}`))
+	}))
+	defer backend.Close()
+	backendURL := strings.TrimPrefix(backend.URL, "http://")
+	backendPort, err := strconv.Atoi(strings.TrimPrefix(backendURL, "127.0.0.1:"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	model := writeLocalModel(t, filepath.Join(root, "canonical-model.gguf"))
+	cfg := testConfig(root)
+	cfg.Host = "127.0.0.1"
+	cfg.Port = freeTCPPort(t)
+	cfg.Aliases = map[string]string{"code": model}
+	cfg.Models = map[string]ModelConfig{
+		"code":      {Concurrency: intPtr(1)},
+		"unlimited": {},
+	}
+	backendProcess := exec.Command("sleep", "60")
+	if err := backendProcess.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer backendProcess.Process.Kill()
+	reg := Registry{Instances: []Instance{
+		{Name: "code", Model: model, Port: backendPort, PID: backendProcess.Process.Pid},
+		{Name: "canonical-model", Model: model, Port: backendPort, PID: backendProcess.Process.Pid, IsDefault: true},
+		{Name: "unlimited", Model: model, Port: backendPort, PID: backendProcess.Process.Pid},
+	}}
+	base, stop := startProxyForConcurrencyTest(t, cfg, reg)
+	defer stop()
+
+	post := func(modelName string) *http.Request {
+		body := `{"messages":[{"role":"user","content":"hello"}]}`
+		req, _ := http.NewRequest(http.MethodPost, base+"/v1/chat/completions", strings.NewReader(body))
+		req.Header.Set("X-Model", modelName)
+		return req
+	}
+	// Alias, canonical, and fuzzy names must contend for one semaphore.
+	backendCalls = make(chan struct{}, 4)
+	firstDone := make(chan error, 1)
+	go func() {
+		resp, err := http.DefaultClient.Do(post("code"))
+		if resp != nil {
+			resp.Body.Close()
+		}
+		firstDone <- err
+	}()
+	select {
+	case <-backendStarted:
+	case <-time.After(time.Second):
+		t.Fatal("first request did not reach backend")
+	}
+	select {
+	case <-backendCalls:
+	case <-time.After(time.Second):
+		t.Fatal("first backend call was not recorded")
+	}
+	secondDone := make(chan error, 1)
+	go func() {
+		resp, err := http.DefaultClient.Do(post("canonical-model"))
+		if resp != nil {
+			resp.Body.Close()
+		}
+		secondDone <- err
+	}()
+	select {
+	case <-backendCalls:
+		t.Fatal("canonical route bypassed alias queue")
+	case <-time.After(150 * time.Millisecond):
+	}
+	close(backendBlock)
+	select {
+	case err := <-firstDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("first request did not release")
+	}
+	select {
+	case err := <-secondDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("queued request was not released")
+	}
+
+	// Unset concurrency must not serialize independent requests.
+	backendBlock = make(chan struct{})
+	backendStarted = make(chan struct{}, 4)
+	backendCalls = make(chan struct{}, 4)
+	unlimited1 := make(chan error, 1)
+	unlimited2 := make(chan error, 1)
+	go func() {
+		resp, err := http.DefaultClient.Do(post("unlimited"))
+		if resp != nil {
+			resp.Body.Close()
+		}
+		unlimited1 <- err
+	}()
+	go func() {
+		resp, err := http.DefaultClient.Do(post("unlimited"))
+		if resp != nil {
+			resp.Body.Close()
+		}
+		unlimited2 <- err
+	}()
+	select {
+	case <-backendCalls:
+	case <-time.After(time.Second):
+		t.Fatal("unlimited request did not reach backend")
+	}
+	select {
+	case <-backendCalls:
+	case <-time.After(time.Second):
+		t.Fatal("nil concurrency unexpectedly blocked second request")
+	}
+	close(backendBlock)
+	select {
+	case <-unlimited1:
+	case <-time.After(time.Second):
+		t.Fatal("unlimited request did not finish")
+	}
+	select {
+	case <-unlimited2:
+	case <-time.After(time.Second):
+		t.Fatal("unlimited request did not finish")
+	}
+
+}
+
+func TestProxyConcurrencyQueuesConfiguredDefaultFallback(t *testing.T) {
+	backendBlock := make(chan struct{})
+	backendStarted := make(chan struct{}, 2)
+	backendCalls := make(chan struct{}, 2)
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		backendStarted <- struct{}{}
+		backendCalls <- struct{}{}
+		<-backendBlock
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"ok"}`))
+	}))
+	defer backend.Close()
+
+	backendPort, err := strconv.Atoi(strings.TrimPrefix(backend.URL, "http://127.0.0.1:"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	model := writeLocalModel(t, filepath.Join(root, "default-model.gguf"))
+	cfg := testConfig(root)
+	cfg.Host = "127.0.0.1"
+	cfg.Port = freeTCPPort(t)
+	cfg.Models = map[string]ModelConfig{"default": {Concurrency: intPtr(1)}}
+	backendProcess := exec.Command("sleep", "60")
+	if err := backendProcess.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer backendProcess.Process.Kill()
+	reg := Registry{Instances: []Instance{{Name: "default", Model: model, Port: backendPort, PID: backendProcess.Process.Pid, IsDefault: true}}}
+	base, stop := startProxyForConcurrencyTest(t, cfg, reg)
+	defer stop()
+
+	postWithoutModel := func() *http.Request {
+		body := `{"messages":[{"role":"user","content":"hello"}]}`
+		req, _ := http.NewRequest(http.MethodPost, base+"/v1/chat/completions", strings.NewReader(body))
+		return req
+	}
+	do := func(done chan<- error) {
+		resp, err := http.DefaultClient.Do(postWithoutModel())
+		if resp != nil {
+			resp.Body.Close()
+		}
+		done <- err
+	}
+	firstDone := make(chan error, 1)
+	go do(firstDone)
+	select {
+	case <-backendStarted:
+	case <-time.After(time.Second):
+		t.Fatal("fallback request did not reach backend")
+	}
+	select {
+	case <-backendCalls:
+	case <-time.After(time.Second):
+		t.Fatal("first fallback call was not recorded")
+	}
+	secondDone := make(chan error, 1)
+	go do(secondDone)
+	select {
+	case <-backendCalls:
+		t.Fatal("default fallback bypassed concurrency queue")
+	case <-time.After(150 * time.Millisecond):
+	}
+	close(backendBlock)
+	for name, done := range map[string]chan error{"first": firstDone, "second": secondDone} {
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("%s fallback request: %v", name, err)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("%s fallback request was not released", name)
+		}
+	}
+}
+
+func freeTCPPort(t *testing.T) int {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := ln.Addr().(*net.TCPAddr).Port
+	_ = ln.Close()
+	return port
+}
+
 func TestHandleListModelsIncludesAutoLoadModels(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	cfg := testConfig(t.TempDir())
@@ -428,15 +949,43 @@ func TestSystemdUnitFile(t *testing.T) {
 	}
 }
 
+func TestREADMEDocumentsConcurrencyQueueingAndParallelEffects(t *testing.T) {
+	data, err := os.ReadFile("README.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	readme := string(data)
+	checks := []struct {
+		name    string
+		pattern string
+	}{
+		{"per-model concurrency setting", `(?i)concurrency`},
+		{"queued requests", `(?i)queue`},
+		{"automatic backend parallelism", `(?is)automatically.{0,200}--parallel`},
+		{"llama-server parallel flag", `(?i)--parallel`},
+		{"VRAM impact", `(?i)VRAM`},
+		{"context per slot impact", `(?i)context[^[:space:]]*[[:space:]-]*per[[:space:]-]*slot|context per slot`},
+	}
+	for _, check := range checks {
+		matched, err := regexp.MatchString(check.pattern, readme)
+		if err != nil {
+			t.Fatalf("invalid README check %s: %v", check.name, err)
+		}
+		if !matched {
+			t.Errorf("README.md missing %s documentation (/%s/)", check.name, check.pattern)
+		}
+	}
+}
+
 func TestHandleUIModelsListsOnlyConfiguredModels(t *testing.T) {
 	tmp := t.TempDir()
 	cfg := testConfig(tmp)
 	cfg.Aliases = map[string]string{
-		"qwen27b":     "Qwen3.5-27B-GGUF/UD-Q4_K_XL.gguf",
+		"qwen27b":      "Qwen3.5-27B-GGUF/UD-Q4_K_XL.gguf",
 		"qwen27b_code": "Qwen3.5-27B-GGUF/UD-Q4_K_XL.gguf", // same target, distinct alias
 	}
 	cfg.Models = map[string]ModelConfig{
-		"qwen27b":     {VramMB: 18000},
+		"qwen27b":      {VramMB: 18000},
 		"qwen27b_code": {VramMB: 16000},
 	}
 

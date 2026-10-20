@@ -1,9 +1,9 @@
 package main
 
 import (
-	"embed"
 	"bufio"
 	"bytes"
+	"embed"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -39,14 +39,15 @@ const (
 // ═══════════════════════════════════════════════════════════════════════════
 
 type ModelConfig struct {
-	ServerBin  *string  `json:"server_bin,omitempty"`
-	GpuLayers  *int     `json:"gpu_layers,omitempty"`
-	CtxSize    *int     `json:"ctx_size,omitempty"`
-	Mmproj     string   `json:"mmproj,omitempty"`
-	ExtraArgs  []string `json:"extra_args,omitempty"`
-	AutoLoad   bool     `json:"auto_load,omitempty"`
-	AutoUnload bool     `json:"auto_unload,omitempty"`
-	VramMB     int      `json:"vram_mb,omitempty"`
+	ServerBin   *string  `json:"server_bin,omitempty"`
+	GpuLayers   *int     `json:"gpu_layers,omitempty"`
+	CtxSize     *int     `json:"ctx_size,omitempty"`
+	Concurrency *int     `json:"concurrency,omitempty"`
+	Mmproj      string   `json:"mmproj,omitempty"`
+	ExtraArgs   []string `json:"extra_args,omitempty"`
+	AutoLoad    bool     `json:"auto_load,omitempty"`
+	AutoUnload  bool     `json:"auto_unload,omitempty"`
+	VramMB      int      `json:"vram_mb,omitempty"`
 }
 
 type AutoswitchConfig struct {
@@ -74,17 +75,18 @@ func validateAutoswitchConfig(cfg Config) error {
 }
 
 type Config struct {
-	ModelsDir  string                 `json:"models_dir"`
-	ServerBin  string                 `json:"server_bin"`
-	Host       string                 `json:"host"`
-	Port       int                    `json:"port"`
-	GpuLayers  int                    `json:"gpu_layers"`
-	CtxSize    int                    `json:"ctx_size"`
-	Mmproj     string                 `json:"mmproj,omitempty"`
-	ExtraArgs  []string               `json:"extra_args,omitempty"`
-	Aliases    map[string]string      `json:"aliases,omitempty"`
-	Models     map[string]ModelConfig `json:"models,omitempty"`
-	Autoswitch AutoswitchConfig       `json:"autoswitch,omitempty"`
+	ModelsDir   string                 `json:"models_dir"`
+	ServerBin   string                 `json:"server_bin"`
+	Host        string                 `json:"host"`
+	Port        int                    `json:"port"`
+	GpuLayers   int                    `json:"gpu_layers"`
+	CtxSize     int                    `json:"ctx_size"`
+	Concurrency *int                   `json:"-"`
+	Mmproj      string                 `json:"mmproj,omitempty"`
+	ExtraArgs   []string               `json:"extra_args,omitempty"`
+	Aliases     map[string]string      `json:"aliases,omitempty"`
+	Models      map[string]ModelConfig `json:"models,omitempty"`
+	Autoswitch  AutoswitchConfig       `json:"autoswitch,omitempty"`
 }
 
 func defaultConfig() Config {
@@ -232,6 +234,9 @@ func configForModel(cfg Config, modelKey string) Config {
 	if mc.CtxSize != nil {
 		cfg.CtxSize = *mc.CtxSize
 	}
+	if mc.Concurrency != nil {
+		cfg.Concurrency = mc.Concurrency
+	}
 	if mc.Mmproj != "" {
 		cfg.Mmproj = mc.Mmproj
 	}
@@ -317,6 +322,7 @@ type Instance struct {
 	Port            int      `json:"port"`
 	IsDefault       bool     `json:"is_default"` // default model for unmatched requests
 	CtxSize         int      `json:"ctx_size"`
+	Concurrency     *int     `json:"concurrency,omitempty"`
 	GpuLayers       int      `json:"gpu_layers"`
 	ServerBin       string   `json:"server_bin"`
 	ExtraArgs       []string `json:"extra_args,omitempty"`
@@ -865,6 +871,88 @@ func shouldFallbackToDefault(targetName string, autoswitchErr error) bool {
 // Reverse Proxy — routes by "model" field in OpenAI requests
 // ═══════════════════════════════════════════════════════════════════════════
 
+// concurrencyConfigKey resolves a route or alias to the model configuration
+// that owns its concurrency limit. Aliases for the same target share a key.
+func concurrencyConfigKey(cfg Config, routeName string) string {
+	// Resolve every spelling to the configured model's canonical path. This is
+	// deliberately case-insensitive: proxy routing is fuzzy and instance names
+	// are derived from filenames, while config keys and aliases are user input.
+	routeName = strings.TrimSpace(routeName)
+	if routeName == "" {
+		return ""
+	}
+	lookupCI := func(values map[string]string, name string) (string, bool) {
+		for key, value := range values {
+			if strings.EqualFold(key, name) {
+				return value, true
+			}
+		}
+		return "", false
+	}
+	modelKey := func(name string) (string, bool) {
+		for key := range cfg.Models {
+			if strings.EqualFold(key, name) {
+				return key, true
+			}
+		}
+		return "", false
+	}
+	resolveRoute := func(name string) (string, error) {
+		if target, ok := lookupCI(cfg.Aliases, name); ok {
+			name = target
+		}
+		return resolveModel(cfg, name)
+	}
+
+	// Prefer an exact configured key (or alias), including case variants.
+	if key, ok := modelKey(routeName); ok {
+		return key
+	}
+	if target, ok := lookupCI(cfg.Aliases, routeName); ok {
+		if key, configured := modelKey(target); configured {
+			return key
+		}
+	}
+
+	resolvedRoute, err := resolveRoute(routeName)
+	if err == nil {
+		resolvedRoute = filepath.Clean(resolvedRoute)
+		for key := range cfg.Models {
+			configuredName := key
+			if target, ok := lookupCI(cfg.Aliases, key); ok {
+				configuredName = target
+			}
+			resolved, resolveErr := resolveModel(cfg, configuredName)
+			if resolveErr == nil && filepath.Clean(resolved) == resolvedRoute {
+				return key
+			}
+		}
+	}
+
+	// A loaded instance name or fuzzy filename may not itself be resolvable as
+	// a path (for example, it omits the directory). Match it against each
+	// configured model's resolved path and derived instance name.
+	lowerRoute := strings.ToLower(strings.TrimSuffix(routeName, ".gguf"))
+	for key := range cfg.Models {
+		configuredName := key
+		if target, ok := lookupCI(cfg.Aliases, key); ok {
+			configuredName = target
+		}
+		resolved, resolveErr := resolveModel(cfg, configuredName)
+		if resolveErr != nil {
+			continue
+		}
+		candidates := []string{strings.ToLower(filepath.Base(resolved)), strings.ToLower(deriveInstanceName(modelRef(cfg.ModelsDir, resolved)))}
+		for _, candidate := range candidates {
+			candidate = strings.TrimSuffix(candidate, ".gguf")
+			if strings.Contains(candidate, lowerRoute) || strings.Contains(lowerRoute, candidate) {
+				return key
+			}
+		}
+	}
+	return ""
+}
+
 func hasAutoLoadModels(cfg Config) bool {
 	if !cfg.Autoswitch.Enabled {
 		return false
@@ -1114,6 +1202,29 @@ func startProxy(cfg Config) {
 
 	var mu sync.RWMutex
 	backends := map[string]*url.URL{}
+	var semMu sync.Mutex
+	semaphores := map[string]chan struct{}{}
+	acquireConcurrency := func(configKey string) func() {
+		if configKey == "" {
+			return func() {}
+		}
+		mc, ok := cfg.Models[configKey]
+		if !ok || mc.Concurrency == nil || *mc.Concurrency <= 0 {
+			return func() {}
+		}
+		// Key by the canonical configured model key, never by the request's raw
+		// or loaded instance name. All aliases and route spellings therefore share
+		// one queue, while distinct configured models remain independent.
+		semMu.Lock()
+		sem := semaphores[configKey]
+		if sem == nil {
+			sem = make(chan struct{}, *mc.Concurrency)
+			semaphores[configKey] = sem
+		}
+		semMu.Unlock()
+		sem <- struct{}{}
+		return func() { <-sem }
+	}
 
 	rebuildBackends := func() {
 		mu.Lock()
@@ -1224,6 +1335,15 @@ func startProxy(cfg Config) {
 		}
 		mu.RUnlock()
 
+		// Serialize the complete routing, autoswitch, and proxy flow for a
+		// configured model. The resolved route name is used for loaded models.
+		configKey := concurrencyConfigKey(cfg, routedName)
+		if configKey == "" {
+			configKey = concurrencyConfigKey(cfg, targetName)
+		}
+		releaseConcurrency := acquireConcurrency(configKey)
+		defer func() { releaseConcurrency() }()
+
 		if ok {
 			markInstanceUsed(routedName)
 		}
@@ -1246,6 +1366,14 @@ func startProxy(cfg Config) {
 		if !ok && shouldFallbackToDefault(targetName, autoswitchErr) {
 			reg := loadRegistry()
 			if def := reg.Default(); def != nil {
+				// The request may have started without a route (the default-model
+				// fallback), so switch the queue to the default model before proxying.
+				defaultConfigKey := concurrencyConfigKey(cfg, def.Name)
+				if defaultConfigKey != configKey {
+					releaseConcurrency()
+					configKey = defaultConfigKey
+					releaseConcurrency = acquireConcurrency(configKey)
+				}
 				target, _ = url.Parse(fmt.Sprintf("http://127.0.0.1:%d", def.Port))
 				ok = true
 				routedName = def.Name
@@ -1531,6 +1659,16 @@ func loadInstance(cfg Config, opts loadOptions) (Instance, bool, error) {
 	if err := validateExtraArgs(cfg.ExtraArgs); err != nil {
 		return Instance{}, false, err
 	}
+	if cfg.Concurrency != nil {
+		if *cfg.Concurrency <= 0 {
+			return Instance{}, false, fmt.Errorf("concurrency must be greater than zero")
+		}
+		for _, arg := range cfg.ExtraArgs {
+			if arg == "--parallel" || strings.HasPrefix(arg, "--parallel=") {
+				return Instance{}, false, fmt.Errorf("extra_args must not contain --parallel when concurrency is configured")
+			}
+		}
+	}
 
 	args := []string{}
 	if spec.HFRepo != "" {
@@ -1543,6 +1681,9 @@ func loadInstance(cfg Config, opts loadOptions) (Instance, bool, error) {
 		"--port", strconv.Itoa(backendPort),
 		"--ctx-size", strconv.Itoa(cfg.CtxSize),
 	)
+	if cfg.Concurrency != nil {
+		args = append(args, "--parallel", strconv.Itoa(*cfg.Concurrency))
+	}
 	if cfg.GpuLayers != 0 {
 		args = append(args, "--n-gpu-layers", strconv.Itoa(cfg.GpuLayers))
 	}
@@ -1581,6 +1722,7 @@ func loadInstance(cfg Config, opts loadOptions) (Instance, bool, error) {
 		Port:            backendPort,
 		IsDefault:       isDefault,
 		CtxSize:         cfg.CtxSize,
+		Concurrency:     cfg.Concurrency,
 		GpuLayers:       cfg.GpuLayers,
 		ServerBin:       cfg.ServerBin,
 		ExtraArgs:       cfg.ExtraArgs,
@@ -1788,6 +1930,9 @@ func cmdPS() {
 		}
 		fmt.Printf("  %s%-20s %-26s %-8d %-8d %-8s %s\n",
 			marker, inst.Name, model, inst.PID, inst.Port, ctxStr, status)
+		if inst.Concurrency != nil {
+			fmt.Printf("    concurrency: %d (queued per-model; backend --parallel is automatic)\n", *inst.Concurrency)
+		}
 		if inst.AutoUnload || inst.EstimatedVramMB > 0 {
 			fmt.Printf("    autoswitch: auto_unload=%t estimated_vram_mb=%d\n", inst.AutoUnload, inst.EstimatedVramMB)
 		}
@@ -1855,6 +2000,10 @@ func cmdInfo(name string) {
 	fmt.Printf("Backend:    http://127.0.0.1:%d\n", inst.Port)
 	fmt.Printf("Server:     %s\n", inst.ServerBin)
 	fmt.Printf("Ctx size:   %d\n", inst.CtxSize)
+	if inst.Concurrency != nil {
+		fmt.Printf("Concurrency: %d (queued per-model; --parallel is automatic)\n", *inst.Concurrency)
+		fmt.Printf("Per-slot ctx: ~%d (ctx_size / concurrency)\n", inst.CtxSize / *inst.Concurrency)
+	}
 	fmt.Printf("GPU layers: %d\n", inst.GpuLayers)
 	if inst.AutoUnload || inst.EstimatedVramMB > 0 || inst.LastUsedAt > 0 {
 		fmt.Printf("Auto unload: %t\n", inst.AutoUnload)
@@ -2182,6 +2331,7 @@ func cmdConfig(cfg Config) {
 	fmt.Printf("  Proxy:       %s:%d\n", cfg.Host, cfg.Port)
 	fmt.Printf("  GPU layers:  %d (-1 = all)\n", cfg.GpuLayers)
 	fmt.Printf("  Ctx size:    %d\n", cfg.CtxSize)
+	fmt.Println("  Concurrency: unset (unlimited; per-model overrides may queue requests)")
 	if len(cfg.ExtraArgs) > 0 {
 		fmt.Printf("  Extra args:  %s\n", strings.Join(cfg.ExtraArgs, " "))
 	}
@@ -2213,6 +2363,9 @@ func cmdConfig(cfg Config) {
 			}
 			if mc.CtxSize != nil {
 				fmt.Printf("      ctx_size:    %d\n", *mc.CtxSize)
+			}
+			if mc.Concurrency != nil {
+				fmt.Printf("      concurrency: %d (queues excess requests; auto --parallel; ~ctx_size/concurrency per slot)\n", *mc.Concurrency)
 			}
 			if mc.ExtraArgs != nil {
 				fmt.Printf("      extra_args:  %s\n", strings.Join(mc.ExtraArgs, " "))
