@@ -826,7 +826,7 @@ func TestHandleListModelsFiltersByScope(t *testing.T) {
 
 	listIDs := func(key *APIKey) []string {
 		rec := httptest.NewRecorder()
-		handleListModels(rec, key)
+		handleListModels(rec, key, cfg)
 		var resp struct {
 			Data []struct {
 				ID string `json:"id"`

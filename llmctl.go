@@ -392,9 +392,16 @@ func cmdAuthGenerate(cfg Config, args []string) {
 	}
 	for i := 1; i < len(args); i++ {
 		if args[i] == "--limit" && i+1 < len(args) {
-			rateLimit, _ = strconv.Atoi(args[i+1])
+			n, err := strconv.Atoi(args[i+1])
+			if err != nil || n < 0 {
+				fmt.Fprintf(os.Stderr, "Error: --limit must be a non-negative integer (0 = unlimited; got %q)\n", args[i+1])
+				os.Exit(1)
+			}
+			rateLimit = n
+			i++
 		} else if args[i] == "--model" && i+1 < len(args) {
 			modelRefs = append(modelRefs, args[i+1])
+			i++
 		}
 	}
 
@@ -1538,11 +1545,20 @@ func startProxy(cfg Config) {
 	// Auth middleware + per-key rate limiter
 	limiter := newRateLimiter(1*time.Minute, 0) // global limit disabled; per-key limits used
 	innerHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Answer CORS preflights locally — don't proxy them to backends.
+		if r.Method == "OPTIONS" {
+			w.Header().Set("Access-Control-Allow-Origin", "*")
+			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+			w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, X-Model")
+			w.WriteHeader(204)
+			return
+		}
+
 		key := apiKeyFromRequest(r)
 
 		// GET /v1/models — OpenAI compatible model listing
 		if r.URL.Path == "/v1/models" && r.Method == "GET" {
-			handleListModels(w, key)
+			handleListModels(w, key, cfg)
 			return
 		}
 
@@ -1741,8 +1757,7 @@ func startProxy(cfg Config) {
 	}
 }
 
-func handleListModels(w http.ResponseWriter, key *APIKey) {
-	cfg := loadConfig()
+func handleListModels(w http.ResponseWriter, key *APIKey, cfg Config) {
 	reg := loadRegistry()
 	reg.CleanDead()
 
