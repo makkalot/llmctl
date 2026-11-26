@@ -4,7 +4,10 @@ A CLI tool for managing multiple local [llama.cpp](https://github.com/ggerganov/
 
 ## Prerequisites
 
-- **llama.cpp server** — one of `llama-server`, `llama-cpp-server`, or `server` must be in your `PATH` (or set via config)
+- **Docker** — every model backend runs `llama-server` in its own container. The user running llmctl must be able to run `docker` (e.g. be in the `docker` group).
+- **GPU support for containers**:
+  - NVIDIA desktop/server: [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/) (containers get `--gpus all`)
+  - Jetson: the `nvidia` container runtime that ships with JetPack (containers get `--runtime nvidia`), plus a Jetson-compatible llama.cpp image (the official images are not built for Jetson)
 - **huggingface-cli** (optional) — needed only for `llmctl pull`. Install with `pip install huggingface_hub`
 
 ## Installation
@@ -39,11 +42,11 @@ make build      # outputs to ./bin/ for darwin/linux × amd64/arm64
 ## Quick start
 
 ```sh
-# 1. Tell llmctl where your models and server binary are
+# 1. Tell llmctl where your models are (and, optionally, which image to run)
 llmctl set models_dir /path/to/your/models
-llmctl set server_bin /path/to/llama-server
+llmctl set docker.image ghcr.io/ggml-org/llama.cpp:server-cuda
 
-# 2. Load a model (starts a llama-server backend)
+# 2. Load a model (starts a llama-server container)
 llmctl load mistral
 
 # 3. Start the OpenAI-compatible proxy
@@ -70,7 +73,7 @@ curl http://localhost:8080/v1/chat/completions \
 
 | Command | Aliases | Description |
 |---------|---------|-------------|
-| `llmctl load <model>` | `run` | Load a model (starts a llama-server backend) |
+| `llmctl load <model>` | `run` | Load a model (starts a llama-server container) |
 | `llmctl unload <name>` | | Stop a running model instance |
 | `llmctl stop` | `kill` | Stop all instances and the proxy |
 | `llmctl default <name>` | | Set the default model for unmatched requests |
@@ -156,7 +159,8 @@ Config is stored at `~/.llmctl.json`. Set values with `llmctl set`:
 
 ```sh
 llmctl set models_dir /path/to/models
-llmctl set server_bin /path/to/llama-server
+llmctl set docker.image ghcr.io/ggml-org/llama.cpp:server-cuda
+llmctl set docker.gpu nvidia      # nvidia | jetson | none
 llmctl set host 0.0.0.0
 llmctl set port 8080
 llmctl set gpu_layers -1          # -1 = offload all layers to GPU
@@ -166,11 +170,61 @@ llmctl set ctx_size 4096
 | Key | Default | Description |
 |-----|---------|-------------|
 | `models_dir` | `~/models` | Directory containing `.gguf` files |
-| `server_bin` | auto-detected | Path to `llama-server` binary |
+| `docker.image` | `ghcr.io/ggml-org/llama.cpp:server-cuda` | llama.cpp server image |
+| `docker.gpu` | `nvidia` | `nvidia` (`--gpus all`), `jetson` (`--runtime nvidia`) or `none` |
+| `docker.entrypoint` | image default | Override the image entrypoint, e.g. `llama-server` for images without one |
+| `docker.hf_cache_dir` | `$LLAMA_CACHE` or `~/.cache/llama.cpp` | Host directory used for `-hf` downloads |
+| `docker.bin` | `docker` | Container CLI (any docker-compatible CLI, e.g. `podman`) |
 | `host` | `0.0.0.0` | Proxy listen address |
 | `port` | `8080` | Proxy listen port |
 | `gpu_layers` | `-1` (all) | Number of layers to offload to GPU |
 | `ctx_size` | `4096` | Context window size |
+
+### Docker backends
+
+Each loaded model runs as a container named `llmctl-<instance>` with the label `llmctl.instance=<instance>`:
+
+```sh
+docker run -d --name llmctl-<instance> --label llmctl.instance=<instance> \
+  -p 127.0.0.1:<port>:<port> --user <your uid>:<your gid> [--gpus all | --runtime nvidia] \
+  -v <models_dir>:<models_dir>:ro -v <hf_cache_dir>:<hf_cache_dir> -e LLAMA_CACHE=<hf_cache_dir> \
+  [docker.args...] <image> --model <path> --host 0.0.0.0 --port <port> ...
+```
+
+- **Same paths inside and out.** Host directories are mounted at the same path in the container, so model paths in the registry, `llmctl info` and `extra_args` work unchanged. `models_dir` is mounted read-only and the HF cache read-write. llmctl also mounts the directory of every other file it passes to llama-server: a model or mmproj outside `models_dir` (including the target of a symlink) read-only, and absolute paths in `extra_args` (e.g. `--chat-template-file`, `--lora`) read-write.
+- **Network.** The backend port is published on `127.0.0.1` only; the proxy is the only public endpoint.
+- **Image pulls.** If the image is missing, llmctl pulls it before starting the container, so the first pull doesn't count against the health-check timeout.
+- **Lifecycle.** Containers are not started with `--rm` and have no restart policy. On `unload`, `stop`, or when llmctl finds a backend that has exited, it saves the container logs to `~/.llmctl-logs/<name>.log` and removes the container. `llmctl stop` also removes any `llmctl.instance`-labelled containers the registry has lost track of.
+
+Extra `docker run` flags go in `docker.args` (global) or `docker_args` (per model, appended to the global ones). Image and entrypoint can also be set per model:
+
+```json
+{
+  "docker": {
+    "image": "ghcr.io/ggml-org/llama.cpp:server-cuda",
+    "gpu": "nvidia",
+    "args": ["--shm-size", "1g"]
+  },
+  "models": {
+    "vision": {
+      "docker_image": "my-registry/llama.cpp:server-cuda-custom",
+      "docker_args": ["-e", "CUDA_VISIBLE_DEVICES=1"]
+    }
+  }
+}
+```
+
+On **Jetson**, use an L4T-based llama.cpp image built for your JetPack version. If the image has no `llama-server` entrypoint, set it:
+
+```json
+{
+  "docker": {
+    "image": "<your-jetson-llama.cpp-image>",
+    "gpu": "jetson",
+    "entrypoint": "llama-server"
+  }
+}
+```
 
 ### Autoswitching
 
@@ -300,8 +354,8 @@ Requests can also specify a model via the `X-Model` HTTP header.
 | Path | Description |
 |------|-------------|
 | `~/.llmctl.json` | Configuration |
-| `~/.llmctl.registry.json` | Registry of running instances and proxy PID |
-| `~/.llmctl-logs/<name>.log` | Per-instance server logs |
+| `~/.llmctl.registry.json` | Registry of running instances (container names, ports) and proxy PID |
+| `~/.llmctl-logs/<name>.log` | Server logs of stopped instances (running ones are read with `docker logs`) |
 
 ## License
 

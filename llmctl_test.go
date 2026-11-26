@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -421,7 +422,7 @@ func TestSystemdUnitFile(t *testing.T) {
 		t.Skipf("llmctl.service not found: %v", err)
 	}
 	content := string(data)
-	for _, want := range []string{"[Unit]", "[Service]", "[Install]", "ExecStart=/usr/local/bin/llmctl proxy", "Restart=always", "WantedBy=multi-user.target"} {
+	for _, want := range []string{"[Unit]", "[Service]", "[Install]", "After=network-online.target docker.service", "ExecStart=/usr/local/bin/llmctl proxy", "Restart=always", "WantedBy=multi-user.target"} {
 		if !strings.Contains(content, want) {
 			t.Errorf("unit file missing: %s", want)
 		}
@@ -432,11 +433,11 @@ func TestHandleUIModelsListsOnlyConfiguredModels(t *testing.T) {
 	tmp := t.TempDir()
 	cfg := testConfig(tmp)
 	cfg.Aliases = map[string]string{
-		"qwen27b":     "Qwen3.5-27B-GGUF/UD-Q4_K_XL.gguf",
+		"qwen27b":      "Qwen3.5-27B-GGUF/UD-Q4_K_XL.gguf",
 		"qwen27b_code": "Qwen3.5-27B-GGUF/UD-Q4_K_XL.gguf", // same target, distinct alias
 	}
 	cfg.Models = map[string]ModelConfig{
-		"qwen27b":     {VramMB: 18000},
+		"qwen27b":      {VramMB: 18000},
 		"qwen27b_code": {VramMB: 16000},
 	}
 
@@ -480,5 +481,258 @@ func TestHandleUIModelsListsOnlyConfiguredModels(t *testing.T) {
 		if strings.Contains(name, "stray-model") {
 			t.Errorf("stray disk model leaked into UI list: %q", name)
 		}
+	}
+}
+
+// ── Docker backend ──────────────────────────────────────────────────────────
+
+func stubDocker(t *testing.T, fn func(args ...string) (string, error)) *[][]string {
+	t.Helper()
+	var calls [][]string
+	orig := dockerExec
+	dockerExec = func(args ...string) (string, error) {
+		calls = append(calls, args)
+		return fn(args...)
+	}
+	invalidateLiveContainers()
+	t.Cleanup(func() {
+		dockerExec = orig
+		invalidateLiveContainers()
+	})
+	return &calls
+}
+
+func argValue(args []string, flag string) []string {
+	var vals []string
+	for i := 0; i+1 < len(args); i++ {
+		if args[i] == flag {
+			vals = append(vals, args[i+1])
+		}
+	}
+	return vals
+}
+
+func TestContainerNameSanitizes(t *testing.T) {
+	if got := containerName("qwen3.5-27b"); got != "llmctl-qwen3.5-27b" {
+		t.Fatalf("got %q", got)
+	}
+	if got := containerName("org/model:Q4 K"); got != "llmctl-org-model-Q4-K" {
+		t.Fatalf("got %q", got)
+	}
+}
+
+func TestDockerRunArgsNvidia(t *testing.T) {
+	args := dockerRunArgs(dockerRunSpec{
+		Docker:     DockerConfig{Image: "img:tag", GPU: "nvidia", HFCacheDir: "/cache", Args: []string{"--shm-size", "1g"}},
+		Container:  "llmctl-chat",
+		Instance:   "chat",
+		Port:       9100,
+		Mounts:     []containerMount{{Host: "/models", ReadOnly: true}, {Host: "/cache"}},
+		ServerArgs: []string{"--model", "/models/a.gguf", "--port", "9100"},
+	})
+	joined := strings.Join(args, " ")
+	if args[0] != "run" || args[1] != "-d" {
+		t.Fatalf("expected detached run, got %v", args[:2])
+	}
+	for _, want := range []string{
+		"--name llmctl-chat",
+		"--label llmctl.instance=chat",
+		"-p 127.0.0.1:9100:9100",
+		"--gpus all",
+		"-v /models:/models:ro",
+		"-v /cache:/cache ",
+		"-e LLAMA_CACHE=/cache",
+		"--shm-size 1g img:tag --model /models/a.gguf --port 9100",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("missing %q in: %s", want, joined)
+		}
+	}
+	if strings.Contains(joined, "--rm") {
+		t.Errorf("containers must not use --rm (logs are kept until llmctl removes them)")
+	}
+	if strings.Contains(joined, "--entrypoint") || strings.Contains(joined, "--runtime") {
+		t.Errorf("unexpected flags: %s", joined)
+	}
+}
+
+func TestDockerRunArgsJetsonAndEntrypoint(t *testing.T) {
+	args := dockerRunArgs(dockerRunSpec{
+		Docker:    DockerConfig{Image: "jetson:img", GPU: "jetson", Entrypoint: "llama-server"},
+		Container: "llmctl-x", Instance: "x", Port: 9101,
+	})
+	if got := argValue(args, "--runtime"); len(got) != 1 || got[0] != "nvidia" {
+		t.Fatalf("expected --runtime nvidia, got %v", args)
+	}
+	if got := argValue(args, "--entrypoint"); len(got) != 1 || got[0] != "llama-server" {
+		t.Fatalf("expected --entrypoint llama-server, got %v", args)
+	}
+	if len(argValue(args, "--gpus")) != 0 {
+		t.Fatalf("jetson must not use --gpus: %v", args)
+	}
+	if args[len(args)-1] != "jetson:img" {
+		t.Fatalf("image must be last when no server args: %v", args)
+	}
+}
+
+func TestDockerRunArgsNoGPU(t *testing.T) {
+	args := dockerRunArgs(dockerRunSpec{Docker: DockerConfig{Image: "cpu", GPU: "none"}, Container: "c", Instance: "i", Port: 1})
+	if len(argValue(args, "--gpus"))+len(argValue(args, "--runtime")) != 0 {
+		t.Fatalf("expected no GPU flags: %v", args)
+	}
+}
+
+func TestBackendMountsCoversSymlinkTargetsAndExtraArgs(t *testing.T) {
+	root := t.TempDir()
+	models := filepath.Join(root, "models")
+	other := filepath.Join(root, "other")
+	blobs := filepath.Join(root, "store", "blobs")
+	tmpl := filepath.Join(root, "templates")
+	for _, d := range []string{models, other, blobs, tmpl} {
+		if err := os.MkdirAll(d, 0755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	inModels := filepath.Join(models, "a.gguf")
+	if err := os.WriteFile(inModels, []byte("x"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	blob := filepath.Join(blobs, "abc")
+	if err := os.WriteFile(blob, []byte("x"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(other, "b.gguf")
+	if err := os.Symlink(blob, link); err != nil {
+		t.Fatal(err)
+	}
+	tmplFile := filepath.Join(tmpl, "chat.jinja")
+	if err := os.WriteFile(tmplFile, []byte("x"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	mounts := backendMounts(models, filepath.Join(root, "cache"),
+		[]string{inModels, link, "relative.gguf"},
+		[]string{"--chat-template-file", tmplFile, "--temp", "0.7", "--foo", "/nonexistent-dir/x"})
+
+	got := map[string]bool{}
+	for _, m := range mounts {
+		got[m.Host] = m.ReadOnly
+	}
+	want := map[string]bool{
+		models:                       true,
+		filepath.Join(root, "cache"): false,
+		other:                        true,
+		blobs:                        true,
+		tmpl:                         false,
+	}
+	// t.TempDir may itself be behind a symlink (e.g. macOS /var → /private/var).
+	if real, _ := filepath.EvalSymlinks(blobs); real != blobs {
+		delete(want, blobs)
+		want[real] = true
+	}
+	for dir, ro := range want {
+		gotRO, ok := got[dir]
+		if !ok {
+			t.Errorf("missing mount %s (got %v)", dir, mounts)
+			continue
+		}
+		if gotRO != ro {
+			t.Errorf("mount %s read-only=%t, want %t", dir, gotRO, ro)
+		}
+	}
+	if len(mounts) != len(want) {
+		t.Errorf("unexpected extra mounts: %v", mounts)
+	}
+}
+
+func TestConfigForModelDockerOverrides(t *testing.T) {
+	img := "custom:img"
+	ep := "llama-server"
+	cfg := defaultConfig()
+	cfg.Docker.Args = []string{"--shm-size", "1g"}
+	cfg.Models = map[string]ModelConfig{
+		"m": {DockerImage: &img, DockerEntrypoint: &ep, DockerArgs: []string{"--ipc", "host"}},
+	}
+	got := configForModel(cfg, "m")
+	if got.Docker.Image != img || got.Docker.Entrypoint != ep {
+		t.Fatalf("overrides not applied: %+v", got.Docker)
+	}
+	if strings.Join(got.Docker.Args, " ") != "--shm-size 1g --ipc host" {
+		t.Fatalf("docker args not appended: %v", got.Docker.Args)
+	}
+	if strings.Join(cfg.Docker.Args, " ") != "--shm-size 1g" {
+		t.Fatalf("global docker args mutated: %v", cfg.Docker.Args)
+	}
+}
+
+func TestLoadConfigFillsDockerDefaults(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("LLAMA_CACHE", "")
+	if err := os.WriteFile(filepath.Join(home, configFile), []byte(`{"docker":{"image":"my:img"}}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := loadConfig()
+	if cfg.Docker.Image != "my:img" {
+		t.Fatalf("image = %q", cfg.Docker.Image)
+	}
+	if cfg.Docker.Bin != "docker" || cfg.Docker.GPU != "nvidia" {
+		t.Fatalf("defaults not filled: %+v", cfg.Docker)
+	}
+	if cfg.Docker.HFCacheDir != filepath.Join(home, ".cache", "llama.cpp") {
+		t.Fatalf("hf_cache_dir = %q", cfg.Docker.HFCacheDir)
+	}
+}
+
+func TestCleanDeadRemovesExitedContainers(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	calls := stubDocker(t, func(args ...string) (string, error) {
+		if args[0] == "ps" {
+			return "llmctl-alive\n", nil
+		}
+		return "", nil
+	})
+	reg := Registry{Instances: []Instance{
+		{Name: "alive", Container: "llmctl-alive"},
+		{Name: "dead", Container: "llmctl-dead"},
+		{Name: "legacy"}, // pre-docker registry entry
+	}}
+	reg.CleanDead()
+	if len(reg.Instances) != 1 || reg.Instances[0].Name != "alive" {
+		t.Fatalf("instances = %+v", reg.Instances)
+	}
+	removed := false
+	for _, c := range *calls {
+		if c[0] == "rm" && c[len(c)-1] == "llmctl-dead" {
+			removed = true
+		}
+		if c[0] == "rm" && c[len(c)-1] == "llmctl-alive" {
+			t.Fatalf("live container removed")
+		}
+	}
+	if !removed {
+		t.Fatalf("dead container not removed: %v", *calls)
+	}
+}
+
+func TestCleanDeadKeepsRegistryWhenDockerUnreachable(t *testing.T) {
+	stubDocker(t, func(args ...string) (string, error) {
+		return "", fmt.Errorf("cannot connect to the Docker daemon")
+	})
+	reg := Registry{Instances: []Instance{{Name: "a", Container: "llmctl-a"}}}
+	reg.CleanDead()
+	if len(reg.Instances) != 1 {
+		t.Fatalf("registry wiped when docker unreachable: %+v", reg.Instances)
+	}
+}
+
+func TestRegistryDefaultFallsBackToLiveContainer(t *testing.T) {
+	stubDocker(t, func(args ...string) (string, error) { return "llmctl-b\n", nil })
+	reg := Registry{Instances: []Instance{
+		{Name: "a", Container: "llmctl-a"},
+		{Name: "b", Container: "llmctl-b"},
+	}}
+	if def := reg.Default(); def == nil || def.Name != "b" {
+		t.Fatalf("default = %+v", def)
 	}
 }

@@ -1,9 +1,9 @@
 package main
 
 import (
-	"embed"
 	"bufio"
 	"bytes"
+	"embed"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -32,6 +32,10 @@ const (
 	configFile    = ".llmctl.json"
 	defaultModels = "models"
 	startPort     = 9100 // internal backend ports start here
+
+	defaultDockerImage = "ghcr.io/ggml-org/llama.cpp:server-cuda"
+	containerPrefix    = "llmctl-"
+	containerLabel     = "llmctl.instance"
 )
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -39,14 +43,16 @@ const (
 // ═══════════════════════════════════════════════════════════════════════════
 
 type ModelConfig struct {
-	ServerBin  *string  `json:"server_bin,omitempty"`
-	GpuLayers  *int     `json:"gpu_layers,omitempty"`
-	CtxSize    *int     `json:"ctx_size,omitempty"`
-	Mmproj     string   `json:"mmproj,omitempty"`
-	ExtraArgs  []string `json:"extra_args,omitempty"`
-	AutoLoad   bool     `json:"auto_load,omitempty"`
-	AutoUnload bool     `json:"auto_unload,omitempty"`
-	VramMB     int      `json:"vram_mb,omitempty"`
+	DockerImage      *string  `json:"docker_image,omitempty"`
+	DockerEntrypoint *string  `json:"docker_entrypoint,omitempty"`
+	DockerArgs       []string `json:"docker_args,omitempty"`
+	GpuLayers        *int     `json:"gpu_layers,omitempty"`
+	CtxSize          *int     `json:"ctx_size,omitempty"`
+	Mmproj           string   `json:"mmproj,omitempty"`
+	ExtraArgs        []string `json:"extra_args,omitempty"`
+	AutoLoad         bool     `json:"auto_load,omitempty"`
+	AutoUnload       bool     `json:"auto_unload,omitempty"`
+	VramMB           int      `json:"vram_mb,omitempty"`
 }
 
 type AutoswitchConfig struct {
@@ -75,7 +81,7 @@ func validateAutoswitchConfig(cfg Config) error {
 
 type Config struct {
 	ModelsDir  string                 `json:"models_dir"`
-	ServerBin  string                 `json:"server_bin"`
+	Docker     DockerConfig           `json:"docker"`
 	Host       string                 `json:"host"`
 	Port       int                    `json:"port"`
 	GpuLayers  int                    `json:"gpu_layers"`
@@ -87,10 +93,32 @@ type Config struct {
 	Autoswitch AutoswitchConfig       `json:"autoswitch,omitempty"`
 }
 
+// DockerConfig controls how llama-server backends are run as containers.
+type DockerConfig struct {
+	Bin        string   `json:"bin"`                  // docker CLI (or a compatible one, e.g. podman)
+	Image      string   `json:"image"`                // llama.cpp server image
+	Entrypoint string   `json:"entrypoint,omitempty"` // override image entrypoint (e.g. "llama-server")
+	GPU        string   `json:"gpu"`                  // "nvidia" (--gpus all), "jetson" (--runtime nvidia), "none"
+	HFCacheDir string   `json:"hf_cache_dir"`         // host dir mounted for -hf downloads
+	Args       []string `json:"args,omitempty"`       // extra `docker run` flags
+}
+
+func defaultHFCacheDir() string {
+	if d := os.Getenv("LLAMA_CACHE"); d != "" {
+		return d
+	}
+	return filepath.Join(homeDir(), ".cache", "llama.cpp")
+}
+
 func defaultConfig() Config {
 	return Config{
 		ModelsDir: modelsDir(),
-		ServerBin: findServerBin(),
+		Docker: DockerConfig{
+			Bin:        "docker",
+			Image:      defaultDockerImage,
+			GPU:        "nvidia",
+			HFCacheDir: defaultHFCacheDir(),
+		},
 		Host:      defaultHost,
 		Port:      defaultPort,
 		GpuLayers: -1,
@@ -120,6 +148,19 @@ func loadConfig() Config {
 	}
 	if cfg.Models == nil {
 		cfg.Models = map[string]ModelConfig{}
+	}
+	def := defaultConfig().Docker
+	if cfg.Docker.Bin == "" {
+		cfg.Docker.Bin = def.Bin
+	}
+	if cfg.Docker.Image == "" {
+		cfg.Docker.Image = def.Image
+	}
+	if cfg.Docker.GPU == "" {
+		cfg.Docker.GPU = def.GPU
+	}
+	if cfg.Docker.HFCacheDir == "" {
+		cfg.Docker.HFCacheDir = def.HFCacheDir
 	}
 	return cfg
 }
@@ -223,8 +264,14 @@ func configForModel(cfg Config, modelKey string) Config {
 	if !ok {
 		return cfg
 	}
-	if mc.ServerBin != nil {
-		cfg.ServerBin = *mc.ServerBin
+	if mc.DockerImage != nil {
+		cfg.Docker.Image = *mc.DockerImage
+	}
+	if mc.DockerEntrypoint != nil {
+		cfg.Docker.Entrypoint = *mc.DockerEntrypoint
+	}
+	if mc.DockerArgs != nil {
+		cfg.Docker.Args = append(append([]string{}, cfg.Docker.Args...), mc.DockerArgs...)
 	}
 	if mc.GpuLayers != nil {
 		cfg.GpuLayers = *mc.GpuLayers
@@ -296,15 +343,6 @@ func aliasTargetMatchesModel(cfg Config, target, modelPath string) bool {
 	return false
 }
 
-func findServerBin() string {
-	for _, name := range []string{"llama-server", "llama-cpp-server", "server"} {
-		if p, err := exec.LookPath(name); err == nil {
-			return p
-		}
-	}
-	return "llama-server"
-}
-
 // ═══════════════════════════════════════════════════════════════════════════
 // Instance Registry — tracks multiple running backends
 // ═══════════════════════════════════════════════════════════════════════════
@@ -313,12 +351,12 @@ type Instance struct {
 	Name            string   `json:"name"`
 	Model           string   `json:"model"` // full path to .gguf
 	Mmproj          string   `json:"mmproj,omitempty"`
-	PID             int      `json:"pid"`
+	Container       string   `json:"container"` // docker container name
+	Image           string   `json:"image"`
 	Port            int      `json:"port"`
 	IsDefault       bool     `json:"is_default"` // default model for unmatched requests
 	CtxSize         int      `json:"ctx_size"`
 	GpuLayers       int      `json:"gpu_layers"`
-	ServerBin       string   `json:"server_bin"`
 	ExtraArgs       []string `json:"extra_args,omitempty"`
 	Aliases         []string `json:"aliases,omitempty"`
 	AutoUnload      bool     `json:"auto_unload,omitempty"`
@@ -361,8 +399,9 @@ func (r *Registry) Default() *Instance {
 			return &r.Instances[i]
 		}
 	}
+	live := liveContainers()
 	for i := range r.Instances {
-		if isRunning(r.Instances[i].PID) {
+		if live[r.Instances[i].Container] {
 			return &r.Instances[i]
 		}
 	}
@@ -379,11 +418,23 @@ func (r *Registry) Remove(name string) {
 	r.Instances = filtered
 }
 
+// CleanDead drops instances whose container is no longer running. Exited
+// containers are not started with --rm, so their logs are saved to
+// ~/.llmctl-logs before the container is removed.
 func (r *Registry) CleanDead() {
+	live, err := liveContainersErr()
+	if err != nil {
+		// Docker unreachable: keep the registry rather than forget backends.
+		return
+	}
 	var alive []Instance
 	for _, inst := range r.Instances {
-		if isRunning(inst.PID) {
+		if live[inst.Container] {
 			alive = append(alive, inst)
+			continue
+		}
+		if inst.Container != "" {
+			removeContainer(inst.Container, instanceLogPath(inst.Name))
 		}
 	}
 	r.Instances = alive
@@ -405,6 +456,7 @@ func (r *Registry) NextPort() int {
 // Process helpers
 // ═══════════════════════════════════════════════════════════════════════════
 
+// isRunning reports whether a host process is alive (used for the proxy PID).
 func isRunning(pid int) bool {
 	if pid <= 0 {
 		return false
@@ -432,20 +484,306 @@ func stopProcess(pid int) {
 	time.Sleep(200 * time.Millisecond)
 }
 
-func waitForHealth(port int, timeout time.Duration) bool {
+// ═══════════════════════════════════════════════════════════════════════════
+// Docker helpers — llama-server backends run as containers
+// ═══════════════════════════════════════════════════════════════════════════
+
+// dockerBin is the container CLI used for all docker calls. It is set from
+// config in main() so registry helpers don't need a Config.
+var dockerBin = "docker"
+
+// dockerExec runs the docker CLI and returns combined stdout. It is a
+// variable so tests can stub it.
+var dockerExec = func(args ...string) (string, error) {
+	cmd := exec.Command(dockerBin, args...)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
+	if err != nil {
+		msg := strings.TrimSpace(stderr.String())
+		if msg == "" {
+			msg = err.Error()
+		}
+		return string(out), fmt.Errorf("%s %s: %s", dockerBin, strings.Join(args, " "), msg)
+	}
+	return string(out), nil
+}
+
+var (
+	liveMu      sync.Mutex
+	liveCache   map[string]bool
+	liveCacheAt time.Time
+	liveErr     error
+)
+
+const liveCacheTTL = time.Second
+
+// liveContainers returns the names of running llmctl-managed containers.
+// The result is cached briefly because the proxy calls this on hot paths.
+func liveContainers() map[string]bool {
+	live, _ := liveContainersErr()
+	return live
+}
+
+// liveContainersErr is liveContainers plus the error from docker, so callers
+// that delete state can tell "nothing running" from "docker unreachable".
+func liveContainersErr() (map[string]bool, error) {
+	liveMu.Lock()
+	defer liveMu.Unlock()
+	if liveCache != nil && time.Since(liveCacheAt) < liveCacheTTL {
+		return liveCache, liveErr
+	}
+	out, err := dockerExec("ps", "--filter", "label="+containerLabel, "--format", "{{.Names}}")
+	live := map[string]bool{}
+	if err == nil {
+		for _, name := range strings.Fields(out) {
+			live[name] = true
+		}
+	}
+	liveCache, liveCacheAt, liveErr = live, time.Now(), err
+	return live, err
+}
+
+func invalidateLiveContainers() {
+	liveMu.Lock()
+	liveCache = nil
+	liveMu.Unlock()
+}
+
+func instanceRunning(inst Instance) bool {
+	return inst.Container != "" && liveContainers()[inst.Container]
+}
+
+// containerName maps an instance name to a valid docker container name.
+func containerName(instance string) string {
+	name := strings.Map(func(r rune) rune {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '_', r == '.', r == '-':
+			return r
+		}
+		return '-'
+	}, instance)
+	return containerPrefix + name
+}
+
+func logDir() string { return filepath.Join(homeDir(), ".llmctl-logs") }
+
+func instanceLogPath(name string) string { return filepath.Join(logDir(), name+".log") }
+
+// saveContainerLogs writes the container's stdout+stderr to path.
+func saveContainerLogs(container, path string) {
+	if path == "" {
+		return
+	}
+	cmd := exec.Command(dockerBin, "logs", container)
+	out, err := cmd.CombinedOutput()
+	if err != nil || len(out) == 0 {
+		return
+	}
+	_ = os.MkdirAll(filepath.Dir(path), 0755)
+	_ = os.WriteFile(path, out, 0644)
+}
+
+// removeContainer saves the container's logs (if logPath is set) and removes it.
+func removeContainer(container, logPath string) {
+	saveContainerLogs(container, logPath)
+	_, _ = dockerExec("rm", "-f", container)
+	invalidateLiveContainers()
+}
+
+// stopInstance stops and removes an instance's container, keeping its logs.
+func stopInstance(inst Instance) {
+	if inst.Container == "" {
+		return
+	}
+	_, _ = dockerExec("stop", "-t", "10", inst.Container)
+	removeContainer(inst.Container, instanceLogPath(inst.Name))
+}
+
+// containerState returns whether the container is running and its exit code.
+// exists is false if the container is gone.
+func containerState(container string) (running bool, exitCode int, exists bool) {
+	out, err := dockerExec("inspect", "-f", "{{.State.Running}} {{.State.ExitCode}}", container)
+	if err != nil {
+		return false, 0, false
+	}
+	fields := strings.Fields(out)
+	if len(fields) != 2 {
+		return false, 0, false
+	}
+	exitCode, _ = strconv.Atoi(fields[1])
+	return fields[0] == "true", exitCode, true
+}
+
+// ensureImage pulls the image if it is not present locally, so the first
+// pull does not count against the backend health timeout.
+func ensureImage(image string, verbose bool) error {
+	if _, err := dockerExec("image", "inspect", image); err == nil {
+		return nil
+	}
+	if verbose {
+		fmt.Printf("Pulling image %s...\n", image)
+	}
+	cmd := exec.Command(dockerBin, "pull", image)
+	if verbose {
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		return cmd.Run()
+	}
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("pull %s: %v: %s", image, err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+type containerMount struct {
+	Host     string
+	ReadOnly bool
+}
+
+// backendMounts returns host directories to bind-mount (at the same path) so
+// every host path llama-server is given also exists inside the container.
+// HF-cache model files are symlinks into ../../blobs, so symlink targets are
+// mounted too.
+func backendMounts(modelsDir, hfCacheDir string, files []string, extraArgs []string) []containerMount {
+	var mounts []containerMount
+	idx := map[string]int{}
+	add := func(dir string, ro bool) {
+		if dir == "" || dir == "/" || dir == "." {
+			return
+		}
+		dir = filepath.Clean(dir)
+		if i, ok := idx[dir]; ok {
+			if !ro {
+				mounts[i].ReadOnly = false
+			}
+			return
+		}
+		idx[dir] = len(mounts)
+		mounts = append(mounts, containerMount{Host: dir, ReadOnly: ro})
+	}
+	covered := func(path string) bool {
+		for _, m := range mounts {
+			if path == m.Host || strings.HasPrefix(path, m.Host+string(filepath.Separator)) {
+				return true
+			}
+		}
+		return false
+	}
+	addFile := func(path string, ro bool) {
+		for _, p := range []string{path, resolveSymlinks(path)} {
+			if p == "" {
+				continue
+			}
+			if dir := filepath.Dir(p); !covered(dir) {
+				add(dir, ro)
+			}
+		}
+	}
+
+	if modelsDir != "" {
+		add(modelsDir, true)
+	}
+	if hfCacheDir != "" {
+		add(hfCacheDir, false)
+	}
+	for _, f := range files {
+		if filepath.IsAbs(f) {
+			addFile(f, true)
+		}
+	}
+	for _, a := range extraArgs {
+		if !filepath.IsAbs(a) {
+			continue
+		}
+		if info, err := os.Stat(a); err == nil && info.IsDir() {
+			if !covered(a) {
+				add(a, false)
+			}
+			continue
+		}
+		if _, err := os.Stat(filepath.Dir(a)); err == nil {
+			addFile(a, false)
+		}
+	}
+	return mounts
+}
+
+func resolveSymlinks(path string) string {
+	real, err := filepath.EvalSymlinks(path)
+	if err != nil || real == path {
+		return ""
+	}
+	return real
+}
+
+type dockerRunSpec struct {
+	Docker     DockerConfig
+	Container  string
+	Instance   string
+	Port       int
+	Mounts     []containerMount
+	ServerArgs []string // llama-server arguments
+}
+
+// dockerRunArgs builds the `docker run` argument list for a backend.
+func dockerRunArgs(spec dockerRunSpec) []string {
+	args := []string{
+		"run", "-d",
+		"--name", spec.Container,
+		"--label", containerLabel + "=" + spec.Instance,
+		"-p", fmt.Sprintf("127.0.0.1:%d:%d", spec.Port, spec.Port),
+		"--user", fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid()),
+	}
+	switch strings.ToLower(spec.Docker.GPU) {
+	case "nvidia", "cuda":
+		args = append(args, "--gpus", "all")
+	case "jetson":
+		args = append(args, "--runtime", "nvidia")
+	}
+	for _, m := range spec.Mounts {
+		v := m.Host + ":" + m.Host
+		if m.ReadOnly {
+			v += ":ro"
+		}
+		args = append(args, "-v", v)
+	}
+	if spec.Docker.HFCacheDir != "" {
+		args = append(args,
+			"-e", "LLAMA_CACHE="+spec.Docker.HFCacheDir,
+			"-e", "HF_HUB_CACHE="+spec.Docker.HFCacheDir,
+		)
+	}
+	if spec.Docker.Entrypoint != "" {
+		args = append(args, "--entrypoint", spec.Docker.Entrypoint)
+	}
+	args = append(args, spec.Docker.Args...)
+	args = append(args, spec.Docker.Image)
+	return append(args, spec.ServerArgs...)
+}
+
+// waitForHealth polls the backend's /health until it returns 200, the
+// container exits, or the timeout elapses.
+func waitForHealth(port int, container string, timeout time.Duration) (healthy bool, exited bool, exitCode int) {
 	deadline := time.Now().Add(timeout)
 	addr := fmt.Sprintf("http://127.0.0.1:%d/health", port)
-	for time.Now().Before(deadline) {
-		resp, err := http.Get(addr)
+	client := &http.Client{Timeout: 2 * time.Second}
+	for i := 0; time.Now().Before(deadline); i++ {
+		resp, err := client.Get(addr)
 		if err == nil {
 			resp.Body.Close()
 			if resp.StatusCode == 200 {
-				return true
+				return true, false, 0
+			}
+		}
+		if i%4 == 0 {
+			if running, code, _ := containerState(container); !running {
+				return false, true, code
 			}
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
-	return false
+	return false, false, 0
 }
 
 func printLogTail(path string, maxLines int) {
@@ -464,15 +802,6 @@ func printLogTail(path string, maxLines int) {
 	fmt.Fprintln(os.Stderr, "Last log lines:")
 	for _, line := range lines[start:] {
 		fmt.Fprintln(os.Stderr, "  "+line)
-	}
-}
-
-func backendExited(exitCh <-chan error) (error, bool) {
-	select {
-	case err := <-exitCh:
-		return err, true
-	default:
-		return nil, false
 	}
 }
 
@@ -961,7 +1290,7 @@ func autoswitchModel(cfg Config, targetName string) (*url.URL, string, error) {
 		return nil, "", err
 	}
 	if !healthy {
-		stopProcess(inst.PID)
+		stopInstance(inst)
 		reg := loadRegistry()
 		reg.Remove(inst.Name)
 		saveRegistry(reg)
@@ -1045,7 +1374,7 @@ func handleUIModels(w http.ResponseWriter, cfg Config) {
 			if vram == 0 {
 				vram = cfg.Models[name].VramMB
 			}
-			out = append(out, row{name, isRunning(inst.PID), vram, inst.Port})
+			out = append(out, row{name, instanceRunning(*inst), vram, inst.Port})
 			continue
 		}
 		// Configured but not currently loaded.
@@ -1080,7 +1409,7 @@ func handleUIUnload(w http.ResponseWriter, r *http.Request, cfg Config) {
 		jsonResp(w, map[string]string{"error": "model not found"})
 		return
 	}
-	stopProcess(inst.PID)
+	stopInstance(*inst)
 	reg.Remove(name)
 	saveRegistry(reg)
 	addEvent("Unloaded model " + name)
@@ -1511,12 +1840,10 @@ func loadInstance(cfg Config, opts loadOptions) (Instance, bool, error) {
 	reg.CleanDead()
 
 	if existing := reg.FindByName(spec.InstanceName); existing != nil {
-		if isRunning(existing.PID) {
-			if opts.Verbose {
-				fmt.Printf("Replacing instance '%s'...\n", spec.InstanceName)
-			}
-			stopProcess(existing.PID)
+		if opts.Verbose {
+			fmt.Printf("Replacing instance '%s'...\n", spec.InstanceName)
 		}
+		stopInstance(*existing)
 		reg.Remove(spec.InstanceName)
 	}
 
@@ -1539,7 +1866,9 @@ func loadInstance(cfg Config, opts loadOptions) (Instance, bool, error) {
 		args = append(args, "--model", spec.ModelPath)
 	}
 	args = append(args,
-		"--host", "127.0.0.1",
+		// Inside the container llama-server must listen on all interfaces;
+		// docker publishes the port on 127.0.0.1 only.
+		"--host", "0.0.0.0",
 		"--port", strconv.Itoa(backendPort),
 		"--ctx-size", strconv.Itoa(cfg.CtxSize),
 	)
@@ -1554,22 +1883,37 @@ func loadInstance(cfg Config, opts loadOptions) (Instance, bool, error) {
 	}
 	args = append(args, cfg.ExtraArgs...)
 
-	cmd := exec.Command(cfg.ServerBin, args...)
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
-
-	logDir := filepath.Join(homeDir(), ".llmctl-logs")
-	os.MkdirAll(logDir, 0755)
-	logFile, _ := os.Create(filepath.Join(logDir, spec.InstanceName+".log"))
-	cmd.Stdout = logFile
-	cmd.Stderr = logFile
-
-	if err := cmd.Start(); err != nil {
-		return Instance{}, false, fmt.Errorf("error starting server: %w; is %q installed and in PATH?", err, cfg.ServerBin)
+	var files []string
+	if spec.HFRepo == "" {
+		files = append(files, spec.ModelPath)
 	}
-	exitCh := make(chan error, 1)
-	go func() {
-		exitCh <- cmd.Wait()
-	}()
+	if spec.MmprojPath != "" {
+		files = append(files, spec.MmprojPath)
+	}
+	if cfg.Docker.HFCacheDir != "" {
+		// Create it as the current user; otherwise docker creates it as root.
+		_ = os.MkdirAll(cfg.Docker.HFCacheDir, 0755)
+	}
+	container := containerName(spec.InstanceName)
+	runArgs := dockerRunArgs(dockerRunSpec{
+		Docker:     cfg.Docker,
+		Container:  container,
+		Instance:   spec.InstanceName,
+		Port:       backendPort,
+		Mounts:     backendMounts(cfg.ModelsDir, cfg.Docker.HFCacheDir, files, cfg.ExtraArgs),
+		ServerArgs: args,
+	})
+
+	if err := ensureImage(cfg.Docker.Image, opts.Verbose); err != nil {
+		return Instance{}, false, fmt.Errorf("error pulling image %s: %w", cfg.Docker.Image, err)
+	}
+	// Clear any leftover container with the same name (e.g. from a crash).
+	_, _ = dockerExec("rm", "-f", container)
+	if _, err := dockerExec(runArgs...); err != nil {
+		_, _ = dockerExec("rm", "-f", container)
+		return Instance{}, false, fmt.Errorf("error starting container: %w", err)
+	}
+	invalidateLiveContainers()
 
 	isDefault := len(reg.Instances) == 0
 
@@ -1577,12 +1921,12 @@ func loadInstance(cfg Config, opts loadOptions) (Instance, bool, error) {
 		Name:            spec.InstanceName,
 		Model:           spec.ModelPath,
 		Mmproj:          spec.MmprojPath,
-		PID:             cmd.Process.Pid,
+		Container:       container,
+		Image:           cfg.Docker.Image,
 		Port:            backendPort,
 		IsDefault:       isDefault,
 		CtxSize:         cfg.CtxSize,
 		GpuLayers:       cfg.GpuLayers,
-		ServerBin:       cfg.ServerBin,
 		ExtraArgs:       cfg.ExtraArgs,
 		AutoUnload:      autoUnload,
 		EstimatedVramMB: estimatedVramMB,
@@ -1598,12 +1942,15 @@ func loadInstance(cfg Config, opts loadOptions) (Instance, bool, error) {
 	if timeout <= 0 {
 		timeout = 60 * time.Second
 	}
-	if waitForHealth(backendPort, timeout) {
+	healthy, exited, exitCode := waitForHealth(backendPort, container, timeout)
+	if healthy {
 		if opts.Verbose {
-			fmt.Printf("✓ '%s' ready (PID %d, backend :%d)\n", spec.InstanceName, inst.PID, backendPort)
+			fmt.Printf("✓ '%s' ready (container %s, backend :%d)\n", spec.InstanceName, container, backendPort)
 		}
 	} else {
-		if exitErr, exited := backendExited(exitCh); exited {
+		if exited {
+			logPath := instanceLogPath(spec.InstanceName)
+			removeContainer(container, logPath)
 			reg := loadRegistry()
 			reg.Remove(spec.InstanceName)
 			if isDefault && len(reg.Instances) > 0 {
@@ -1611,18 +1958,15 @@ func loadInstance(cfg Config, opts loadOptions) (Instance, bool, error) {
 			}
 			saveRegistry(reg)
 			if opts.Verbose {
-				fmt.Fprintf(os.Stderr, "Error: '%s' exited before becoming healthy. Check: llmctl logs %s\n",
-					spec.InstanceName, spec.InstanceName)
-				if exitErr != nil {
-					fmt.Fprintf(os.Stderr, "Backend exit: %v\n", exitErr)
-				}
-				printLogTail(filepath.Join(logDir, spec.InstanceName+".log"), 20)
+				fmt.Fprintf(os.Stderr, "Error: '%s' exited (code %d) before becoming healthy. Check: llmctl logs %s\n",
+					spec.InstanceName, exitCode, spec.InstanceName)
+				printLogTail(logPath, 20)
 			}
-			return Instance{}, false, fmt.Errorf("%q exited before becoming healthy: %v", spec.InstanceName, exitErr)
+			return Instance{}, false, fmt.Errorf("%q exited with code %d before becoming healthy", spec.InstanceName, exitCode)
 		}
 		if opts.Verbose {
-			fmt.Printf("⚠ '%s' started (PID %d) but not yet healthy. Check: llmctl logs %s\n",
-				spec.InstanceName, inst.PID, spec.InstanceName)
+			fmt.Printf("⚠ '%s' started (container %s) but not yet healthy. Check: llmctl logs %s\n",
+				spec.InstanceName, container, spec.InstanceName)
 		}
 		return inst, false, nil
 	}
@@ -1677,9 +2021,9 @@ func unloadInstance(name string, verbose bool) error {
 	}
 
 	if verbose {
-		fmt.Printf("Stopping '%s' (PID %d)...\n", inst.Name, inst.PID)
+		fmt.Printf("Stopping '%s' (container %s)...\n", inst.Name, inst.Container)
 	}
-	stopProcess(inst.PID)
+	stopInstance(*inst)
 	wasDefault := inst.IsDefault
 	reg.Remove(inst.Name)
 
@@ -1711,9 +2055,17 @@ func cmdStopAll() {
 		stopProcess(reg.ProxyPID)
 	}
 	for _, inst := range reg.Instances {
-		if isRunning(inst.PID) {
-			fmt.Printf("Stopping '%s' (PID %d)...\n", inst.Name, inst.PID)
-			stopProcess(inst.PID)
+		if inst.Container != "" {
+			fmt.Printf("Stopping '%s' (container %s)...\n", inst.Name, inst.Container)
+			stopInstance(inst)
+		}
+	}
+	// Also remove any llmctl-managed containers the registry lost track of.
+	if out, err := dockerExec("ps", "-a", "--filter", "label="+containerLabel, "--format", "{{.Names}}"); err == nil {
+		for _, name := range strings.Fields(out) {
+			fmt.Printf("Removing orphan container %s...\n", name)
+			_, _ = dockerExec("stop", "-t", "10", name)
+			removeContainer(name, "")
 		}
 	}
 	reg.Instances = nil
@@ -1756,8 +2108,8 @@ func cmdPS() {
 
 	fmt.Println("Loaded models:")
 	fmt.Println()
-	fmt.Printf("  %-3s %-20s %-26s %-8s %-8s %-8s %s\n", "", "NAME", "MODEL", "PID", "PORT", "CTX", "STATUS")
-	fmt.Printf("  %-3s %-20s %-26s %-8s %-8s %-8s %s\n", "", "────", "─────", "───", "────", "───", "──────")
+	fmt.Printf("  %-3s %-20s %-26s %-8s %-8s %s\n", "", "NAME", "MODEL", "PORT", "CTX", "STATUS")
+	fmt.Printf("  %-3s %-20s %-26s %-8s %-8s %s\n", "", "────", "─────", "────", "───", "──────")
 
 	for _, inst := range reg.Instances {
 		marker := "  "
@@ -1765,7 +2117,7 @@ func cmdPS() {
 			marker = "★ "
 		}
 		status := "stopped"
-		if isRunning(inst.PID) {
+		if instanceRunning(inst) {
 			resp, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d/health", inst.Port))
 			if err == nil {
 				resp.Body.Close()
@@ -1786,8 +2138,8 @@ func cmdPS() {
 		if inst.CtxSize > 0 {
 			ctxStr = strconv.Itoa(inst.CtxSize)
 		}
-		fmt.Printf("  %s%-20s %-26s %-8d %-8d %-8s %s\n",
-			marker, inst.Name, model, inst.PID, inst.Port, ctxStr, status)
+		fmt.Printf("  %s%-20s %-26s %-8d %-8s %s\n",
+			marker, inst.Name, model, inst.Port, ctxStr, status)
 		if inst.AutoUnload || inst.EstimatedVramMB > 0 {
 			fmt.Printf("    autoswitch: auto_unload=%t estimated_vram_mb=%d\n", inst.AutoUnload, inst.EstimatedVramMB)
 		}
@@ -1825,7 +2177,7 @@ func cmdInfo(name string) {
 	}
 
 	status := "stopped"
-	if isRunning(inst.PID) {
+	if instanceRunning(*inst) {
 		resp, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d/health", inst.Port))
 		if err == nil {
 			resp.Body.Close()
@@ -1847,13 +2199,13 @@ func cmdInfo(name string) {
 		fmt.Println("Default:    ★ yes")
 	}
 	fmt.Printf("Status:     %s\n", status)
-	fmt.Printf("PID:        %d\n", inst.PID)
+	fmt.Printf("Container:  %s\n", inst.Container)
+	fmt.Printf("Image:      %s\n", inst.Image)
 	fmt.Printf("Model:      %s\n", inst.Model)
 	if inst.Mmproj != "" {
 		fmt.Printf("Mmproj:     %s\n", inst.Mmproj)
 	}
 	fmt.Printf("Backend:    http://127.0.0.1:%d\n", inst.Port)
-	fmt.Printf("Server:     %s\n", inst.ServerBin)
 	fmt.Printf("Ctx size:   %d\n", inst.CtxSize)
 	fmt.Printf("GPU layers: %d\n", inst.GpuLayers)
 	if inst.AutoUnload || inst.EstimatedVramMB > 0 || inst.LastUsedAt > 0 {
@@ -1962,15 +2314,27 @@ func cmdList(cfg Config) {
 }
 
 func cmdLogs(name string) {
-	logDir := filepath.Join(homeDir(), ".llmctl-logs")
-	logPath := filepath.Join(logDir, name+".log")
+	// Running instance: read straight from the container.
+	reg := loadRegistry()
+	if inst := findInstanceByNameFuzzy(reg, name); inst != nil && inst.Container != "" {
+		if _, _, exists := containerState(inst.Container); exists {
+			cmd := exec.Command(dockerBin, "logs", "--tail", "50", inst.Container)
+			cmd.Stdout = os.Stdout
+			cmd.Stderr = os.Stdout // llama-server logs to stderr
+			if cmd.Run() == nil {
+				return
+			}
+		}
+	}
 
+	// Stopped instance: logs saved when the container was removed.
+	logPath := instanceLogPath(name)
 	if _, err := os.Stat(logPath); err != nil {
-		entries, _ := os.ReadDir(logDir)
+		entries, _ := os.ReadDir(logDir())
 		lower := strings.ToLower(name)
 		for _, e := range entries {
 			if strings.Contains(strings.ToLower(e.Name()), lower) {
-				logPath = filepath.Join(logDir, e.Name())
+				logPath = filepath.Join(logDir(), e.Name())
 				break
 			}
 		}
@@ -2159,7 +2523,7 @@ func cmdRM(cfg Config, modelName string) {
 	}
 	reg := loadRegistry()
 	for _, inst := range reg.Instances {
-		if inst.Model == modelPath && isRunning(inst.PID) {
+		if inst.Model == modelPath && instanceRunning(inst) {
 			fmt.Fprintf(os.Stderr, "Error: model loaded as '%s'. Unload first.\n", inst.Name)
 			os.Exit(1)
 		}
@@ -2178,7 +2542,17 @@ func cmdConfig(cfg Config) {
 	fmt.Println("Configuration:")
 	fmt.Printf("  Config:      %s\n", configPath())
 	fmt.Printf("  Models dir:  %s\n", cfg.ModelsDir)
-	fmt.Printf("  Server bin:  %s\n", cfg.ServerBin)
+	fmt.Println("  Docker:")
+	fmt.Printf("    bin:          %s\n", cfg.Docker.Bin)
+	fmt.Printf("    image:        %s\n", cfg.Docker.Image)
+	if cfg.Docker.Entrypoint != "" {
+		fmt.Printf("    entrypoint:   %s\n", cfg.Docker.Entrypoint)
+	}
+	fmt.Printf("    gpu:          %s\n", cfg.Docker.GPU)
+	fmt.Printf("    hf_cache_dir: %s\n", cfg.Docker.HFCacheDir)
+	if len(cfg.Docker.Args) > 0 {
+		fmt.Printf("    args:         %s\n", strings.Join(cfg.Docker.Args, " "))
+	}
 	fmt.Printf("  Proxy:       %s:%d\n", cfg.Host, cfg.Port)
 	fmt.Printf("  GPU layers:  %d (-1 = all)\n", cfg.GpuLayers)
 	fmt.Printf("  Ctx size:    %d\n", cfg.CtxSize)
@@ -2205,8 +2579,14 @@ func cmdConfig(cfg Config) {
 		fmt.Println("  Model overrides:")
 		for name, mc := range cfg.Models {
 			fmt.Printf("    [%s]\n", name)
-			if mc.ServerBin != nil {
-				fmt.Printf("      server_bin:  %s\n", *mc.ServerBin)
+			if mc.DockerImage != nil {
+				fmt.Printf("      docker_image: %s\n", *mc.DockerImage)
+			}
+			if mc.DockerEntrypoint != nil {
+				fmt.Printf("      docker_entrypoint: %s\n", *mc.DockerEntrypoint)
+			}
+			if mc.DockerArgs != nil {
+				fmt.Printf("      docker_args: %s\n", strings.Join(mc.DockerArgs, " "))
 			}
 			if mc.GpuLayers != nil {
 				fmt.Printf("      gpu_layers:  %d\n", *mc.GpuLayers)
@@ -2234,8 +2614,22 @@ func cmdSet(cfg Config, key, value string) {
 	switch key {
 	case "models_dir":
 		cfg.ModelsDir = value
-	case "server_bin":
-		cfg.ServerBin = value
+	case "docker.bin":
+		cfg.Docker.Bin = value
+	case "docker.image":
+		cfg.Docker.Image = value
+	case "docker.entrypoint":
+		cfg.Docker.Entrypoint = value
+	case "docker.gpu":
+		switch value {
+		case "nvidia", "jetson", "none":
+		default:
+			fmt.Fprintln(os.Stderr, "Error: docker.gpu must be nvidia, jetson or none")
+			os.Exit(1)
+		}
+		cfg.Docker.GPU = value
+	case "docker.hf_cache_dir":
+		cfg.Docker.HFCacheDir = value
 	case "host":
 		cfg.Host = value
 	case "port":
@@ -2387,6 +2781,7 @@ func main() {
 	}
 
 	cfg := loadConfig()
+	dockerBin = cfg.Docker.Bin
 
 	switch os.Args[1] {
 	case "list", "ls":
