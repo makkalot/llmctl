@@ -4,11 +4,15 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
+	"net/http/httptest"
+	"net/http/httputil"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func intPtr(n int) *int {
@@ -523,7 +527,7 @@ func TestContainerNameSanitizes(t *testing.T) {
 
 func TestDockerRunArgsNvidia(t *testing.T) {
 	args := dockerRunArgs(dockerRunSpec{
-		Docker:     DockerConfig{Image: "img:tag", GPU: "nvidia", HFCacheDir: "/cache", Args: []string{"--shm-size", "1g"}},
+		Docker:     DockerConfig{Image: "img:tag", GPU: "nvidia", Network: netBridge, HFCacheDir: "/cache", Args: []string{"--shm-size", "1g"}},
 		Container:  "llmctl-chat",
 		Instance:   "chat",
 		Port:       9100,
@@ -537,6 +541,9 @@ func TestDockerRunArgsNvidia(t *testing.T) {
 	for _, want := range []string{
 		"--name llmctl-chat",
 		"--label llmctl.instance=chat",
+		"--cap-drop ALL",
+		"--security-opt no-new-privileges",
+		"--read-only --tmpfs /tmp",
 		"-p 127.0.0.1:9100:9100",
 		"--gpus all",
 		"-v /models:/models:ro",
@@ -610,9 +617,13 @@ func TestBackendMountsCoversSymlinkTargetsAndExtraArgs(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	slots := filepath.Join(root, "slots")
+	if err := os.MkdirAll(slots, 0755); err != nil {
+		t.Fatal(err)
+	}
 	mounts := backendMounts(models, filepath.Join(root, "cache"),
 		[]string{inModels, link, "relative.gguf"},
-		[]string{"--chat-template-file", tmplFile, "--temp", "0.7", "--foo", "/nonexistent-dir/x"})
+		[]string{"--chat-template-file", tmplFile, "--temp", "0.7", "--foo", "/nonexistent-dir/x", "--slot-save-path", slots})
 
 	got := map[string]bool{}
 	for _, m := range mounts {
@@ -623,7 +634,8 @@ func TestBackendMountsCoversSymlinkTargetsAndExtraArgs(t *testing.T) {
 		filepath.Join(root, "cache"): false,
 		other:                        true,
 		blobs:                        true,
-		tmpl:                         false,
+		tmpl:                         true, // read-only: not a writable flag
+		slots:                        false,
 	}
 	// t.TempDir may itself be behind a symlink (e.g. macOS /var → /private/var).
 	if real, _ := filepath.EvalSymlinks(blobs); real != blobs {
@@ -734,5 +746,235 @@ func TestRegistryDefaultFallsBackToLiveContainer(t *testing.T) {
 	}}
 	if def := reg.Default(); def == nil || def.Name != "b" {
 		t.Fatalf("default = %+v", def)
+	}
+}
+
+func TestDockerRunArgsNetworkModes(t *testing.T) {
+	base := dockerRunSpec{Container: "c", Instance: "i", Port: 9100, ServerArgs: []string{"--host", "/run/x.sock"}}
+
+	base.Docker = DockerConfig{Image: "img", Network: netNone, HFCacheDir: "/cache", PidsLimit: 512}
+	args := dockerRunArgs(base)
+	if got := argValue(args, "--network"); len(got) != 1 || got[0] != "none" {
+		t.Fatalf("none: expected --network none, got %v", args)
+	}
+	if len(argValue(args, "-p")) != 0 {
+		t.Fatalf("none: must not publish ports: %v", args)
+	}
+	for _, e := range argValue(args, "-e") {
+		if strings.HasPrefix(e, "LLAMA_CACHE=") {
+			t.Fatalf("none: HF cache env must not be set: %v", args)
+		}
+	}
+	if got := argValue(args, "--pids-limit"); len(got) != 1 || got[0] != "512" {
+		t.Fatalf("expected --pids-limit 512: %v", args)
+	}
+
+	base.Docker.Network = netInternal
+	args = dockerRunArgs(base)
+	if got := argValue(args, "--network"); len(got) != 1 || got[0] != internalNetwork {
+		t.Fatalf("internal: expected --network %s, got %v", internalNetwork, args)
+	}
+	if len(argValue(args, "-p")) != 0 {
+		t.Fatalf("internal: must not publish ports: %v", args)
+	}
+
+	base.Docker.Network = netBridge
+	args = dockerRunArgs(base)
+	if len(argValue(args, "--network")) != 0 {
+		t.Fatalf("bridge: no --network flag expected: %v", args)
+	}
+	if got := argValue(args, "-p"); len(got) != 1 || got[0] != "127.0.0.1:9100:9100" {
+		t.Fatalf("bridge: expected loopback publish: %v", args)
+	}
+}
+
+func TestDockerRunArgsHardeningToggles(t *testing.T) {
+	off := false
+	args := dockerRunArgs(dockerRunSpec{Docker: DockerConfig{Image: "img", Network: netNone, ReadOnly: &off, PidsLimit: 0}, Container: "c", Instance: "i"})
+	joined := strings.Join(args, " ")
+	if strings.Contains(joined, "--read-only") || strings.Contains(joined, "--pids-limit") {
+		t.Fatalf("read_only=false / pids_limit=0 should drop flags: %s", joined)
+	}
+	if !strings.Contains(joined, "--cap-drop ALL") || !strings.Contains(joined, "--security-opt no-new-privileges") {
+		t.Fatalf("cap-drop/no-new-privileges must always be set: %s", joined)
+	}
+}
+
+func TestLoadConfigDefaultsToIsolatedHardenedContainers(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	if err := os.WriteFile(filepath.Join(home, configFile), []byte(`{"docker":{"image":"x"}}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := loadConfig()
+	if cfg.Docker.Network != netNone || !cfg.Docker.readOnly() || cfg.Docker.PidsLimit != defaultPidsLimit {
+		t.Fatalf("unexpected defaults: %+v", cfg.Docker)
+	}
+}
+
+func TestConfigForModelNetworkOverride(t *testing.T) {
+	bridge := netBridge
+	cfg := defaultConfig()
+	cfg.Models = map[string]ModelConfig{"m": {DockerNetwork: &bridge}}
+	if got := configForModel(cfg, "m").Docker.Network; got != netBridge {
+		t.Fatalf("network = %q", got)
+	}
+	if cfg.Docker.Network != netNone {
+		t.Fatalf("global network mutated")
+	}
+}
+
+func TestInstanceBackendAddressing(t *testing.T) {
+	if got := instanceBackend(Instance{Socket: "/run/a.sock"}).String(); got != "unix:///run/a.sock" {
+		t.Fatalf("socket: %s", got)
+	}
+	if got := instanceBackend(Instance{Addr: "172.18.0.2:9100"}).String(); got != "http://172.18.0.2:9100" {
+		t.Fatalf("addr: %s", got)
+	}
+	if got := instanceBackend(Instance{Port: 9101}).String(); got != "http://127.0.0.1:9101" {
+		t.Fatalf("legacy port: %s", got)
+	}
+}
+
+func TestBackendOverUnixSocket(t *testing.T) {
+	dir, err := os.MkdirTemp("", "llmsock")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(dir)
+	sock := filepath.Join(dir, "llama.sock")
+	ln, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Skipf("unix sockets unavailable: %v", err)
+	}
+	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/health" {
+			_, _ = w.Write([]byte(`{"status":"ok"}`))
+			return
+		}
+		_, _ = w.Write([]byte("chat:" + r.URL.Path))
+	})}
+	go func() { _ = srv.Serve(ln) }()
+	defer srv.Close()
+
+	inst := Instance{Name: "x", Socket: sock}
+	if got := backendStatus(inst); got != "healthy" {
+		t.Fatalf("status = %q", got)
+	}
+	if healthy, _, _ := waitForHealth(instanceBackend(inst), "unused", 2*time.Second); !healthy {
+		t.Fatal("waitForHealth over unix socket failed")
+	}
+
+	// Reverse proxy wiring as used by startProxy.
+	target := instanceBackend(inst)
+	proxy := &httputil.ReverseProxy{
+		Director: func(req *http.Request) {
+			req.URL.Scheme = target.URL.Scheme
+			req.URL.Host = target.URL.Host
+			req.Host = target.URL.Host
+		},
+		Transport: target.Transport,
+	}
+	rec := httptest.NewRecorder()
+	proxy.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{}`)))
+	if rec.Body.String() != "chat:/v1/chat/completions" {
+		t.Fatalf("proxied body = %q (code %d)", rec.Body.String(), rec.Code)
+	}
+}
+
+func TestHFSelectFiles(t *testing.T) {
+	files := []string{
+		"README.md",
+		"Model-Q4_K_M.gguf",
+		"Model-Q8_0.gguf",
+		"Model-UD-Q4_K_XL.gguf",
+		"BF16/Model-BF16-00001-of-00002.gguf",
+		"BF16/Model-BF16-00002-of-00002.gguf",
+		"mmproj-BF16.gguf",
+		"mmproj-F16.gguf",
+	}
+	cases := []struct {
+		tag    string
+		model  []string
+		errSub string
+	}{
+		{"", []string{"Model-Q4_K_M.gguf"}, ""},
+		{"q8_0", []string{"Model-Q8_0.gguf"}, ""},
+		{"UD-Q4_K_XL", []string{"Model-UD-Q4_K_XL.gguf"}, ""},
+		{"BF16", []string{"BF16/Model-BF16-00001-of-00002.gguf", "BF16/Model-BF16-00002-of-00002.gguf"}, ""},
+		{"Model-Q8_0.gguf", []string{"Model-Q8_0.gguf"}, ""},
+		{"IQ1_S", nil, "no .gguf matching"},
+	}
+	for _, c := range cases {
+		model, mmproj, err := hfSelectFiles(files, c.tag)
+		if c.errSub != "" {
+			if err == nil || !strings.Contains(err.Error(), c.errSub) {
+				t.Errorf("tag %q: err = %v, want %q", c.tag, err, c.errSub)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("tag %q: %v", c.tag, err)
+			continue
+		}
+		if strings.Join(model, ",") != strings.Join(c.model, ",") {
+			t.Errorf("tag %q: model = %v, want %v", c.tag, model, c.model)
+		}
+		if mmproj != "mmproj-F16.gguf" {
+			t.Errorf("tag %q: mmproj = %q", c.tag, mmproj)
+		}
+	}
+
+	model, mmproj, err := hfSelectFiles([]string{"only-IQ2.gguf"}, "")
+	if err != nil || len(model) != 1 || model[0] != "only-IQ2.gguf" || mmproj != "" {
+		t.Fatalf("fallback to first gguf: %v %q %v", model, mmproj, err)
+	}
+}
+
+func TestFindInHFCacheNestedFile(t *testing.T) {
+	dir := t.TempDir()
+	nested := filepath.Join(dir, "hub", "models--u--r", "snapshots", "abc", "BF16")
+	if err := os.MkdirAll(nested, 0755); err != nil {
+		t.Fatal(err)
+	}
+	f := filepath.Join(nested, "m-00001-of-00002.gguf")
+	if err := os.WriteFile(f, []byte("x"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if got := findInHFCache(dir, "models--u--r/BF16/m-00001-of-00002.gguf"); got != f {
+		t.Fatalf("got %q", got)
+	}
+}
+
+func TestResolveLoadSpecLeavesHFToContainerOnBridge(t *testing.T) {
+	cfg := testConfig(t.TempDir())
+	cfg.Docker.Network = netBridge
+	spec, err := resolveLoadSpec(cfg, loadOptions{HFRepo: "u/r:Q4_K_M"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if spec.HFRepo != "u/r:Q4_K_M" {
+		t.Fatalf("bridge mode should pass -hf through, got %+v", spec)
+	}
+}
+
+func TestResolveLoadSpecUsesCachedHFFileWhenIsolated(t *testing.T) {
+	dir := t.TempDir()
+	snap := filepath.Join(dir, "models--u--r", "snapshots", "abc")
+	if err := os.MkdirAll(snap, 0755); err != nil {
+		t.Fatal(err)
+	}
+	f := filepath.Join(snap, "m-Q4_K_M.gguf")
+	if err := os.WriteFile(f, []byte("x"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := testConfig(dir)
+	cfg.Docker.Network = netNone
+	spec, err := resolveLoadSpec(cfg, loadOptions{HFRepo: "u/r:m-Q4_K_M.gguf"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if spec.HFRepo != "" || spec.ModelPath != f {
+		t.Fatalf("expected local file load, got %+v", spec)
 	}
 }

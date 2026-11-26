@@ -9,7 +9,7 @@
 ```sh
 make build          # cross-compile all 4 targets (darwin/linux × amd64/arm64) into ./bin/
 make lint           # go vet + golangci-lint (default config, no .golangci.yml)
-make test           # go test -v ./... (~33 tests in llmctl_test.go)
+make test           # go test -v ./... (~43 tests in llmctl_test.go)
 make install        # build + copy current-platform binary to /usr/local/bin/llmctl
 make systemd-install    # install + enable systemd system service (/etc/systemd/system/llmctl.service, runs as $SUDO_USER)
 make systemd-uninstall  # disable + remove systemd system service
@@ -34,9 +34,9 @@ Everything lives in `llmctl.go` under `package main`. Sections are separated by 
 
 - **No sub-packages.** Do not create new Go files or packages — all code goes in `llmctl.go`.
 - **No third-party deps.** Do not add `require` entries to `go.mod`. Use only the standard library.
-- **Tests** live in `llmctl_test.go` in the root (~33 tests). Covers model resolution, HF cache layout, docker run args / mounts / registry cleanup (docker stubbed via `dockerExec`), alias/config key matching, pull target parsing, autoswitch VRAM estimation & eviction logic, and proxy model listing. Add new tests there — same `package main`, no external deps.
+- **Tests** live in `llmctl_test.go` in the root (~43 tests). Covers model resolution, HF cache layout, docker run args / mounts / registry cleanup (docker stubbed via `dockerExec`), alias/config key matching, pull target parsing, autoswitch VRAM estimation & eviction logic, and proxy model listing. Add new tests there — same `package main`, no external deps.
 - **Runtime state** is file-based JSON in `$HOME` (`~/.llmctl.json`, `~/.llmctl.registry.json`, `~/.llmctl-logs/`).
-- **Backends are Docker containers** named `llmctl-<instance>`, labelled `llmctl.instance=<instance>`, started without `--rm` (llmctl saves logs to `~/.llmctl-logs/` and removes them). Host paths are bind-mounted at the same path so model paths are identical inside the container. Ports are published on `127.0.0.1` only. Talk to Docker only via the CLI (`dockerExec`) — no Docker SDK.
+- **Backends are Docker containers** named `llmctl-<instance>`, labelled `llmctl.instance=<instance>`, started without `--rm` (llmctl saves logs to `~/.llmctl-logs/` and removes them). Host paths are bind-mounted at the same path so model paths are identical inside the container. Containers are hardened (`--cap-drop ALL`, `no-new-privileges`, read-only rootfs, pids limit). Network modes (`docker.network`): `none` (default; llama-server on a unix socket in `~/.llmctl-run/<container>/`, proxy uses a unix-dialing transport), `internal` (`llmctl-internal` docker network, proxy dials container IP), `bridge` (port published on `127.0.0.1`). Always reach backends via `instanceBackend(inst)` — never build `127.0.0.1:<port>` URLs directly. In `none`/`internal`, `-hf` loads are prefetched on the host (`prefetchHF`). Talk to Docker only via the CLI (`dockerExec`) — no Docker SDK.
 - **`CleanDead` must not wipe the registry when `docker ps` fails** (daemon unreachable) — it returns early.
 - **Fuzzy matching** is used for model/instance resolution (case-insensitive substring). Don't break this contract.
 - **Model names** support both `/` and `:` as separators (e.g., `Qwen3.5-27B-GGUF:UD-Q4_K_XL` and `Qwen3.5-27B-GGUF/UD-Q4_K_XL` both resolve the same way).

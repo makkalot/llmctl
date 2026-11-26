@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"embed"
 	"encoding/json"
 	"fmt"
@@ -14,7 +15,9 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"sort"
 	"strconv"
@@ -36,6 +39,14 @@ const (
 	defaultDockerImage = "ghcr.io/ggml-org/llama.cpp:server-cuda"
 	containerPrefix    = "llmctl-"
 	containerLabel     = "llmctl.instance"
+	defaultPidsLimit   = 512
+
+	// Backend network modes (docker.network).
+	netNone     = "none"     // no network; llama-server listens on a unix socket
+	netInternal = "internal" // docker --internal network, no egress
+	netBridge   = "bridge"   // default docker bridge, full egress (needed for in-container -hf)
+
+	internalNetwork = "llmctl-internal"
 )
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -46,6 +57,7 @@ type ModelConfig struct {
 	DockerImage      *string  `json:"docker_image,omitempty"`
 	DockerEntrypoint *string  `json:"docker_entrypoint,omitempty"`
 	DockerArgs       []string `json:"docker_args,omitempty"`
+	DockerNetwork    *string  `json:"docker_network,omitempty"`
 	GpuLayers        *int     `json:"gpu_layers,omitempty"`
 	CtxSize          *int     `json:"ctx_size,omitempty"`
 	Mmproj           string   `json:"mmproj,omitempty"`
@@ -99,8 +111,17 @@ type DockerConfig struct {
 	Image      string   `json:"image"`                // llama.cpp server image
 	Entrypoint string   `json:"entrypoint,omitempty"` // override image entrypoint (e.g. "llama-server")
 	GPU        string   `json:"gpu"`                  // "nvidia" (--gpus all), "jetson" (--runtime nvidia), "none"
-	HFCacheDir string   `json:"hf_cache_dir"`         // host dir mounted for -hf downloads
+	HFCacheDir string   `json:"hf_cache_dir"`         // host dir mounted for -hf downloads (bridge network only)
+	Network    string   `json:"network"`              // "none" (unix socket), "internal" or "bridge"
+	ReadOnly   *bool    `json:"read_only,omitempty"`  // read-only root fs (default true)
+	PidsLimit  int      `json:"pids_limit"`           // --pids-limit; <= 0 disables
 	Args       []string `json:"args,omitempty"`       // extra `docker run` flags
+}
+
+func (d DockerConfig) readOnly() bool { return d.ReadOnly == nil || *d.ReadOnly }
+
+func validNetworkMode(m string) bool {
+	return m == netNone || m == netInternal || m == netBridge
 }
 
 func defaultHFCacheDir() string {
@@ -118,6 +139,8 @@ func defaultConfig() Config {
 			Image:      defaultDockerImage,
 			GPU:        "nvidia",
 			HFCacheDir: defaultHFCacheDir(),
+			Network:    netNone,
+			PidsLimit:  defaultPidsLimit,
 		},
 		Host:      defaultHost,
 		Port:      defaultPort,
@@ -161,6 +184,9 @@ func loadConfig() Config {
 	}
 	if cfg.Docker.HFCacheDir == "" {
 		cfg.Docker.HFCacheDir = def.HFCacheDir
+	}
+	if cfg.Docker.Network == "" {
+		cfg.Docker.Network = def.Network
 	}
 	return cfg
 }
@@ -273,6 +299,9 @@ func configForModel(cfg Config, modelKey string) Config {
 	if mc.DockerArgs != nil {
 		cfg.Docker.Args = append(append([]string{}, cfg.Docker.Args...), mc.DockerArgs...)
 	}
+	if mc.DockerNetwork != nil {
+		cfg.Docker.Network = *mc.DockerNetwork
+	}
 	if mc.GpuLayers != nil {
 		cfg.GpuLayers = *mc.GpuLayers
 	}
@@ -353,6 +382,9 @@ type Instance struct {
 	Mmproj          string   `json:"mmproj,omitempty"`
 	Container       string   `json:"container"` // docker container name
 	Image           string   `json:"image"`
+	Network         string   `json:"network,omitempty"` // none | internal | bridge
+	Socket          string   `json:"socket,omitempty"`  // unix socket path (network none)
+	Addr            string   `json:"addr,omitempty"`    // host:port (network internal/bridge)
 	Port            int      `json:"port"`
 	IsDefault       bool     `json:"is_default"` // default model for unmatched requests
 	CtxSize         int      `json:"ctx_size"`
@@ -435,6 +467,7 @@ func (r *Registry) CleanDead() {
 		}
 		if inst.Container != "" {
 			removeContainer(inst.Container, instanceLogPath(inst.Name))
+			removeSocketDir(inst.Container)
 		}
 	}
 	r.Instances = alive
@@ -598,6 +631,106 @@ func stopInstance(inst Instance) {
 	}
 	_, _ = dockerExec("stop", "-t", "10", inst.Container)
 	removeContainer(inst.Container, instanceLogPath(inst.Name))
+	removeSocketDir(inst.Container)
+}
+
+// socketDir is the per-instance host directory holding llama-server's unix
+// socket. Each instance gets its own directory so a compromised backend
+// cannot reach other backends' sockets.
+func socketDir(container string) string {
+	return filepath.Join(homeDir(), ".llmctl-run", container)
+}
+
+func removeSocketDir(container string) {
+	_ = os.RemoveAll(socketDir(container))
+}
+
+// ensureInternalNetwork creates the egress-less docker network used in
+// "internal" mode. Inter-container traffic is disabled so backends cannot
+// talk to each other.
+func ensureInternalNetwork() error {
+	if _, err := dockerExec("network", "inspect", internalNetwork); err == nil {
+		return nil
+	}
+	_, err := dockerExec("network", "create", "--internal",
+		"-o", "com.docker.network.bridge.enable_icc=false",
+		"--label", containerLabel+"=network",
+		internalNetwork)
+	return err
+}
+
+func containerIP(container, network string) (string, error) {
+	out, err := dockerExec("inspect", "-f", fmt.Sprintf("{{(index .NetworkSettings.Networks %q).IPAddress}}", network), container)
+	if err != nil {
+		return "", err
+	}
+	ip := strings.TrimSpace(out)
+	if ip == "" || ip == "<no value>" {
+		return "", fmt.Errorf("container %s has no IP on network %s", container, network)
+	}
+	return ip, nil
+}
+
+// backendTarget is how the host reaches a backend: TCP or a unix socket.
+type backendTarget struct {
+	URL       *url.URL
+	Socket    string
+	Transport http.RoundTripper
+}
+
+var socketTransports sync.Map // socket path -> *http.Transport
+
+func unixTransport(sock string) http.RoundTripper {
+	if t, ok := socketTransports.Load(sock); ok {
+		return t.(http.RoundTripper)
+	}
+	t := &http.Transport{
+		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			var d net.Dialer
+			return d.DialContext(ctx, "unix", sock)
+		},
+		MaxIdleConns:    16,
+		IdleConnTimeout: 90 * time.Second,
+	}
+	actual, _ := socketTransports.LoadOrStore(sock, t)
+	return actual.(http.RoundTripper)
+}
+
+func instanceBackend(inst Instance) backendTarget {
+	if inst.Socket != "" {
+		u, _ := url.Parse("http://localhost")
+		return backendTarget{URL: u, Socket: inst.Socket, Transport: unixTransport(inst.Socket)}
+	}
+	addr := inst.Addr
+	if addr == "" {
+		addr = fmt.Sprintf("127.0.0.1:%d", inst.Port)
+	}
+	u, _ := url.Parse("http://" + addr)
+	return backendTarget{URL: u, Transport: http.DefaultTransport}
+}
+
+func (b backendTarget) String() string {
+	if b.Socket != "" {
+		return "unix://" + b.Socket
+	}
+	return b.URL.String()
+}
+
+func (b backendTarget) client(timeout time.Duration) *http.Client {
+	return &http.Client{Transport: b.Transport, Timeout: timeout}
+}
+
+// backendStatus reports healthy/loading/running from the backend's /health.
+func backendStatus(inst Instance) string {
+	resp, err := instanceBackend(inst).client(3 * time.Second).Get(instanceBackend(inst).URL.String() + "/health")
+	if err != nil {
+		return "running"
+	}
+	resp.Body.Close()
+	if resp.StatusCode == 200 {
+		return "healthy"
+	}
+	return "loading"
 }
 
 // containerState returns whether the container is running and its exit code.
@@ -692,21 +825,32 @@ func backendMounts(modelsDir, hfCacheDir string, files []string, extraArgs []str
 			addFile(f, true)
 		}
 	}
-	for _, a := range extraArgs {
+	for i, a := range extraArgs {
 		if !filepath.IsAbs(a) {
 			continue
 		}
+		// Paths are mounted read-only unless the flag is one llama-server
+		// writes to, so a compromised backend can't tamper with templates,
+		// LoRAs, etc. used by other instances.
+		ro := i == 0 || !writableArgFlags[extraArgs[i-1]]
 		if info, err := os.Stat(a); err == nil && info.IsDir() {
 			if !covered(a) {
-				add(a, false)
+				add(a, ro)
 			}
 			continue
 		}
 		if _, err := os.Stat(filepath.Dir(a)); err == nil {
-			addFile(a, false)
+			addFile(a, ro)
 		}
 	}
 	return mounts
+}
+
+// writableArgFlags are llama-server flags whose path argument is written to.
+var writableArgFlags = map[string]bool{
+	"--slot-save-path": true,
+	"--log-file":       true,
+	"-lf":              true,
 }
 
 func resolveSymlinks(path string) string {
@@ -732,8 +876,24 @@ func dockerRunArgs(spec dockerRunSpec) []string {
 		"run", "-d",
 		"--name", spec.Container,
 		"--label", containerLabel + "=" + spec.Instance,
-		"-p", fmt.Sprintf("127.0.0.1:%d:%d", spec.Port, spec.Port),
 		"--user", fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid()),
+		// Hardening: no capabilities, no privilege escalation.
+		"--cap-drop", "ALL",
+		"--security-opt", "no-new-privileges",
+	}
+	if spec.Docker.readOnly() {
+		args = append(args, "--read-only", "--tmpfs", "/tmp")
+	}
+	if spec.Docker.PidsLimit > 0 {
+		args = append(args, "--pids-limit", strconv.Itoa(spec.Docker.PidsLimit))
+	}
+	switch spec.Docker.Network {
+	case netBridge:
+		args = append(args, "-p", fmt.Sprintf("127.0.0.1:%d:%d", spec.Port, spec.Port))
+	case netInternal:
+		args = append(args, "--network", internalNetwork)
+	default: // netNone
+		args = append(args, "--network", "none")
 	}
 	switch strings.ToLower(spec.Docker.GPU) {
 	case "nvidia", "cuda":
@@ -748,7 +908,7 @@ func dockerRunArgs(spec dockerRunSpec) []string {
 		}
 		args = append(args, "-v", v)
 	}
-	if spec.Docker.HFCacheDir != "" {
+	if spec.Docker.Network == netBridge && spec.Docker.HFCacheDir != "" {
 		args = append(args,
 			"-e", "LLAMA_CACHE="+spec.Docker.HFCacheDir,
 			"-e", "HF_HUB_CACHE="+spec.Docker.HFCacheDir,
@@ -764,10 +924,10 @@ func dockerRunArgs(spec dockerRunSpec) []string {
 
 // waitForHealth polls the backend's /health until it returns 200, the
 // container exits, or the timeout elapses.
-func waitForHealth(port int, container string, timeout time.Duration) (healthy bool, exited bool, exitCode int) {
+func waitForHealth(target backendTarget, container string, timeout time.Duration) (healthy bool, exited bool, exitCode int) {
 	deadline := time.Now().Add(timeout)
-	addr := fmt.Sprintf("http://127.0.0.1:%d/health", port)
-	client := &http.Client{Timeout: 2 * time.Second}
+	addr := target.URL.String() + "/health"
+	client := target.client(2 * time.Second)
 	for i := 0; time.Now().Before(deadline); i++ {
 		resp, err := client.Get(addr)
 		if err == nil {
@@ -1019,12 +1179,9 @@ func findInHFCache(modelsDir, name string) string {
 			continue
 		}
 		for _, e := range entries {
-			snapPath := filepath.Join(snapshotsDir, e.Name())
-			files, _ := os.ReadDir(snapPath)
-			for _, f := range files {
-				if f.Name() == parts[1] {
-					return filepath.Join(snapPath, f.Name())
-				}
+			candidate := filepath.Join(snapshotsDir, e.Name(), filepath.FromSlash(parts[1]))
+			if _, err := os.Stat(candidate); err == nil {
+				return candidate
 			}
 		}
 	}
@@ -1228,21 +1385,21 @@ func markInstanceUsed(name string) {
 	}
 }
 
-func autoswitchModel(cfg Config, targetName string) (*url.URL, string, error) {
+func autoswitchModel(cfg Config, targetName string) (backendTarget, string, error) {
 	if !cfg.Autoswitch.Enabled {
-		return nil, "", fmt.Errorf("model %q is not loaded", targetName)
+		return backendTarget{}, "", fmt.Errorf("model %q is not loaded", targetName)
 	}
 
 	spec, err := resolveLoadSpec(cfg, loadOptions{ModelName: targetName})
 	if err != nil {
-		return nil, "", err
+		return backendTarget{}, "", err
 	}
 	if spec.ConfigKey == "" {
-		return nil, "", fmt.Errorf("model %q is not configured for autoswitch", targetName)
+		return backendTarget{}, "", fmt.Errorf("model %q is not configured for autoswitch", targetName)
 	}
 	mc := cfg.Models[spec.ConfigKey]
 	if !mc.AutoLoad {
-		return nil, "", fmt.Errorf("model %q is not configured with auto_load", targetName)
+		return backendTarget{}, "", fmt.Errorf("model %q is not configured with auto_load", targetName)
 	}
 	requiredMB := mc.VramMB
 
@@ -1251,18 +1408,18 @@ func autoswitchModel(cfg Config, targetName string) (*url.URL, string, error) {
 
 	availableMB, err := autoswitchAvailableMB(cfg)
 	if err != nil {
-		return nil, "", err
+		return backendTarget{}, "", err
 	}
 
 	if availableMB < requiredMB {
 		candidates, hasCandidates := autoswitchEvictionPlan(reg, spec.InstanceName, requiredMB, availableMB)
 		if !hasCandidates {
-			return nil, "", fmt.Errorf("model %q needs %d MB but only %d MB available on GPU 0, no auto_unload models to evict", targetName, requiredMB, availableMB)
+			return backendTarget{}, "", fmt.Errorf("model %q needs %d MB but only %d MB available on GPU 0, no auto_unload models to evict", targetName, requiredMB, availableMB)
 		}
 		evicted := 0
 		for _, inst := range candidates {
 			if err := unloadInstance(inst.Name, false); err != nil {
-				return nil, "", fmt.Errorf("failed to evict %q: %w", inst.Name, err)
+				return backendTarget{}, "", fmt.Errorf("failed to evict %q: %w", inst.Name, err)
 			}
 			evicted++
 			newAvail, checkErr := autoswitchAvailableMB(cfg)
@@ -1272,10 +1429,10 @@ func autoswitchModel(cfg Config, targetName string) (*url.URL, string, error) {
 		}
 		availableMB, err = autoswitchAvailableMB(cfg)
 		if err != nil {
-			return nil, "", err
+			return backendTarget{}, "", err
 		}
 		if availableMB < requiredMB {
-			return nil, "", fmt.Errorf("model %q needs %d MB but only %d MB available after evicting %d auto_unload models", targetName, requiredMB, availableMB, evicted)
+			return backendTarget{}, "", fmt.Errorf("model %q needs %d MB but only %d MB available after evicting %d auto_unload models", targetName, requiredMB, availableMB, evicted)
 		}
 	}
 
@@ -1287,17 +1444,16 @@ func autoswitchModel(cfg Config, targetName string) (*url.URL, string, error) {
 		EstimatedVramMB: requiredMB,
 	})
 	if err != nil {
-		return nil, "", err
+		return backendTarget{}, "", err
 	}
 	if !healthy {
 		stopInstance(inst)
 		reg := loadRegistry()
 		reg.Remove(inst.Name)
 		saveRegistry(reg)
-		return nil, "", fmt.Errorf("model %q did not become healthy before timeout", inst.Name)
+		return backendTarget{}, "", fmt.Errorf("model %q did not become healthy before timeout", inst.Name)
 	}
-	u, _ := url.Parse(fmt.Sprintf("http://127.0.0.1:%d", inst.Port))
-	return u, inst.Name, nil
+	return instanceBackend(inst), inst.Name, nil
 }
 
 //go:embed web/index.html
@@ -1442,7 +1598,7 @@ func startProxy(cfg Config) {
 	}
 
 	var mu sync.RWMutex
-	backends := map[string]*url.URL{}
+	backends := map[string]backendTarget{}
 
 	rebuildBackends := func() {
 		mu.Lock()
@@ -1453,8 +1609,7 @@ func startProxy(cfg Config) {
 			delete(backends, k)
 		}
 		for _, inst := range r.Instances {
-			u, _ := url.Parse(fmt.Sprintf("http://127.0.0.1:%d", inst.Port))
-			backends[inst.Name] = u
+			backends[inst.Name] = instanceBackend(inst)
 		}
 	}
 	rebuildBackends()
@@ -1575,7 +1730,7 @@ func startProxy(cfg Config) {
 		if !ok && shouldFallbackToDefault(targetName, autoswitchErr) {
 			reg := loadRegistry()
 			if def := reg.Default(); def != nil {
-				target, _ = url.Parse(fmt.Sprintf("http://127.0.0.1:%d", def.Port))
+				target = instanceBackend(*def)
 				ok = true
 				routedName = def.Name
 				markInstanceUsed(routedName)
@@ -1594,10 +1749,11 @@ func startProxy(cfg Config) {
 		// Proxy the request
 		proxy := &httputil.ReverseProxy{
 			Director: func(req *http.Request) {
-				req.URL.Scheme = target.Scheme
-				req.URL.Host = target.Host
-				req.Host = target.Host
+				req.URL.Scheme = target.URL.Scheme
+				req.URL.Host = target.URL.Host
+				req.Host = target.URL.Host
 			},
+			Transport: target.Transport,
 		}
 		proxy.ServeHTTP(w, r)
 	})
@@ -1617,7 +1773,7 @@ func startProxy(cfg Config) {
 		if inst := reg.FindByName(name); inst != nil && inst.IsDefault {
 			def = " (default)"
 		}
-		fmt.Printf("    %-28s → %s%s\n", name, u.String(), def)
+		fmt.Printf("    %-28s → %s%s\n", name, u, def)
 	}
 	mu.RUnlock()
 	if routeCount == 0 && hasAutoLoadModels(cfg) {
@@ -1790,6 +1946,17 @@ func resolveLoadSpec(cfg Config, opts loadOptions) (loadSpec, error) {
 		cfg = configForModel(cfg, configKey)
 	}
 
+	// Isolated containers can't download, so fetch -hf models on the host
+	// and load them as local files.
+	hfRepo := opts.HFRepo
+	if hfRepo != "" && cfg.Docker.Network != netBridge {
+		local, err := prefetchHF(cfg, hfRepo, opts.Verbose)
+		if err != nil {
+			return loadSpec{}, err
+		}
+		modelPath, hfRepo = local, ""
+	}
+
 	var mmprojPath string
 	if opts.MmprojArg != "" {
 		mmprojPath, err = resolveMmproj(cfg, modelPath, opts.MmprojArg)
@@ -1810,7 +1977,7 @@ func resolveLoadSpec(cfg Config, opts loadOptions) (loadSpec, error) {
 		ModelName:    opts.ModelName,
 		InstanceName: instanceName,
 		ModelPath:    modelPath,
-		HFRepo:       opts.HFRepo,
+		HFRepo:       hfRepo,
 		MmprojPath:   mmprojPath,
 		AliasUsed:    aliasUsed,
 		ConfigKey:    configKey,
@@ -1847,13 +2014,37 @@ func loadInstance(cfg Config, opts loadOptions) (Instance, bool, error) {
 		reg.Remove(spec.InstanceName)
 	}
 
-	backendPort := reg.NextPort()
+	network := cfg.Docker.Network
+	if !validNetworkMode(network) {
+		return Instance{}, false, fmt.Errorf("invalid docker network mode %q (want none, internal or bridge)", network)
+	}
+	container := containerName(spec.InstanceName)
+
+	// Network none: llama-server listens on a unix socket in a per-instance
+	// directory; no TCP port is used.
+	backendPort := 0
+	sockPath := ""
+	if network == netNone {
+		dir := socketDir(container)
+		removeSocketDir(container)
+		if err := os.MkdirAll(dir, 0700); err != nil {
+			return Instance{}, false, fmt.Errorf("creating socket dir: %w", err)
+		}
+		sockPath = filepath.Join(dir, "llama.sock")
+	} else {
+		backendPort = reg.NextPort()
+	}
+
 	displayName := spec.ModelPath
 	if spec.HFRepo != "" {
 		displayName = spec.HFRepo
 	}
 	if opts.Verbose {
-		fmt.Printf("Loading %s as '%s' (backend :%d)...\n", shortName(displayName), spec.InstanceName, backendPort)
+		where := fmt.Sprintf("backend :%d", backendPort)
+		if sockPath != "" {
+			where = "no network, unix socket"
+		}
+		fmt.Printf("Loading %s as '%s' (%s)...\n", shortName(displayName), spec.InstanceName, where)
 	}
 	if err := validateExtraArgs(cfg.ExtraArgs); err != nil {
 		return Instance{}, false, err
@@ -1865,13 +2056,15 @@ func loadInstance(cfg Config, opts loadOptions) (Instance, bool, error) {
 	} else {
 		args = append(args, "--model", spec.ModelPath)
 	}
-	args = append(args,
+	if sockPath != "" {
+		// llama-server binds a unix socket when --host ends in .sock.
+		args = append(args, "--host", sockPath)
+	} else {
 		// Inside the container llama-server must listen on all interfaces;
-		// docker publishes the port on 127.0.0.1 only.
-		"--host", "0.0.0.0",
-		"--port", strconv.Itoa(backendPort),
-		"--ctx-size", strconv.Itoa(cfg.CtxSize),
-	)
+		// it is only reachable via 127.0.0.1 (bridge) or the internal network.
+		args = append(args, "--host", "0.0.0.0", "--port", strconv.Itoa(backendPort))
+	}
+	args = append(args, "--ctx-size", strconv.Itoa(cfg.CtxSize))
 	if cfg.GpuLayers != 0 {
 		args = append(args, "--n-gpu-layers", strconv.Itoa(cfg.GpuLayers))
 	}
@@ -1890,30 +2083,56 @@ func loadInstance(cfg Config, opts loadOptions) (Instance, bool, error) {
 	if spec.MmprojPath != "" {
 		files = append(files, spec.MmprojPath)
 	}
-	if cfg.Docker.HFCacheDir != "" {
+	// The HF cache is only mounted (read-write) when the container may
+	// download models itself, i.e. on the bridge network.
+	hfCache := ""
+	if network == netBridge && cfg.Docker.HFCacheDir != "" {
+		hfCache = cfg.Docker.HFCacheDir
 		// Create it as the current user; otherwise docker creates it as root.
-		_ = os.MkdirAll(cfg.Docker.HFCacheDir, 0755)
+		_ = os.MkdirAll(hfCache, 0755)
 	}
-	container := containerName(spec.InstanceName)
+	mounts := backendMounts(cfg.ModelsDir, hfCache, files, cfg.ExtraArgs)
+	if sockPath != "" {
+		mounts = append(mounts, containerMount{Host: filepath.Dir(sockPath)})
+	}
 	runArgs := dockerRunArgs(dockerRunSpec{
 		Docker:     cfg.Docker,
 		Container:  container,
 		Instance:   spec.InstanceName,
 		Port:       backendPort,
-		Mounts:     backendMounts(cfg.ModelsDir, cfg.Docker.HFCacheDir, files, cfg.ExtraArgs),
+		Mounts:     mounts,
 		ServerArgs: args,
 	})
 
 	if err := ensureImage(cfg.Docker.Image, opts.Verbose); err != nil {
 		return Instance{}, false, fmt.Errorf("error pulling image %s: %w", cfg.Docker.Image, err)
 	}
+	if network == netInternal {
+		if err := ensureInternalNetwork(); err != nil {
+			return Instance{}, false, fmt.Errorf("error creating network %s: %w", internalNetwork, err)
+		}
+	}
 	// Clear any leftover container with the same name (e.g. from a crash).
 	_, _ = dockerExec("rm", "-f", container)
 	if _, err := dockerExec(runArgs...); err != nil {
 		_, _ = dockerExec("rm", "-f", container)
+		removeSocketDir(container)
 		return Instance{}, false, fmt.Errorf("error starting container: %w", err)
 	}
 	invalidateLiveContainers()
+
+	addr := ""
+	switch network {
+	case netInternal:
+		ip, err := containerIP(container, internalNetwork)
+		if err != nil {
+			removeContainer(container, instanceLogPath(spec.InstanceName))
+			return Instance{}, false, err
+		}
+		addr = net.JoinHostPort(ip, strconv.Itoa(backendPort))
+	case netBridge:
+		addr = fmt.Sprintf("127.0.0.1:%d", backendPort)
+	}
 
 	isDefault := len(reg.Instances) == 0
 
@@ -1923,6 +2142,9 @@ func loadInstance(cfg Config, opts loadOptions) (Instance, bool, error) {
 		Mmproj:          spec.MmprojPath,
 		Container:       container,
 		Image:           cfg.Docker.Image,
+		Network:         network,
+		Socket:          sockPath,
+		Addr:            addr,
 		Port:            backendPort,
 		IsDefault:       isDefault,
 		CtxSize:         cfg.CtxSize,
@@ -1942,15 +2164,17 @@ func loadInstance(cfg Config, opts loadOptions) (Instance, bool, error) {
 	if timeout <= 0 {
 		timeout = 60 * time.Second
 	}
-	healthy, exited, exitCode := waitForHealth(backendPort, container, timeout)
+	target := instanceBackend(inst)
+	healthy, exited, exitCode := waitForHealth(target, container, timeout)
 	if healthy {
 		if opts.Verbose {
-			fmt.Printf("✓ '%s' ready (container %s, backend :%d)\n", spec.InstanceName, container, backendPort)
+			fmt.Printf("✓ '%s' ready (container %s, network %s)\n", spec.InstanceName, container, network)
 		}
 	} else {
 		if exited {
 			logPath := instanceLogPath(spec.InstanceName)
 			removeContainer(container, logPath)
+			removeSocketDir(container)
 			reg := loadRegistry()
 			reg.Remove(spec.InstanceName)
 			if isDefault && len(reg.Instances) > 0 {
@@ -1977,7 +2201,11 @@ func loadInstance(cfg Config, opts loadOptions) (Instance, bool, error) {
 	if opts.Verbose {
 		fmt.Printf("\n  Proxy endpoint: http://%s:%d/v1\n", displayHost(cfg.Host), cfg.Port)
 		fmt.Printf("  Model name:     %s\n", spec.InstanceName)
-		fmt.Printf("  Direct backend: http://127.0.0.1:%d\n", backendPort)
+		if sockPath != "" {
+			fmt.Printf("  Direct backend: curl --unix-socket %s http://localhost/health\n", sockPath)
+		} else {
+			fmt.Printf("  Direct backend: %s\n", target)
+		}
 	}
 	return inst, true, nil
 }
@@ -2118,17 +2346,7 @@ func cmdPS() {
 		}
 		status := "stopped"
 		if instanceRunning(inst) {
-			resp, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d/health", inst.Port))
-			if err == nil {
-				resp.Body.Close()
-				if resp.StatusCode == 200 {
-					status = "healthy"
-				} else {
-					status = "loading"
-				}
-			} else {
-				status = "running"
-			}
+			status = backendStatus(inst)
 		}
 		model := shortName(inst.Model)
 		if len(model) > 26 {
@@ -2138,8 +2356,12 @@ func cmdPS() {
 		if inst.CtxSize > 0 {
 			ctxStr = strconv.Itoa(inst.CtxSize)
 		}
-		fmt.Printf("  %s%-20s %-26s %-8d %-8s %s\n",
-			marker, inst.Name, model, inst.Port, ctxStr, status)
+		portStr := strconv.Itoa(inst.Port)
+		if inst.Socket != "" {
+			portStr = "socket"
+		}
+		fmt.Printf("  %s%-20s %-26s %-8s %-8s %s\n",
+			marker, inst.Name, model, portStr, ctxStr, status)
 		if inst.AutoUnload || inst.EstimatedVramMB > 0 {
 			fmt.Printf("    autoswitch: auto_unload=%t estimated_vram_mb=%d\n", inst.AutoUnload, inst.EstimatedVramMB)
 		}
@@ -2178,17 +2400,7 @@ func cmdInfo(name string) {
 
 	status := "stopped"
 	if instanceRunning(*inst) {
-		resp, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d/health", inst.Port))
-		if err == nil {
-			resp.Body.Close()
-			if resp.StatusCode == 200 {
-				status = "healthy"
-			} else {
-				status = "loading"
-			}
-		} else {
-			status = "running"
-		}
+		status = backendStatus(*inst)
 	}
 
 	fmt.Printf("Instance:   %s\n", inst.Name)
@@ -2205,7 +2417,10 @@ func cmdInfo(name string) {
 	if inst.Mmproj != "" {
 		fmt.Printf("Mmproj:     %s\n", inst.Mmproj)
 	}
-	fmt.Printf("Backend:    http://127.0.0.1:%d\n", inst.Port)
+	fmt.Printf("Backend:    %s\n", instanceBackend(*inst))
+	if inst.Network != "" {
+		fmt.Printf("Network:    %s\n", inst.Network)
+	}
 	fmt.Printf("Ctx size:   %d\n", inst.CtxSize)
 	fmt.Printf("GPU layers: %d\n", inst.GpuLayers)
 	if inst.AutoUnload || inst.EstimatedVramMB > 0 || inst.LastUsedAt > 0 {
@@ -2394,6 +2609,191 @@ func parsePullTarget(target string) (user string, repoName string, repoID string
 	return user, repoName, repoID, specificFile, nil
 }
 
+// f16Re matches an F16 (not BF16) file name, the mmproj llama.cpp prefers.
+var f16Re = regexp.MustCompile(`(?i)(^|[^b])f16`)
+
+var splitGGUFRe = regexp.MustCompile(`(?i)-(\d{5})-of-(\d{5})\.gguf$`)
+
+// hfSelectFiles picks the repo files to fetch for `-hf repo[:tag]`, mirroring
+// llama.cpp: the gguf whose name contains the quant tag (default Q4_K_M,
+// falling back to the first gguf when no tag was given), all parts of a split
+// model, and an mmproj file if the repo has one. A tag ending in .gguf names
+// the file directly.
+func hfSelectFiles(files []string, tag string) (model []string, mmproj string, err error) {
+	var ggufs, mmprojs []string
+	for _, f := range files {
+		lower := strings.ToLower(f)
+		if !strings.HasSuffix(lower, ".gguf") {
+			continue
+		}
+		if strings.HasPrefix(strings.ToLower(path.Base(f)), "mmproj") {
+			mmprojs = append(mmprojs, f)
+		} else {
+			ggufs = append(ggufs, f)
+		}
+	}
+	sort.Strings(ggufs)
+	sort.Strings(mmprojs)
+	if len(ggufs) == 0 {
+		return nil, "", fmt.Errorf("no .gguf files in repo")
+	}
+
+	var chosen string
+	if strings.HasSuffix(strings.ToLower(tag), ".gguf") {
+		for _, f := range ggufs {
+			if f == tag || path.Base(f) == tag {
+				chosen = f
+				break
+			}
+		}
+		if chosen == "" {
+			return nil, "", fmt.Errorf("file %q not found in repo", tag)
+		}
+	} else {
+		want := tag
+		if want == "" {
+			want = "Q4_K_M"
+		}
+		want = strings.ToLower(want)
+		for _, f := range ggufs {
+			if strings.Contains(strings.ToLower(f), want) {
+				chosen = f
+				break
+			}
+		}
+		if chosen == "" {
+			if tag != "" {
+				return nil, "", fmt.Errorf("no .gguf matching %q; available: %s", tag, strings.Join(ggufs, ", "))
+			}
+			chosen = ggufs[0]
+		}
+	}
+
+	if m := splitGGUFRe.FindStringSubmatchIndex(chosen); m != nil {
+		stem := chosen[:m[0]]
+		total := chosen[m[4]:m[5]]
+		for _, f := range ggufs {
+			if sm := splitGGUFRe.FindStringSubmatchIndex(f); sm != nil && f[:sm[0]] == stem && f[sm[4]:sm[5]] == total {
+				model = append(model, f)
+			}
+		}
+	} else {
+		model = []string{chosen}
+	}
+
+	if len(mmprojs) > 0 {
+		mmproj = mmprojs[0]
+		for _, f := range mmprojs {
+			if f16Re.MatchString(path.Base(f)) {
+				mmproj = f
+				break
+			}
+		}
+	}
+	return model, mmproj, nil
+}
+
+func hfListFiles(user, repoName string) ([]string, error) {
+	apiURL := fmt.Sprintf("https://huggingface.co/api/models/%s/%s", user, repoName)
+	resp, err := http.Get(apiURL)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("huggingface API %s: %s", apiURL, resp.Status)
+	}
+	var repoInfo struct {
+		Siblings []struct {
+			Filename string `json:"rfilename"`
+		} `json:"siblings"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&repoInfo); err != nil {
+		return nil, err
+	}
+	files := make([]string, 0, len(repoInfo.Siblings))
+	for _, s := range repoInfo.Siblings {
+		files = append(files, s.Filename)
+	}
+	return files, nil
+}
+
+// hfDownloadCmd builds the host-side huggingface_hub download command that
+// stores the file in the HF cache layout under models_dir.
+func hfDownloadCmd(cfg Config, repoID, file string) (*exec.Cmd, error) {
+	var cmd *exec.Cmd
+	if p, err := exec.LookPath("hf"); err == nil {
+		cmd = exec.Command(p, "download", repoID, file)
+	} else if p, err := exec.LookPath("huggingface-cli"); err == nil {
+		cmd = exec.Command(p, "download", repoID, file)
+	} else if p, err := exec.LookPath("python3"); err == nil {
+		cmd = exec.Command(p, "-m", "huggingface_hub", "download", repoID, file)
+	} else if p, err := exec.LookPath("python"); err == nil {
+		cmd = exec.Command(p, "-m", "huggingface_hub", "download", repoID, file)
+	} else {
+		return nil, fmt.Errorf("huggingface_hub not installed (pip install huggingface_hub)")
+	}
+	cmd.Env = append(os.Environ(), "HF_HOME="+cfg.ModelsDir)
+	return cmd, nil
+}
+
+// prefetchHF downloads the files `-hf repo[:tag]` needs into models_dir on
+// the host and returns the local model path (first part for split models).
+func prefetchHF(cfg Config, hfRepo string, verbose bool) (string, error) {
+	user, repoName, repoID, tag, err := parsePullTarget(hfRepo)
+	if err != nil {
+		return "", fmt.Errorf("invalid -hf repo %q", hfRepo)
+	}
+	cacheKey := func(f string) string { return "models--" + user + "--" + repoName + "/" + f }
+
+	// A tag naming a file that is already cached needs no network.
+	if strings.HasSuffix(strings.ToLower(tag), ".gguf") {
+		if p := findInHFCache(cfg.ModelsDir, cacheKey(tag)); p != "" {
+			return p, nil
+		}
+	}
+
+	files, err := hfListFiles(user, repoName)
+	if err != nil {
+		return "", fmt.Errorf("listing %s: %w", repoID, err)
+	}
+	modelFiles, mmproj, err := hfSelectFiles(files, tag)
+	if err != nil {
+		return "", fmt.Errorf("%s: %w", repoID, err)
+	}
+	toFetch := append([]string{}, modelFiles...)
+	if mmproj != "" {
+		toFetch = append(toFetch, mmproj)
+	}
+	for _, f := range toFetch {
+		if findInHFCache(cfg.ModelsDir, cacheKey(f)) != "" {
+			continue
+		}
+		if verbose {
+			fmt.Printf("Downloading %s:%s on the host (containers have no network)...\n", repoID, f)
+		}
+		cmd, err := hfDownloadCmd(cfg, repoID, f)
+		if err != nil {
+			return "", err
+		}
+		if verbose {
+			cmd.Stdout = os.Stdout
+			cmd.Stderr = os.Stderr
+			err = cmd.Run()
+		} else if out, cerr := cmd.CombinedOutput(); cerr != nil {
+			err = fmt.Errorf("%v: %s", cerr, strings.TrimSpace(string(out)))
+		}
+		if err != nil {
+			return "", fmt.Errorf("downloading %s:%s: %w", repoID, f, err)
+		}
+	}
+	p := findInHFCache(cfg.ModelsDir, cacheKey(modelFiles[0]))
+	if p == "" {
+		return "", fmt.Errorf("downloaded %s:%s but could not find it under %s", repoID, modelFiles[0], cfg.ModelsDir)
+	}
+	return p, nil
+}
+
 func cmdPull(cfg Config, repo string) {
 	user, repoName, repoID, specificFile, err := parsePullTarget(repo)
 	if err != nil {
@@ -2402,26 +2802,16 @@ func cmdPull(cfg Config, repo string) {
 	}
 
 	if specificFile == "" {
-		apiURL := fmt.Sprintf("https://huggingface.co/api/models/%s/%s", user, repoName)
-		resp, err := http.Get(apiURL)
+		files, err := hfListFiles(user, repoName)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
 		}
-		body, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
-
-		var repoInfo struct {
-			Siblings []struct {
-				Filename string `json:"rfilename"`
-			} `json:"siblings"`
-		}
-		json.Unmarshal(body, &repoInfo)
 
 		var ggufFiles []string
-		for _, s := range repoInfo.Siblings {
-			if strings.HasSuffix(strings.ToLower(s.Filename), ".gguf") {
-				ggufFiles = append(ggufFiles, s.Filename)
+		for _, f := range files {
+			if strings.HasSuffix(strings.ToLower(f), ".gguf") {
+				ggufFiles = append(ggufFiles, f)
 			}
 		}
 
@@ -2467,27 +2857,14 @@ func cmdPull(cfg Config, repo string) {
 	fmt.Println("  (This uses huggingface_hub to populate the proper cache format)")
 	fmt.Println("  Press Ctrl+C to cancel")
 
-	var cmd *exec.Cmd
-	env := os.Environ()
-	env = append(env, "HF_HOME="+cfg.ModelsDir)
-
-	if p, err := exec.LookPath("hf"); err == nil {
-		cmd = exec.Command(p, "download", repoID, specificFile)
-	} else if p, err := exec.LookPath("huggingface-cli"); err == nil {
-		cmd = exec.Command(p, "download", repoID, specificFile)
-	} else if p, err := exec.LookPath("python3"); err == nil {
-		cmd = exec.Command(p, "-m", "huggingface_hub", "download", repoID, specificFile)
-	} else if p, err := exec.LookPath("python"); err == nil {
-		cmd = exec.Command(p, "-m", "huggingface_hub", "download", repoID, specificFile)
-	} else {
-		fmt.Fprintf(os.Stderr, "Error: huggingface_hub not installed.\n")
-		fmt.Fprintf(os.Stderr, "  Run: pip install huggingface_hub\n")
+	cmd, err := hfDownloadCmd(cfg, repoID, specificFile)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	cmd.Stdin = os.Stdin
-	cmd.Env = env
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
@@ -2549,6 +2926,9 @@ func cmdConfig(cfg Config) {
 		fmt.Printf("    entrypoint:   %s\n", cfg.Docker.Entrypoint)
 	}
 	fmt.Printf("    gpu:          %s\n", cfg.Docker.GPU)
+	fmt.Printf("    network:      %s\n", cfg.Docker.Network)
+	fmt.Printf("    read_only:    %t\n", cfg.Docker.readOnly())
+	fmt.Printf("    pids_limit:   %d\n", cfg.Docker.PidsLimit)
 	fmt.Printf("    hf_cache_dir: %s\n", cfg.Docker.HFCacheDir)
 	if len(cfg.Docker.Args) > 0 {
 		fmt.Printf("    args:         %s\n", strings.Join(cfg.Docker.Args, " "))
@@ -2587,6 +2967,9 @@ func cmdConfig(cfg Config) {
 			}
 			if mc.DockerArgs != nil {
 				fmt.Printf("      docker_args: %s\n", strings.Join(mc.DockerArgs, " "))
+			}
+			if mc.DockerNetwork != nil {
+				fmt.Printf("      docker_network: %s\n", *mc.DockerNetwork)
 			}
 			if mc.GpuLayers != nil {
 				fmt.Printf("      gpu_layers:  %d\n", *mc.GpuLayers)
@@ -2630,6 +3013,26 @@ func cmdSet(cfg Config, key, value string) {
 		cfg.Docker.GPU = value
 	case "docker.hf_cache_dir":
 		cfg.Docker.HFCacheDir = value
+	case "docker.network":
+		if !validNetworkMode(value) {
+			fmt.Fprintln(os.Stderr, "Error: docker.network must be none, internal or bridge")
+			os.Exit(1)
+		}
+		cfg.Docker.Network = value
+	case "docker.read_only":
+		v, err := strconv.ParseBool(value)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Error: must be true or false")
+			os.Exit(1)
+		}
+		cfg.Docker.ReadOnly = &v
+	case "docker.pids_limit":
+		n, err := strconv.Atoi(value)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Error: must be a number (<= 0 disables)")
+			os.Exit(1)
+		}
+		cfg.Docker.PidsLimit = n
 	case "host":
 		cfg.Host = value
 	case "port":

@@ -161,6 +161,7 @@ Config is stored at `~/.llmctl.json`. Set values with `llmctl set`:
 llmctl set models_dir /path/to/models
 llmctl set docker.image ghcr.io/ggml-org/llama.cpp:server-cuda
 llmctl set docker.gpu nvidia      # nvidia | jetson | none
+llmctl set docker.network none    # none | internal | bridge
 llmctl set host 0.0.0.0
 llmctl set port 8080
 llmctl set gpu_layers -1          # -1 = offload all layers to GPU
@@ -173,7 +174,10 @@ llmctl set ctx_size 4096
 | `docker.image` | `ghcr.io/ggml-org/llama.cpp:server-cuda` | llama.cpp server image |
 | `docker.gpu` | `nvidia` | `nvidia` (`--gpus all`), `jetson` (`--runtime nvidia`) or `none` |
 | `docker.entrypoint` | image default | Override the image entrypoint, e.g. `llama-server` for images without one |
-| `docker.hf_cache_dir` | `$LLAMA_CACHE` or `~/.cache/llama.cpp` | Host directory used for `-hf` downloads |
+| `docker.network` | `none` | Backend network: `none` (no network, unix socket), `internal` (no egress) or `bridge` (full egress) — see below |
+| `docker.read_only` | `true` | Read-only container root filesystem (`/tmp` is a tmpfs) |
+| `docker.pids_limit` | `512` | `--pids-limit` for each backend; `0` disables |
+| `docker.hf_cache_dir` | `$LLAMA_CACHE` or `~/.cache/llama.cpp` | Host directory for in-container `-hf` downloads (`bridge` network only) |
 | `docker.bin` | `docker` | Container CLI (any docker-compatible CLI, e.g. `podman`) |
 | `host` | `0.0.0.0` | Proxy listen address |
 | `port` | `8080` | Proxy listen port |
@@ -182,19 +186,46 @@ llmctl set ctx_size 4096
 
 ### Docker backends
 
-Each loaded model runs as a container named `llmctl-<instance>` with the label `llmctl.instance=<instance>`:
+Each loaded model runs as a hardened container named `llmctl-<instance>` with the label `llmctl.instance=<instance>`. The goal is to contain a compromised inference engine: it should not be able to reach the network, write to your models, or gain privileges.
 
 ```sh
 docker run -d --name llmctl-<instance> --label llmctl.instance=<instance> \
-  -p 127.0.0.1:<port>:<port> --user <your uid>:<your gid> [--gpus all | --runtime nvidia] \
-  -v <models_dir>:<models_dir>:ro -v <hf_cache_dir>:<hf_cache_dir> -e LLAMA_CACHE=<hf_cache_dir> \
-  [docker.args...] <image> --model <path> --host 0.0.0.0 --port <port> ...
+  --user <your uid>:<your gid> --cap-drop ALL --security-opt no-new-privileges \
+  --read-only --tmpfs /tmp --pids-limit 512 \
+  --network none [--gpus all | --runtime nvidia] \
+  -v <models_dir>:<models_dir>:ro -v ~/.llmctl-run/llmctl-<instance>:~/.llmctl-run/llmctl-<instance> \
+  [docker.args...] <image> --model <path> --host ~/.llmctl-run/llmctl-<instance>/llama.sock ...
 ```
 
-- **Same paths inside and out.** Host directories are mounted at the same path in the container, so model paths in the registry, `llmctl info` and `extra_args` work unchanged. `models_dir` is mounted read-only and the HF cache read-write. llmctl also mounts the directory of every other file it passes to llama-server: a model or mmproj outside `models_dir` (including the target of a symlink) read-only, and absolute paths in `extra_args` (e.g. `--chat-template-file`, `--lora`) read-write.
-- **Network.** The backend port is published on `127.0.0.1` only; the proxy is the only public endpoint.
-- **Image pulls.** If the image is missing, llmctl pulls it before starting the container, so the first pull doesn't count against the health-check timeout.
-- **Lifecycle.** Containers are not started with `--rm` and have no restart policy. On `unload`, `stop`, or when llmctl finds a backend that has exited, it saves the container logs to `~/.llmctl-logs/<name>.log` and removes the container. `llmctl stop` also removes any `llmctl.instance`-labelled containers the registry has lost track of.
+#### Network isolation (`docker.network`)
+
+| Mode | How the proxy reaches the backend | What the container can reach |
+|------|------------------------------------|------------------------------|
+| `none` (default) | llama-server listens on a unix socket in a per-instance directory (`~/.llmctl-run/<container>/llama.sock`) | Nothing — no network interfaces besides loopback |
+| `internal` | Container IP on the `llmctl-internal` Docker network (`--internal`, inter-container traffic disabled) | No internet or DNS, no other backends — **but** host services listening on all interfaces (e.g. the llmctl proxy, sshd) via the network gateway |
+| `bridge` | `127.0.0.1:<port>` published port | Everything (internet included). Needed only for in-container `-hf` downloads |
+
+`none` requires a llama.cpp build with unix-socket support (`--host <path>.sock`, upstream PR #12613). If your image is older (some Jetson images), use `internal` for that model:
+
+```json
+{ "models": { "jetson-model": { "docker_network": "internal" } } }
+```
+
+**`-hf` loads with isolated networks.** In `none`/`internal` mode the container can't download, so `llmctl load "" -hf user/repo[:quant]` downloads the files on the host first (same `huggingface_hub` tooling and `models_dir` cache as `llmctl pull`), picking the file like llama.cpp does: the `.gguf` matching the quant tag (default `Q4_K_M`), all parts of split models, and an `mmproj` if the repo has one. The container then loads the local file. In `bridge` mode `-hf` is passed through to llama-server, with `docker.hf_cache_dir` mounted read-write.
+
+#### Mounts
+
+Host directories are mounted at the same path in the container, so model paths in the registry, `llmctl info` and `extra_args` work unchanged:
+
+- `models_dir` — read-only.
+- Directories of a model or mmproj outside `models_dir`, including symlink targets (HF cache blobs) — read-only.
+- Absolute paths in `extra_args` (e.g. `--chat-template-file`, `--lora`) — read-only, except the arguments of `--slot-save-path` and `--log-file`, which llama-server writes to.
+- The per-instance socket directory (`none`) or HF cache (`bridge`) — read-write.
+
+#### Lifecycle
+
+- If the image is missing, llmctl pulls it before starting the container, so the first pull doesn't count against the health-check timeout.
+- Containers are not started with `--rm` and have no restart policy. On `unload`, `stop`, or when llmctl finds a backend that has exited, it saves the container logs to `~/.llmctl-logs/<name>.log` and removes the container (and its socket directory). `llmctl stop` also removes any `llmctl.instance`-labelled containers the registry has lost track of.
 
 Extra `docker run` flags go in `docker.args` (global) or `docker_args` (per model, appended to the global ones). Image and entrypoint can also be set per model:
 
@@ -356,6 +387,7 @@ Requests can also specify a model via the `X-Model` HTTP header.
 | `~/.llmctl.json` | Configuration |
 | `~/.llmctl.registry.json` | Registry of running instances (container names, ports) and proxy PID |
 | `~/.llmctl-logs/<name>.log` | Server logs of stopped instances (running ones are read with `docker logs`) |
+| `~/.llmctl-run/<container>/llama.sock` | Per-instance unix socket (`docker.network: none`) |
 
 ## License
 
