@@ -4,7 +4,10 @@ A CLI tool for managing multiple local [llama.cpp](https://github.com/ggerganov/
 
 ## Prerequisites
 
-- **llama.cpp server** — one of `llama-server`, `llama-cpp-server`, or `server` must be in your `PATH` (or set via config)
+- **Docker** — every model backend runs `llama-server` in its own container. The user running llmctl must be able to run `docker` (e.g. be in the `docker` group).
+- **GPU support for containers**:
+  - NVIDIA desktop/server: [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/) (containers get `--gpus all`)
+  - Jetson: the `nvidia` container runtime that ships with JetPack (containers get `--runtime nvidia`), plus a Jetson-compatible llama.cpp image (the official images are not built for Jetson)
 - **huggingface-cli** (optional) — needed only for `llmctl pull`. Install with `pip install huggingface_hub`
 
 ## Installation
@@ -39,11 +42,11 @@ make build      # outputs to ./bin/ for darwin/linux × amd64/arm64
 ## Quick start
 
 ```sh
-# 1. Tell llmctl where your models and server binary are
+# 1. Tell llmctl where your models are (and, optionally, which image to run)
 llmctl set models_dir /path/to/your/models
-llmctl set server_bin /path/to/llama-server
+llmctl set docker.image ghcr.io/ggml-org/llama.cpp:server-cuda
 
-# 2. Load a model (starts a llama-server backend)
+# 2. Load a model (starts a llama-server container)
 llmctl load mistral
 
 # 3. Start the OpenAI-compatible proxy
@@ -70,7 +73,7 @@ curl http://localhost:8080/v1/chat/completions \
 
 | Command | Aliases | Description |
 |---------|---------|-------------|
-| `llmctl load <model>` | `run` | Load a model (starts a llama-server backend) |
+| `llmctl load <model>` | `run` | Load a model (starts a llama-server container) |
 | `llmctl unload <name>` | | Stop a running model instance |
 | `llmctl stop` | `kill` | Stop all instances and the proxy |
 | `llmctl default <name>` | | Set the default model for unmatched requests |
@@ -156,7 +159,9 @@ Config is stored at `~/.llmctl.json`. Set values with `llmctl set`:
 
 ```sh
 llmctl set models_dir /path/to/models
-llmctl set server_bin /path/to/llama-server
+llmctl set docker.image ghcr.io/ggml-org/llama.cpp:server-cuda
+llmctl set docker.gpu nvidia      # nvidia | jetson | none
+llmctl set docker.network none    # none | internal | bridge
 llmctl set host 0.0.0.0
 llmctl set port 8080
 llmctl set gpu_layers -1          # -1 = offload all layers to GPU
@@ -166,11 +171,160 @@ llmctl set ctx_size 4096
 | Key | Default | Description |
 |-----|---------|-------------|
 | `models_dir` | `~/models` | Directory containing `.gguf` files |
-| `server_bin` | auto-detected | Path to `llama-server` binary |
+| `docker.image` | `ghcr.io/ggml-org/llama.cpp:server-cuda` | llama.cpp server image |
+| `docker.gpu` | `nvidia` | `nvidia` (`--gpus all`), `jetson` (`--runtime nvidia`) or `none` |
+| `docker.entrypoint` | image default | Override the image entrypoint, e.g. `llama-server` for images without one |
+| `docker.network` | `none` | Backend network: `none` (no network, unix socket), `internal` (no egress) or `bridge` (full egress) — see below |
+| `docker.read_only` | `true` | Read-only container root filesystem (`/tmp` is a tmpfs) |
+| `docker.pids_limit` | `512` | `--pids-limit` for each backend; `0` disables |
+| `docker.hf_cache_dir` | `$LLAMA_CACHE` or `~/.cache/llama.cpp` | Host directory for in-container `-hf` downloads (`bridge` network only) |
+| `docker.bin` | `docker` | Container CLI (any docker-compatible CLI, e.g. `podman`) |
 | `host` | `0.0.0.0` | Proxy listen address |
 | `port` | `8080` | Proxy listen port |
 | `gpu_layers` | `-1` (all) | Number of layers to offload to GPU |
 | `ctx_size` | `4096` | Context window size |
+
+### Docker backends
+
+Each loaded model runs as a hardened container named `llmctl-<instance>` with the label `llmctl.instance=<instance>`. The goal is to contain a compromised inference engine: it should not be able to reach the network, write to your models, or gain privileges.
+
+```sh
+docker run -d --name llmctl-<instance> --label llmctl.instance=<instance> \
+  --user <your uid>:<your gid> --cap-drop ALL --security-opt no-new-privileges \
+  --read-only --tmpfs /tmp --pids-limit 512 \
+  --network none [--gpus all | --runtime nvidia] \
+  -v <models_dir>:<models_dir>:ro -v ~/.llmctl-run/llmctl-<instance>:~/.llmctl-run/llmctl-<instance> \
+  [docker.args...] <image> --model <path> --host ~/.llmctl-run/llmctl-<instance>/llama.sock ...
+```
+
+#### Network isolation (`docker.network`)
+
+| Mode | How the proxy reaches the backend | What the container can reach |
+|------|------------------------------------|------------------------------|
+| `none` (default) | llama-server listens on a unix socket in a per-instance directory (`~/.llmctl-run/<container>/llama.sock`) | Nothing — no network interfaces besides loopback |
+| `internal` | Container IP on the `llmctl-internal` Docker network (`--internal`, inter-container traffic disabled) | No internet or DNS, no other backends — **but** host services listening on all interfaces (e.g. the llmctl proxy, sshd) via the network gateway |
+| `bridge` | `127.0.0.1:<port>` published port | Everything (internet included). Needed only for in-container `-hf` downloads |
+
+`none` requires a llama.cpp build with unix-socket support (`--host <path>.sock`, upstream PR #12613). If your image is older (some Jetson images), use `internal` for that model:
+
+```json
+{ "models": { "jetson-model": { "docker_network": "internal" } } }
+```
+
+**`-hf` loads with isolated networks.** In `none`/`internal` mode the container can't download, so `llmctl load "" -hf user/repo[:quant]` downloads the files on the host first (same `huggingface_hub` tooling and `models_dir` cache as `llmctl pull`), picking the file like llama.cpp does: the `.gguf` matching the quant tag (default `Q4_K_M`), all parts of split models, and an `mmproj` if the repo has one. The container then loads the local file. In `bridge` mode `-hf` is passed through to llama-server, with `docker.hf_cache_dir` mounted read-write.
+
+#### Mounts
+
+Host directories are mounted at the same path in the container, so model paths in the registry, `llmctl info` and `extra_args` work unchanged:
+
+- `models_dir` — read-only.
+- Directories of a model or mmproj outside `models_dir`, including symlink targets (HF cache blobs) — read-only.
+- Absolute paths in `extra_args` (e.g. `--chat-template-file`, `--lora`) — read-only, except the arguments of `--slot-save-path` and `--log-file`, which llama-server writes to.
+- The per-instance socket directory (`none`) or HF cache (`bridge`) — read-write.
+
+#### Lifecycle
+
+- If the image is missing, llmctl pulls it before starting the container, so the first pull doesn't count against the health-check timeout.
+- Containers are not started with `--rm` and have no restart policy. On `unload`, `stop`, or when llmctl finds a backend that has exited, it saves the container logs to `~/.llmctl-logs/<name>.log` and removes the container (and its socket directory). `llmctl stop` also removes any `llmctl.instance`-labelled containers the registry has lost track of.
+
+Extra `docker run` flags go in `docker.args` (global) or `docker_args` (per model, appended to the global ones). Image and entrypoint can also be set per model:
+
+```json
+{
+  "docker": {
+    "image": "ghcr.io/ggml-org/llama.cpp:server-cuda",
+    "gpu": "nvidia",
+    "args": ["--shm-size", "1g"]
+  },
+  "models": {
+    "vision": {
+      "docker_image": "my-registry/llama.cpp:server-cuda-custom",
+      "docker_args": ["-e", "CUDA_VISIBLE_DEVICES=1"]
+    }
+  }
+}
+```
+
+On **Jetson**, use an L4T-based llama.cpp image built for your JetPack version. If the image has no `llama-server` entrypoint, set it:
+
+```json
+{
+  "docker": {
+    "image": "<your-jetson-llama.cpp-image>",
+    "gpu": "jetson",
+    "entrypoint": "llama-server"
+  }
+}
+```
+
+### Custom llama.cpp builds
+
+To run a fork, a branch, a pull request or your own checkout instead of a prebuilt image, build it and load a model with it.
+
+**Trying a fork** takes two commands — paste the URL from your browser:
+
+```sh
+llmctl build https://github.com/someone/llama.cpp/tree/their-branch   # adds build "someone" and builds it
+llmctl load qwen --build someone                                       # runs as "qwen-someone", next to your normal qwen
+```
+
+`llmctl build` accepts a GitHub repo, branch (`/tree/<branch>`), pull request (`/pull/<N>`) or commit (`/commit/<sha>`) URL, `owner/repo`, any other git URL, or a local path. It names the build after the GitHub owner (`<owner>-pr<N>` for pull requests) and saves it in the `builds` config, so the same command later only rebuilds if the branch moved. Settings can be given as flags: `--ref`, `--backend jetson`, `--cuda-arch 89`, `--cmake-arg -DGGML_CUDA_FA_ALL_QUANTS=ON` (repeatable), `--dockerfile`.
+
+`load --build <name>[@commit]` uses the build for that one load; the instance is named `<model>-<build>` (unless `--name` is given) and keeps the model's other settings (ctx size, extra args). If the fork predates unix-socket support, add `--network internal`.
+
+```sh
+llmctl build add ik https://github.com/ikawrakow/ik_llama.cpp   # add under a chosen name without building
+llmctl build rm someone                                         # remove the build, its images and fetched source
+```
+
+For builds you keep, you can also edit the config directly and point models at them: `llmctl build` fetches the source on the host and builds a llama-server image with an embedded two-stage Dockerfile ([`docker/llama-server.Dockerfile`](docker/llama-server.Dockerfile)).
+
+```json
+{
+  "builds": {
+    "ik":       { "repo": "https://github.com/ikawrakow/ik_llama.cpp", "ref": "main" },
+    "upstream": { "repo": "https://github.com/ggml-org/llama.cpp", "ref": "#12345", "cmake_args": ["-DGGML_CUDA_FA_ALL_QUANTS=ON"] },
+    "jetson":   { "repo": "https://github.com/ggml-org/llama.cpp", "ref": "b6000", "backend": "jetson" },
+    "mine":     { "path": "~/src/llama.cpp" }
+  },
+  "models": {
+    "qwen":      { "docker_build": "ik" },
+    "qwen-pin":  { "docker_build": "ik@3f2a9c1" }
+  }
+}
+```
+
+```sh
+llmctl build ik                 # build the current commit of ik's ref (skips if already built)
+llmctl build ik --ref b6000     # one-off ref override (branch, tag, full SHA or #PR)
+llmctl build ik --ref 3f2a9c1   # roll back: re-point :latest at an existing image, no rebuild
+llmctl build --all              # build/refresh every build
+llmctl builds                   # list builds, latest commit, age, which models use them
+```
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `repo` / `path` | — | Git URL, or a local git checkout (uncommitted changes included, `.gitignore`d files excluded). Exactly one. |
+| `ref` | `HEAD` | Branch, tag, full commit SHA, or `#<number>` for a GitHub pull request (`refs/pull/N/head`) |
+| `backend` | `cuda` | `cuda` (desktop/server) or `jetson` (L4T; build on the Jetson itself) |
+| `cuda_arch` | host GPU (`nvidia-smi`) / `87` on Jetson | `CMAKE_CUDA_ARCHITECTURES`, e.g. `"89"` or `"86;89;120"` |
+| `base_image` | `nvidia/cuda:12.8.1-devel-ubuntu24.04` / L4T JetPack matching `/etc/nv_tegra_release` | Build-stage image |
+| `runtime_image` | `nvidia/cuda:12.8.1-runtime-ubuntu24.04` / same as `base_image` | Runtime-stage image |
+| `cmake_args` | — | Extra cmake flags (space-separated in the build; values can't contain spaces) |
+| `target` | `llama-server` | CMake target to build |
+| `dockerfile` | embedded | Use your own Dockerfile (relative to the source tree, e.g. a fork's `.devops/cuda.Dockerfile`) |
+| `keep` | `3` | Images kept per build; older ones are removed after a successful build |
+
+How it works:
+
+- **Commit-tagged images.** The ref is resolved with `git ls-remote` on the host (using your git credentials), and the image is tagged `llmctl/<build>:<sha12>` plus `:latest`. If that commit was already built, `llmctl build` just re-points `:latest`. Local checkouts with uncommitted changes are tagged `<sha12>-dirty-<hash>`.
+- **Source on the host.** Only the needed commit is shallow-fetched into `~/.cache/llmctl/src/<build>` and used as the build context, so PRs and private forks work, and the image needs no git.
+- **Fast rebuilds.** ccache lives in a BuildKit cache mount, so a nightly with a few changed files rebuilds in minutes. Requires BuildKit (default since Docker 23).
+- **Static binary.** llama-server is linked statically (`-DBUILD_SHARED_LIBS=OFF`) into a slim runtime image with entrypoint `/app/llama-server`.
+- **Unix-socket check.** llmctl checks the fork's server source for unix-socket support and records it on the image. A model whose build lacks it can't use `docker.network: none`; `load` says so and suggests `"docker_network": "internal"`.
+- **Retention.** The newest `keep` images per build are kept; `:latest` and images used by a container are never removed.
+- **Loading.** A model with `docker_build` runs `llmctl/<build>:latest` (or the pinned commit with `name@commit`). Loads never build: if the image is missing, `load` tells you to run `llmctl build`. `ps` and `info` show which build and commit an instance runs. `docker.build` sets a default build for all models.
+- **Network.** Builds need network (base images, apt); only running backends are isolated.
 
 ### Autoswitching
 
@@ -300,8 +454,9 @@ Requests can also specify a model via the `X-Model` HTTP header.
 | Path | Description |
 |------|-------------|
 | `~/.llmctl.json` | Configuration |
-| `~/.llmctl.registry.json` | Registry of running instances and proxy PID |
-| `~/.llmctl-logs/<name>.log` | Per-instance server logs |
+| `~/.llmctl.registry.json` | Registry of running instances (container names, ports) and proxy PID |
+| `~/.llmctl-logs/<name>.log` | Server logs of stopped instances (running ones are read with `docker logs`) |
+| `~/.llmctl-run/<container>/llama.sock` | Per-instance unix socket (`docker.network: none`) |
 
 ## License
 

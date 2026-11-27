@@ -50,6 +50,7 @@ systemd-install: install
 	systemctl enable llmctl.service
 	systemctl restart llmctl.service
 	@echo "Service installed and started."
+	@echo "  Note: $(SERVICE_USER) must be able to run docker (e.g. member of the 'docker' group)."
 	@echo "  sudo systemctl status llmctl   # check status"
 	@echo "  journalctl -u llmctl -f        # follow logs"
 	@echo "  journalctl -u llmctl -n 100    # last 100 lines"

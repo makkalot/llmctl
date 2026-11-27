@@ -1,9 +1,12 @@
 package main
 
 import (
-	"embed"
 	"bufio"
 	"bytes"
+	"context"
+	"crypto/sha256"
+	"embed"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -14,7 +17,9 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"sort"
 	"strconv"
@@ -32,6 +37,18 @@ const (
 	configFile    = ".llmctl.json"
 	defaultModels = "models"
 	startPort     = 9100 // internal backend ports start here
+
+	defaultDockerImage = "ghcr.io/ggml-org/llama.cpp:server-cuda"
+	containerPrefix    = "llmctl-"
+	containerLabel     = "llmctl.instance"
+	defaultPidsLimit   = 512
+
+	// Backend network modes (docker.network).
+	netNone     = "none"     // no network; llama-server listens on a unix socket
+	netInternal = "internal" // docker --internal network, no egress
+	netBridge   = "bridge"   // default docker bridge, full egress (needed for in-container -hf)
+
+	internalNetwork = "llmctl-internal"
 )
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -39,14 +56,18 @@ const (
 // ═══════════════════════════════════════════════════════════════════════════
 
 type ModelConfig struct {
-	ServerBin  *string  `json:"server_bin,omitempty"`
-	GpuLayers  *int     `json:"gpu_layers,omitempty"`
-	CtxSize    *int     `json:"ctx_size,omitempty"`
-	Mmproj     string   `json:"mmproj,omitempty"`
-	ExtraArgs  []string `json:"extra_args,omitempty"`
-	AutoLoad   bool     `json:"auto_load,omitempty"`
-	AutoUnload bool     `json:"auto_unload,omitempty"`
-	VramMB     int      `json:"vram_mb,omitempty"`
+	DockerImage      *string  `json:"docker_image,omitempty"`
+	DockerEntrypoint *string  `json:"docker_entrypoint,omitempty"`
+	DockerArgs       []string `json:"docker_args,omitempty"`
+	DockerNetwork    *string  `json:"docker_network,omitempty"`
+	DockerBuild      *string  `json:"docker_build,omitempty"` // name of an entry in `builds` (optionally name@commit)
+	GpuLayers        *int     `json:"gpu_layers,omitempty"`
+	CtxSize          *int     `json:"ctx_size,omitempty"`
+	Mmproj           string   `json:"mmproj,omitempty"`
+	ExtraArgs        []string `json:"extra_args,omitempty"`
+	AutoLoad         bool     `json:"auto_load,omitempty"`
+	AutoUnload       bool     `json:"auto_unload,omitempty"`
+	VramMB           int      `json:"vram_mb,omitempty"`
 }
 
 type AutoswitchConfig struct {
@@ -75,7 +96,7 @@ func validateAutoswitchConfig(cfg Config) error {
 
 type Config struct {
 	ModelsDir  string                 `json:"models_dir"`
-	ServerBin  string                 `json:"server_bin"`
+	Docker     DockerConfig           `json:"docker"`
 	Host       string                 `json:"host"`
 	Port       int                    `json:"port"`
 	GpuLayers  int                    `json:"gpu_layers"`
@@ -85,12 +106,63 @@ type Config struct {
 	Aliases    map[string]string      `json:"aliases,omitempty"`
 	Models     map[string]ModelConfig `json:"models,omitempty"`
 	Autoswitch AutoswitchConfig       `json:"autoswitch,omitempty"`
+	Builds     map[string]BuildConfig `json:"builds,omitempty"`
+}
+
+// BuildConfig describes a llama.cpp (or fork) build made by `llmctl build`.
+// Exactly one of Repo or Path is set.
+type BuildConfig struct {
+	Repo         string   `json:"repo,omitempty"`          // git URL
+	Ref          string   `json:"ref,omitempty"`           // branch, tag, full SHA or "#<PR number>"; default HEAD
+	Path         string   `json:"path,omitempty"`          // local git checkout (uncommitted changes included)
+	Backend      string   `json:"backend,omitempty"`       // "cuda" (default) or "jetson"
+	CudaArch     string   `json:"cuda_arch,omitempty"`     // CMAKE_CUDA_ARCHITECTURES; default: host GPU (cuda) / 87 (jetson)
+	BaseImage    string   `json:"base_image,omitempty"`    // build-stage image
+	RuntimeImage string   `json:"runtime_image,omitempty"` // runtime-stage image
+	CmakeArgs    []string `json:"cmake_args,omitempty"`
+	Target       string   `json:"target,omitempty"`     // cmake target, default llama-server
+	Dockerfile   string   `json:"dockerfile,omitempty"` // custom Dockerfile (relative to the source tree)
+	Keep         int      `json:"keep,omitempty"`       // images to keep per build, default 3
+}
+
+// DockerConfig controls how llama-server backends are run as containers.
+type DockerConfig struct {
+	Bin        string   `json:"bin"`                  // docker CLI (or a compatible one, e.g. podman)
+	Image      string   `json:"image"`                // llama.cpp server image
+	Entrypoint string   `json:"entrypoint,omitempty"` // override image entrypoint (e.g. "llama-server")
+	GPU        string   `json:"gpu"`                  // "nvidia" (--gpus all), "jetson" (--runtime nvidia), "none"
+	HFCacheDir string   `json:"hf_cache_dir"`         // host dir mounted for -hf downloads (bridge network only)
+	Network    string   `json:"network"`              // "none" (unix socket), "internal" or "bridge"
+	ReadOnly   *bool    `json:"read_only,omitempty"`  // read-only root fs (default true)
+	PidsLimit  int      `json:"pids_limit"`           // --pids-limit; <= 0 disables
+	Args       []string `json:"args,omitempty"`       // extra `docker run` flags
+	Build      string   `json:"build,omitempty"`      // default build (entry in `builds`) instead of Image
+}
+
+func (d DockerConfig) readOnly() bool { return d.ReadOnly == nil || *d.ReadOnly }
+
+func validNetworkMode(m string) bool {
+	return m == netNone || m == netInternal || m == netBridge
+}
+
+func defaultHFCacheDir() string {
+	if d := os.Getenv("LLAMA_CACHE"); d != "" {
+		return d
+	}
+	return filepath.Join(homeDir(), ".cache", "llama.cpp")
 }
 
 func defaultConfig() Config {
 	return Config{
 		ModelsDir: modelsDir(),
-		ServerBin: findServerBin(),
+		Docker: DockerConfig{
+			Bin:        "docker",
+			Image:      defaultDockerImage,
+			GPU:        "nvidia",
+			HFCacheDir: defaultHFCacheDir(),
+			Network:    netNone,
+			PidsLimit:  defaultPidsLimit,
+		},
 		Host:      defaultHost,
 		Port:      defaultPort,
 		GpuLayers: -1,
@@ -120,6 +192,22 @@ func loadConfig() Config {
 	}
 	if cfg.Models == nil {
 		cfg.Models = map[string]ModelConfig{}
+	}
+	def := defaultConfig().Docker
+	if cfg.Docker.Bin == "" {
+		cfg.Docker.Bin = def.Bin
+	}
+	if cfg.Docker.Image == "" {
+		cfg.Docker.Image = def.Image
+	}
+	if cfg.Docker.GPU == "" {
+		cfg.Docker.GPU = def.GPU
+	}
+	if cfg.Docker.HFCacheDir == "" {
+		cfg.Docker.HFCacheDir = def.HFCacheDir
+	}
+	if cfg.Docker.Network == "" {
+		cfg.Docker.Network = def.Network
 	}
 	return cfg
 }
@@ -223,8 +311,24 @@ func configForModel(cfg Config, modelKey string) Config {
 	if !ok {
 		return cfg
 	}
-	if mc.ServerBin != nil {
-		cfg.ServerBin = *mc.ServerBin
+	if mc.DockerImage != nil {
+		cfg.Docker.Image = *mc.DockerImage
+	}
+	if mc.DockerEntrypoint != nil {
+		cfg.Docker.Entrypoint = *mc.DockerEntrypoint
+	}
+	if mc.DockerArgs != nil {
+		cfg.Docker.Args = append(append([]string{}, cfg.Docker.Args...), mc.DockerArgs...)
+	}
+	if mc.DockerNetwork != nil {
+		cfg.Docker.Network = *mc.DockerNetwork
+	}
+	if mc.DockerBuild != nil {
+		cfg.Docker.Build = *mc.DockerBuild
+	}
+	if mc.DockerImage != nil && mc.DockerBuild == nil {
+		// An explicit per-model image wins over a global default build.
+		cfg.Docker.Build = ""
 	}
 	if mc.GpuLayers != nil {
 		cfg.GpuLayers = *mc.GpuLayers
@@ -296,15 +400,6 @@ func aliasTargetMatchesModel(cfg Config, target, modelPath string) bool {
 	return false
 }
 
-func findServerBin() string {
-	for _, name := range []string{"llama-server", "llama-cpp-server", "server"} {
-		if p, err := exec.LookPath(name); err == nil {
-			return p
-		}
-	}
-	return "llama-server"
-}
-
 // ═══════════════════════════════════════════════════════════════════════════
 // Instance Registry — tracks multiple running backends
 // ═══════════════════════════════════════════════════════════════════════════
@@ -313,17 +408,22 @@ type Instance struct {
 	Name            string   `json:"name"`
 	Model           string   `json:"model"` // full path to .gguf
 	Mmproj          string   `json:"mmproj,omitempty"`
-	PID             int      `json:"pid"`
+	Container       string   `json:"container"` // docker container name
+	Image           string   `json:"image"`
+	Network         string   `json:"network,omitempty"` // none | internal | bridge
+	Socket          string   `json:"socket,omitempty"`  // unix socket path (network none)
+	Addr            string   `json:"addr,omitempty"`    // host:port (network internal/bridge)
 	Port            int      `json:"port"`
 	IsDefault       bool     `json:"is_default"` // default model for unmatched requests
 	CtxSize         int      `json:"ctx_size"`
 	GpuLayers       int      `json:"gpu_layers"`
-	ServerBin       string   `json:"server_bin"`
 	ExtraArgs       []string `json:"extra_args,omitempty"`
 	Aliases         []string `json:"aliases,omitempty"`
 	AutoUnload      bool     `json:"auto_unload,omitempty"`
 	EstimatedVramMB int      `json:"estimated_vram_mb,omitempty"`
 	LastUsedAt      int64    `json:"last_used_at,omitempty"`
+	Build           string   `json:"build,omitempty"`  // llmctl build name, if any
+	Commit          string   `json:"commit,omitempty"` // source commit of the build image
 }
 
 type Registry struct {
@@ -361,8 +461,9 @@ func (r *Registry) Default() *Instance {
 			return &r.Instances[i]
 		}
 	}
+	live := liveContainers()
 	for i := range r.Instances {
-		if isRunning(r.Instances[i].PID) {
+		if live[r.Instances[i].Container] {
 			return &r.Instances[i]
 		}
 	}
@@ -379,11 +480,24 @@ func (r *Registry) Remove(name string) {
 	r.Instances = filtered
 }
 
+// CleanDead drops instances whose container is no longer running. Exited
+// containers are not started with --rm, so their logs are saved to
+// ~/.llmctl-logs before the container is removed.
 func (r *Registry) CleanDead() {
+	live, err := liveContainersErr()
+	if err != nil {
+		// Docker unreachable: keep the registry rather than forget backends.
+		return
+	}
 	var alive []Instance
 	for _, inst := range r.Instances {
-		if isRunning(inst.PID) {
+		if live[inst.Container] {
 			alive = append(alive, inst)
+			continue
+		}
+		if inst.Container != "" {
+			removeContainer(inst.Container, instanceLogPath(inst.Name))
+			removeSocketDir(inst.Container)
 		}
 	}
 	r.Instances = alive
@@ -405,6 +519,7 @@ func (r *Registry) NextPort() int {
 // Process helpers
 // ═══════════════════════════════════════════════════════════════════════════
 
+// isRunning reports whether a host process is alive (used for the proxy PID).
 func isRunning(pid int) bool {
 	if pid <= 0 {
 		return false
@@ -432,20 +547,433 @@ func stopProcess(pid int) {
 	time.Sleep(200 * time.Millisecond)
 }
 
-func waitForHealth(port int, timeout time.Duration) bool {
+// ═══════════════════════════════════════════════════════════════════════════
+// Docker helpers — llama-server backends run as containers
+// ═══════════════════════════════════════════════════════════════════════════
+
+// dockerBin is the container CLI used for all docker calls. It is set from
+// config in main() so registry helpers don't need a Config.
+var dockerBin = "docker"
+
+// dockerExec runs the docker CLI and returns combined stdout. It is a
+// variable so tests can stub it.
+var dockerExec = func(args ...string) (string, error) {
+	cmd := exec.Command(dockerBin, args...)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
+	if err != nil {
+		msg := strings.TrimSpace(stderr.String())
+		if msg == "" {
+			msg = err.Error()
+		}
+		return string(out), fmt.Errorf("%s %s: %s", dockerBin, strings.Join(args, " "), msg)
+	}
+	return string(out), nil
+}
+
+var (
+	liveMu      sync.Mutex
+	liveCache   map[string]bool
+	liveCacheAt time.Time
+	liveErr     error
+)
+
+const liveCacheTTL = time.Second
+
+// liveContainers returns the names of running llmctl-managed containers.
+// The result is cached briefly because the proxy calls this on hot paths.
+func liveContainers() map[string]bool {
+	live, _ := liveContainersErr()
+	return live
+}
+
+// liveContainersErr is liveContainers plus the error from docker, so callers
+// that delete state can tell "nothing running" from "docker unreachable".
+func liveContainersErr() (map[string]bool, error) {
+	liveMu.Lock()
+	defer liveMu.Unlock()
+	if liveCache != nil && time.Since(liveCacheAt) < liveCacheTTL {
+		return liveCache, liveErr
+	}
+	out, err := dockerExec("ps", "--filter", "label="+containerLabel, "--format", "{{.Names}}")
+	live := map[string]bool{}
+	if err == nil {
+		for _, name := range strings.Fields(out) {
+			live[name] = true
+		}
+	}
+	liveCache, liveCacheAt, liveErr = live, time.Now(), err
+	return live, err
+}
+
+func invalidateLiveContainers() {
+	liveMu.Lock()
+	liveCache = nil
+	liveMu.Unlock()
+}
+
+func instanceRunning(inst Instance) bool {
+	return inst.Container != "" && liveContainers()[inst.Container]
+}
+
+// containerName maps an instance name to a valid docker container name.
+func containerName(instance string) string {
+	name := strings.Map(func(r rune) rune {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '_', r == '.', r == '-':
+			return r
+		}
+		return '-'
+	}, instance)
+	return containerPrefix + name
+}
+
+func logDir() string { return filepath.Join(homeDir(), ".llmctl-logs") }
+
+func instanceLogPath(name string) string { return filepath.Join(logDir(), name+".log") }
+
+// saveContainerLogs writes the container's stdout+stderr to path.
+func saveContainerLogs(container, path string) {
+	if path == "" {
+		return
+	}
+	cmd := exec.Command(dockerBin, "logs", container)
+	out, err := cmd.CombinedOutput()
+	if err != nil || len(out) == 0 {
+		return
+	}
+	_ = os.MkdirAll(filepath.Dir(path), 0755)
+	_ = os.WriteFile(path, out, 0644)
+}
+
+// removeContainer saves the container's logs (if logPath is set) and removes it.
+func removeContainer(container, logPath string) {
+	saveContainerLogs(container, logPath)
+	_, _ = dockerExec("rm", "-f", container)
+	invalidateLiveContainers()
+}
+
+// stopInstance stops and removes an instance's container, keeping its logs.
+func stopInstance(inst Instance) {
+	if inst.Container == "" {
+		return
+	}
+	_, _ = dockerExec("stop", "-t", "10", inst.Container)
+	removeContainer(inst.Container, instanceLogPath(inst.Name))
+	removeSocketDir(inst.Container)
+}
+
+// socketDir is the per-instance host directory holding llama-server's unix
+// socket. Each instance gets its own directory so a compromised backend
+// cannot reach other backends' sockets.
+func socketDir(container string) string {
+	return filepath.Join(homeDir(), ".llmctl-run", container)
+}
+
+func removeSocketDir(container string) {
+	_ = os.RemoveAll(socketDir(container))
+}
+
+// ensureInternalNetwork creates the egress-less docker network used in
+// "internal" mode. Inter-container traffic is disabled so backends cannot
+// talk to each other.
+func ensureInternalNetwork() error {
+	if _, err := dockerExec("network", "inspect", internalNetwork); err == nil {
+		return nil
+	}
+	_, err := dockerExec("network", "create", "--internal",
+		"-o", "com.docker.network.bridge.enable_icc=false",
+		"--label", containerLabel+"=network",
+		internalNetwork)
+	return err
+}
+
+func containerIP(container, network string) (string, error) {
+	out, err := dockerExec("inspect", "-f", fmt.Sprintf("{{(index .NetworkSettings.Networks %q).IPAddress}}", network), container)
+	if err != nil {
+		return "", err
+	}
+	ip := strings.TrimSpace(out)
+	if ip == "" || ip == "<no value>" {
+		return "", fmt.Errorf("container %s has no IP on network %s", container, network)
+	}
+	return ip, nil
+}
+
+// backendTarget is how the host reaches a backend: TCP or a unix socket.
+type backendTarget struct {
+	URL       *url.URL
+	Socket    string
+	Transport http.RoundTripper
+}
+
+var socketTransports sync.Map // socket path -> *http.Transport
+
+func unixTransport(sock string) http.RoundTripper {
+	if t, ok := socketTransports.Load(sock); ok {
+		return t.(http.RoundTripper)
+	}
+	t := &http.Transport{
+		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			var d net.Dialer
+			return d.DialContext(ctx, "unix", sock)
+		},
+		MaxIdleConns:    16,
+		IdleConnTimeout: 90 * time.Second,
+	}
+	actual, _ := socketTransports.LoadOrStore(sock, t)
+	return actual.(http.RoundTripper)
+}
+
+func instanceBackend(inst Instance) backendTarget {
+	if inst.Socket != "" {
+		u, _ := url.Parse("http://localhost")
+		return backendTarget{URL: u, Socket: inst.Socket, Transport: unixTransport(inst.Socket)}
+	}
+	addr := inst.Addr
+	if addr == "" {
+		addr = fmt.Sprintf("127.0.0.1:%d", inst.Port)
+	}
+	u, _ := url.Parse("http://" + addr)
+	return backendTarget{URL: u, Transport: http.DefaultTransport}
+}
+
+func (b backendTarget) String() string {
+	if b.Socket != "" {
+		return "unix://" + b.Socket
+	}
+	return b.URL.String()
+}
+
+func (b backendTarget) client(timeout time.Duration) *http.Client {
+	return &http.Client{Transport: b.Transport, Timeout: timeout}
+}
+
+// backendStatus reports healthy/loading/running from the backend's /health.
+func backendStatus(inst Instance) string {
+	resp, err := instanceBackend(inst).client(3 * time.Second).Get(instanceBackend(inst).URL.String() + "/health")
+	if err != nil {
+		return "running"
+	}
+	resp.Body.Close()
+	if resp.StatusCode == 200 {
+		return "healthy"
+	}
+	return "loading"
+}
+
+// containerState returns whether the container is running and its exit code.
+// exists is false if the container is gone.
+func containerState(container string) (running bool, exitCode int, exists bool) {
+	out, err := dockerExec("inspect", "-f", "{{.State.Running}} {{.State.ExitCode}}", container)
+	if err != nil {
+		return false, 0, false
+	}
+	fields := strings.Fields(out)
+	if len(fields) != 2 {
+		return false, 0, false
+	}
+	exitCode, _ = strconv.Atoi(fields[1])
+	return fields[0] == "true", exitCode, true
+}
+
+// ensureImage pulls the image if it is not present locally, so the first
+// pull does not count against the backend health timeout.
+func ensureImage(image string, verbose bool) error {
+	if _, err := dockerExec("image", "inspect", image); err == nil {
+		return nil
+	}
+	if verbose {
+		fmt.Printf("Pulling image %s...\n", image)
+	}
+	cmd := exec.Command(dockerBin, "pull", image)
+	if verbose {
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		return cmd.Run()
+	}
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("pull %s: %v: %s", image, err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+type containerMount struct {
+	Host     string
+	ReadOnly bool
+}
+
+// backendMounts returns host directories to bind-mount (at the same path) so
+// every host path llama-server is given also exists inside the container.
+// HF-cache model files are symlinks into ../../blobs, so symlink targets are
+// mounted too.
+func backendMounts(modelsDir, hfCacheDir string, files []string, extraArgs []string) []containerMount {
+	var mounts []containerMount
+	idx := map[string]int{}
+	add := func(dir string, ro bool) {
+		if dir == "" || dir == "/" || dir == "." {
+			return
+		}
+		dir = filepath.Clean(dir)
+		if i, ok := idx[dir]; ok {
+			if !ro {
+				mounts[i].ReadOnly = false
+			}
+			return
+		}
+		idx[dir] = len(mounts)
+		mounts = append(mounts, containerMount{Host: dir, ReadOnly: ro})
+	}
+	covered := func(path string) bool {
+		for _, m := range mounts {
+			if path == m.Host || strings.HasPrefix(path, m.Host+string(filepath.Separator)) {
+				return true
+			}
+		}
+		return false
+	}
+	addFile := func(path string, ro bool) {
+		for _, p := range []string{path, resolveSymlinks(path)} {
+			if p == "" {
+				continue
+			}
+			if dir := filepath.Dir(p); !covered(dir) {
+				add(dir, ro)
+			}
+		}
+	}
+
+	if modelsDir != "" {
+		add(modelsDir, true)
+	}
+	if hfCacheDir != "" {
+		add(hfCacheDir, false)
+	}
+	for _, f := range files {
+		if filepath.IsAbs(f) {
+			addFile(f, true)
+		}
+	}
+	for i, a := range extraArgs {
+		if !filepath.IsAbs(a) {
+			continue
+		}
+		// Paths are mounted read-only unless the flag is one llama-server
+		// writes to, so a compromised backend can't tamper with templates,
+		// LoRAs, etc. used by other instances.
+		ro := i == 0 || !writableArgFlags[extraArgs[i-1]]
+		if info, err := os.Stat(a); err == nil && info.IsDir() {
+			if !covered(a) {
+				add(a, ro)
+			}
+			continue
+		}
+		if _, err := os.Stat(filepath.Dir(a)); err == nil {
+			addFile(a, ro)
+		}
+	}
+	return mounts
+}
+
+// writableArgFlags are llama-server flags whose path argument is written to.
+var writableArgFlags = map[string]bool{
+	"--slot-save-path": true,
+	"--log-file":       true,
+	"-lf":              true,
+}
+
+func resolveSymlinks(path string) string {
+	real, err := filepath.EvalSymlinks(path)
+	if err != nil || real == path {
+		return ""
+	}
+	return real
+}
+
+type dockerRunSpec struct {
+	Docker     DockerConfig
+	Container  string
+	Instance   string
+	Port       int
+	Mounts     []containerMount
+	ServerArgs []string // llama-server arguments
+}
+
+// dockerRunArgs builds the `docker run` argument list for a backend.
+func dockerRunArgs(spec dockerRunSpec) []string {
+	args := []string{
+		"run", "-d",
+		"--name", spec.Container,
+		"--label", containerLabel + "=" + spec.Instance,
+		"--user", fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid()),
+		// Hardening: no capabilities, no privilege escalation.
+		"--cap-drop", "ALL",
+		"--security-opt", "no-new-privileges",
+	}
+	if spec.Docker.readOnly() {
+		args = append(args, "--read-only", "--tmpfs", "/tmp")
+	}
+	if spec.Docker.PidsLimit > 0 {
+		args = append(args, "--pids-limit", strconv.Itoa(spec.Docker.PidsLimit))
+	}
+	switch spec.Docker.Network {
+	case netBridge:
+		args = append(args, "-p", fmt.Sprintf("127.0.0.1:%d:%d", spec.Port, spec.Port))
+	case netInternal:
+		args = append(args, "--network", internalNetwork)
+	default: // netNone
+		args = append(args, "--network", "none")
+	}
+	switch strings.ToLower(spec.Docker.GPU) {
+	case "nvidia", "cuda":
+		args = append(args, "--gpus", "all")
+	case "jetson":
+		args = append(args, "--runtime", "nvidia")
+	}
+	for _, m := range spec.Mounts {
+		v := m.Host + ":" + m.Host
+		if m.ReadOnly {
+			v += ":ro"
+		}
+		args = append(args, "-v", v)
+	}
+	if spec.Docker.Network == netBridge && spec.Docker.HFCacheDir != "" {
+		args = append(args,
+			"-e", "LLAMA_CACHE="+spec.Docker.HFCacheDir,
+			"-e", "HF_HUB_CACHE="+spec.Docker.HFCacheDir,
+		)
+	}
+	if spec.Docker.Entrypoint != "" {
+		args = append(args, "--entrypoint", spec.Docker.Entrypoint)
+	}
+	args = append(args, spec.Docker.Args...)
+	args = append(args, spec.Docker.Image)
+	return append(args, spec.ServerArgs...)
+}
+
+// waitForHealth polls the backend's /health until it returns 200, the
+// container exits, or the timeout elapses.
+func waitForHealth(target backendTarget, container string, timeout time.Duration) (healthy bool, exited bool, exitCode int) {
 	deadline := time.Now().Add(timeout)
-	addr := fmt.Sprintf("http://127.0.0.1:%d/health", port)
-	for time.Now().Before(deadline) {
-		resp, err := http.Get(addr)
+	addr := target.URL.String() + "/health"
+	client := target.client(2 * time.Second)
+	for i := 0; time.Now().Before(deadline); i++ {
+		resp, err := client.Get(addr)
 		if err == nil {
 			resp.Body.Close()
 			if resp.StatusCode == 200 {
-				return true
+				return true, false, 0
+			}
+		}
+		if i%4 == 0 {
+			if running, code, _ := containerState(container); !running {
+				return false, true, code
 			}
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
-	return false
+	return false, false, 0
 }
 
 func printLogTail(path string, maxLines int) {
@@ -467,13 +995,1119 @@ func printLogTail(path string, maxLines int) {
 	}
 }
 
-func backendExited(exitCh <-chan error) (error, bool) {
-	select {
-	case err := <-exitCh:
-		return err, true
-	default:
-		return nil, false
+// ═══════════════════════════════════════════════════════════════════════════
+// Custom llama.cpp builds — `llmctl build` turns a git ref / PR / local
+// checkout of llama.cpp (or a fork) into a llama-server image.
+// ═══════════════════════════════════════════════════════════════════════════
+
+//go:embed docker/llama-server.Dockerfile
+var llamaServerDockerfile string
+
+const (
+	backendCUDA   = "cuda"
+	backendJetson = "jetson"
+
+	defaultCUDABuildImage   = "nvidia/cuda:12.8.1-devel-ubuntu24.04"
+	defaultCUDARuntimeImage = "nvidia/cuda:12.8.1-runtime-ubuntu24.04"
+	defaultJetsonImage      = "nvcr.io/nvidia/l4t-jetpack:r36.4.0"
+	defaultJetsonCudaArch   = "87" // Orin
+	defaultBuildKeep        = 3
+
+	buildLabel       = "llmctl.build"
+	buildCommitLabel = "llmctl.commit"
+	buildRefLabel    = "llmctl.ref"
+	buildSourceLabel = "llmctl.source"
+	buildSocketLabel = "llmctl.unix_socket"
+	buildTimeLabel   = "llmctl.built_at" // RFC3339Nano; image Created is not reliable for ordering
+)
+
+// gitExec runs git and returns stdout. A variable so tests can stub it.
+var gitExec = func(args ...string) (string, error) {
+	cmd := exec.Command("git", args...)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
+	if err != nil {
+		msg := strings.TrimSpace(stderr.String())
+		if msg == "" {
+			msg = err.Error()
+		}
+		return string(out), fmt.Errorf("git %s: %s", strings.Join(args, " "), msg)
 	}
+	return string(out), nil
+}
+
+// buildRepo is the image repository for a build, e.g. "llmctl/ik".
+func buildRepo(name string) string {
+	return "llmctl/" + strings.Map(func(r rune) rune {
+		switch {
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9', r == '.', r == '_', r == '-':
+			return r
+		case r >= 'A' && r <= 'Z':
+			return r + ('a' - 'A')
+		}
+		return '-'
+	}, name)
+}
+
+func expandHome(p string) string {
+	if p == "~" {
+		return homeDir()
+	}
+	if strings.HasPrefix(p, "~/") {
+		return filepath.Join(homeDir(), p[2:])
+	}
+	return p
+}
+
+var (
+	fullSHARe  = regexp.MustCompile(`^[0-9a-fA-F]{40}$`)
+	shortSHARe = regexp.MustCompile(`^[0-9a-fA-F]{7,39}$`)
+	prRefRe    = regexp.MustCompile(`^#(\d+)$`)
+)
+
+// gitRefQuery maps a build ref to what `git ls-remote` should look up.
+func gitRefQuery(ref string) string {
+	if ref == "" {
+		return "HEAD"
+	}
+	if m := prRefRe.FindStringSubmatch(ref); m != nil {
+		return "refs/pull/" + m[1] + "/head"
+	}
+	return ref
+}
+
+// pickLsRemote picks the commit for ref from `git ls-remote` output,
+// preferring branches over tags and peeled (^{}) tags over tag objects.
+func pickLsRemote(out, ref string) (string, error) {
+	refs := map[string]string{}
+	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+		f := strings.Fields(line)
+		if len(f) == 2 {
+			refs[f[1]] = f[0]
+		}
+	}
+	q := gitRefQuery(ref)
+	for _, cand := range []string{q, "refs/heads/" + q, "refs/tags/" + q + "^{}", "refs/tags/" + q} {
+		if sha, ok := refs[cand]; ok {
+			return sha, nil
+		}
+	}
+	return "", fmt.Errorf("ref %q not found", ref)
+}
+
+// resolveRemoteCommit returns the full commit SHA ref points to in repo.
+func resolveRemoteCommit(repo, ref string) (string, error) {
+	if fullSHARe.MatchString(ref) {
+		return strings.ToLower(ref), nil
+	}
+	if shortSHARe.MatchString(ref) {
+		return "", fmt.Errorf("short commit %q can't be resolved remotely; use the full 40-character SHA", ref)
+	}
+	out, err := gitExec("ls-remote", repo, gitRefQuery(ref))
+	if err != nil {
+		return "", err
+	}
+	sha, err := pickLsRemote(out, ref)
+	if err != nil {
+		return "", fmt.Errorf("%s: %w", repo, err)
+	}
+	return sha, nil
+}
+
+// buildSourceDir is where llmctl keeps the fetched source for a build.
+func buildSourceDir(name string) string {
+	return filepath.Join(homeDir(), ".cache", "llmctl", "src", strings.TrimPrefix(buildRepo(name), "llmctl/"))
+}
+
+// fetchRemoteSource shallow-fetches commit (falling back to the ref) into dir
+// and checks it out. Returns the checked-out commit.
+func fetchRemoteSource(dir, repo, ref, commit string) (string, error) {
+	if _, err := os.Stat(filepath.Join(dir, ".git")); err != nil {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			return "", err
+		}
+		if _, err := gitExec("-C", dir, "init", "-q"); err != nil {
+			return "", err
+		}
+	}
+	if _, err := gitExec("-C", dir, "fetch", "-q", "--depth", "1", "--no-tags", repo, commit); err != nil {
+		// Some servers don't allow fetching by SHA; fetch the ref instead.
+		if _, err2 := gitExec("-C", dir, "fetch", "-q", "--depth", "1", "--no-tags", repo, gitRefQuery(ref)); err2 != nil {
+			return "", err2
+		}
+	}
+	if _, err := gitExec("-C", dir, "checkout", "-q", "--force", "--detach", "FETCH_HEAD^{commit}"); err != nil {
+		return "", err
+	}
+	if _, err := gitExec("-C", dir, "clean", "-q", "-ffdx"); err != nil {
+		return "", err
+	}
+	out, err := gitExec("-C", dir, "rev-parse", "HEAD")
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(out), nil
+}
+
+// localSourceState returns the HEAD commit of a local checkout and, if it has
+// uncommitted changes, a short hash of them.
+func localSourceState(path string) (commit, dirty string, err error) {
+	out, err := gitExec("-C", path, "rev-parse", "HEAD")
+	if err != nil {
+		return "", "", fmt.Errorf("%s is not a git checkout: %w", path, err)
+	}
+	commit = strings.TrimSpace(out)
+	status, err := gitExec("-C", path, "status", "--porcelain", "--untracked-files=all")
+	if err != nil {
+		return "", "", err
+	}
+	if strings.TrimSpace(status) == "" {
+		return commit, "", nil
+	}
+	h := sha256.New()
+	diff, err := gitExec("-C", path, "diff", "HEAD", "--binary")
+	if err != nil {
+		return "", "", err
+	}
+	_, _ = io.WriteString(h, diff)
+	untracked, err := gitExec("-C", path, "ls-files", "-z", "--others", "--exclude-standard")
+	if err != nil {
+		return "", "", err
+	}
+	for _, f := range strings.Split(untracked, "\x00") {
+		if f == "" {
+			continue
+		}
+		_, _ = io.WriteString(h, f+"\x00")
+		if data, err := os.ReadFile(filepath.Join(path, f)); err == nil {
+			_, _ = h.Write(data)
+		}
+	}
+	return commit, hex.EncodeToString(h.Sum(nil))[:8], nil
+}
+
+// copyLocalSource copies a checkout's tracked and untracked-but-not-ignored
+// files into dst, so ignored build output (build/, models) stays out of the
+// docker build context.
+func copyLocalSource(src, dst string) error {
+	out, err := gitExec("-C", src, "ls-files", "-z", "--cached", "--others", "--exclude-standard")
+	if err != nil {
+		return err
+	}
+	if err := os.RemoveAll(dst); err != nil {
+		return err
+	}
+	for _, rel := range strings.Split(out, "\x00") {
+		if rel == "" {
+			continue
+		}
+		from := filepath.Join(src, rel)
+		info, err := os.Lstat(from)
+		if err != nil {
+			continue // deleted but not yet committed
+		}
+		to := filepath.Join(dst, rel)
+		if err := os.MkdirAll(filepath.Dir(to), 0755); err != nil {
+			return err
+		}
+		switch {
+		case info.Mode()&os.ModeSymlink != 0:
+			target, err := os.Readlink(from)
+			if err != nil {
+				return err
+			}
+			if err := os.Symlink(target, to); err != nil {
+				return err
+			}
+		case info.Mode().IsRegular():
+			data, err := os.ReadFile(from)
+			if err != nil {
+				return err
+			}
+			if err := os.WriteFile(to, data, info.Mode().Perm()); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// sourceSupportsUnixSocket reports whether llama-server in this source tree
+// can listen on a unix socket (upstream PR #12613, `--host *.sock`).
+func sourceSupportsUnixSocket(srcDir string) bool {
+	found := false
+	for _, sub := range []string{"tools/server", "examples/server"} {
+		root := filepath.Join(srcDir, sub)
+		_ = filepath.WalkDir(root, func(p string, d os.DirEntry, err error) error {
+			if found {
+				return filepath.SkipAll
+			}
+			if err != nil {
+				return filepath.SkipDir
+			}
+			if d.IsDir() {
+				return nil
+			}
+			ext := filepath.Ext(p)
+			if ext != ".cpp" && ext != ".h" && ext != ".hpp" {
+				return nil
+			}
+			if data, err := os.ReadFile(p); err == nil && bytes.Contains(data, []byte("AF_UNIX")) {
+				found = true
+			}
+			return nil
+		})
+	}
+	return found
+}
+
+// parseComputeCaps turns `nvidia-smi --query-gpu=compute_cap` output
+// ("8.9\n8.6\n") into CMAKE_CUDA_ARCHITECTURES ("86;89").
+func parseComputeCaps(out string) string {
+	seen := map[string]bool{}
+	var archs []string
+	for _, line := range strings.Split(out, "\n") {
+		a := strings.ReplaceAll(strings.TrimSpace(line), ".", "")
+		if a == "" || seen[a] {
+			continue
+		}
+		if _, err := strconv.Atoi(a); err != nil {
+			continue
+		}
+		seen[a] = true
+		archs = append(archs, a)
+	}
+	sort.Strings(archs)
+	return strings.Join(archs, ";")
+}
+
+// jetsonImageForRelease maps /etc/nv_tegra_release to an l4t-jetpack tag,
+// e.g. "# R36 (release), REVISION: 4.3, ..." -> nvcr.io/nvidia/l4t-jetpack:r36.4.0.
+func jetsonImageForRelease(release string) string {
+	m := regexp.MustCompile(`R(\d+) \(release\), REVISION: (\d+)`).FindStringSubmatch(release)
+	if m == nil {
+		return ""
+	}
+	return fmt.Sprintf("nvcr.io/nvidia/l4t-jetpack:r%s.%s.0", m[1], m[2])
+}
+
+// resolvedBuild is a BuildConfig with all defaults filled in.
+type resolvedBuild struct {
+	Name         string
+	Backend      string
+	CudaArch     string
+	BaseImage    string
+	RuntimeImage string
+	CmakeArgs    []string
+	Target       string
+	Dockerfile   string
+	Keep         int
+}
+
+func resolveBuildConfig(name string, bc BuildConfig) (resolvedBuild, error) {
+	rb := resolvedBuild{
+		Name:         name,
+		Backend:      strings.ToLower(bc.Backend),
+		CudaArch:     bc.CudaArch,
+		BaseImage:    bc.BaseImage,
+		RuntimeImage: bc.RuntimeImage,
+		CmakeArgs:    bc.CmakeArgs,
+		Target:       bc.Target,
+		Dockerfile:   bc.Dockerfile,
+		Keep:         bc.Keep,
+	}
+	if (bc.Repo == "") == (bc.Path == "") {
+		return rb, fmt.Errorf("build %q: set exactly one of repo or path", name)
+	}
+	if bc.Path != "" && bc.Ref != "" {
+		return rb, fmt.Errorf("build %q: ref only applies to repo builds", name)
+	}
+	if rb.Backend == "" {
+		rb.Backend = backendCUDA
+	}
+	if rb.Target == "" {
+		rb.Target = "llama-server"
+	}
+	if rb.Keep <= 0 {
+		rb.Keep = defaultBuildKeep
+	}
+	switch rb.Backend {
+	case backendCUDA:
+		if rb.BaseImage == "" {
+			rb.BaseImage = defaultCUDABuildImage
+		}
+		if rb.RuntimeImage == "" {
+			rb.RuntimeImage = defaultCUDARuntimeImage
+		}
+		if rb.CudaArch == "" {
+			out, err := exec.Command("nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader").Output()
+			if err == nil {
+				rb.CudaArch = parseComputeCaps(string(out))
+			}
+			if rb.CudaArch == "" {
+				return rb, fmt.Errorf("build %q: can't detect the GPU architecture (nvidia-smi); set cuda_arch, e.g. \"89\"", name)
+			}
+		}
+	case backendJetson:
+		if rb.BaseImage == "" {
+			if data, err := os.ReadFile("/etc/nv_tegra_release"); err == nil {
+				rb.BaseImage = jetsonImageForRelease(string(data))
+			}
+			if rb.BaseImage == "" {
+				rb.BaseImage = defaultJetsonImage
+			}
+		}
+		if rb.RuntimeImage == "" {
+			// JetPack 6 containers must ship CUDA themselves; reuse the
+			// JetPack image so cudart/cublas are present at run time.
+			rb.RuntimeImage = rb.BaseImage
+		}
+		if rb.CudaArch == "" {
+			rb.CudaArch = defaultJetsonCudaArch
+		}
+	default:
+		return rb, fmt.Errorf("build %q: backend must be cuda or jetson, got %q", name, bc.Backend)
+	}
+	return rb, nil
+}
+
+type buildImageSpec struct {
+	Build      resolvedBuild
+	ContextDir string
+	Dockerfile string // path to the Dockerfile to use
+	Tag        string // commit tag, e.g. abc123def456 or abc123def456-dirty-1a2b3c4d
+	Commit     string
+	Ref        string
+	Source     string
+	UnixSocket bool
+	BuiltAt    time.Time
+}
+
+// dockerBuildArgs builds the `docker build` argument list.
+func dockerBuildArgs(spec buildImageSpec) []string {
+	repo := buildRepo(spec.Build.Name)
+	return []string{
+		"build",
+		"-f", spec.Dockerfile,
+		"--build-arg", "BUILD_IMAGE=" + spec.Build.BaseImage,
+		"--build-arg", "RUNTIME_IMAGE=" + spec.Build.RuntimeImage,
+		"--build-arg", "CUDA_ARCH=" + spec.Build.CudaArch,
+		"--build-arg", "CMAKE_ARGS=" + strings.Join(spec.Build.CmakeArgs, " "),
+		"--build-arg", "TARGET=" + spec.Build.Target,
+		"--build-arg", "CCACHE_ID=llmctl-ccache-" + spec.Build.Backend,
+		"--label", buildLabel + "=" + spec.Build.Name,
+		"--label", buildCommitLabel + "=" + spec.Commit,
+		"--label", buildRefLabel + "=" + spec.Ref,
+		"--label", buildSourceLabel + "=" + spec.Source,
+		"--label", buildSocketLabel + "=" + strconv.FormatBool(spec.UnixSocket),
+		"--label", buildTimeLabel + "=" + spec.BuiltAt.UTC().Format(time.RFC3339Nano),
+		"-t", repo + ":" + spec.Tag,
+		"-t", repo + ":latest",
+		spec.ContextDir,
+	}
+}
+
+type builtImage struct {
+	Ref     string // repo:tag
+	Tag     string
+	ID      string
+	Created time.Time
+}
+
+func shortImageID(id string) string {
+	id = strings.TrimPrefix(id, "sha256:")
+	if len(id) > 12 {
+		id = id[:12]
+	}
+	return id
+}
+
+// listBuildImages returns the tagged images of a build (including :latest),
+// ordered by llmctl's own built_at label (image Created is not reliable:
+// BuildKit may reuse or backdate it).
+func listBuildImages(name string) ([]builtImage, error) {
+	out, err := dockerExec("image", "ls", "--filter", "label="+buildLabel+"="+name,
+		"--format", "{{.Repository}}:{{.Tag}}|{{.ID}}")
+	if err != nil {
+		return nil, err
+	}
+	var imgs []builtImage
+	var refs []string
+	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+		f := strings.SplitN(line, "|", 2)
+		if len(f) != 2 || strings.HasSuffix(f[0], ":<none>") {
+			continue
+		}
+		imgs = append(imgs, builtImage{
+			Ref: f[0],
+			Tag: f[0][strings.LastIndex(f[0], ":")+1:],
+			ID:  shortImageID(f[1]),
+		})
+		refs = append(refs, f[0])
+	}
+	if len(refs) == 0 {
+		return imgs, nil
+	}
+	args := append([]string{"image", "inspect", "-f",
+		fmt.Sprintf("{{.Created}}|{{index .Config.Labels %q}}", buildTimeLabel)}, refs...)
+	out, err = dockerExec(args...)
+	if err != nil {
+		return imgs, nil
+	}
+	for i, line := range strings.Split(strings.TrimSpace(out), "\n") {
+		if i >= len(imgs) {
+			break
+		}
+		created, label, _ := strings.Cut(strings.TrimSpace(line), "|")
+		if t, err := time.Parse(time.RFC3339Nano, label); err == nil {
+			imgs[i].Created = t
+		} else if t, err := time.Parse(time.RFC3339Nano, created); err == nil {
+			imgs[i].Created = t
+		}
+	}
+	return imgs, nil
+}
+
+// imagesToPrune picks commit-tagged images beyond the newest `keep`, never
+// touching :latest, the image :latest points to, or protected (in-use) IDs.
+func imagesToPrune(imgs []builtImage, keep int, protected map[string]bool) []string {
+	latestID := ""
+	var tagged []builtImage
+	for _, img := range imgs {
+		if img.Tag == "latest" {
+			latestID = img.ID
+			continue
+		}
+		tagged = append(tagged, img)
+	}
+	sort.SliceStable(tagged, func(i, j int) bool { return tagged[i].Created.After(tagged[j].Created) })
+	var prune []string
+	for i, img := range tagged {
+		if i < keep || img.ID == latestID || protected[img.ID] {
+			continue
+		}
+		prune = append(prune, img.Ref)
+	}
+	return prune
+}
+
+// inUseImageIDs returns short IDs of images used by llmctl containers.
+func inUseImageIDs() map[string]bool {
+	ids := map[string]bool{}
+	out, err := dockerExec("ps", "-aq", "--filter", "label="+containerLabel)
+	if err != nil || strings.TrimSpace(out) == "" {
+		return ids
+	}
+	args := append([]string{"inspect", "-f", "{{.Image}}"}, strings.Fields(out)...)
+	if out, err := dockerExec(args...); err == nil {
+		for _, id := range strings.Fields(out) {
+			ids[shortImageID(id)] = true
+		}
+	}
+	return ids
+}
+
+func pruneBuildImages(name string, keep int, verbose bool) {
+	imgs, err := listBuildImages(name)
+	if err != nil {
+		return
+	}
+	for _, ref := range imagesToPrune(imgs, keep, inUseImageIDs()) {
+		if verbose {
+			fmt.Printf("  Removing old image %s\n", ref)
+		}
+		_, _ = dockerExec("image", "rm", ref)
+	}
+}
+
+type buildOptions struct {
+	Ref   string // overrides the configured ref
+	Force bool
+}
+
+// runBuild builds (or re-tags) the image for a configured build.
+func runBuild(cfg Config, name string, opts buildOptions) error {
+	bc, ok := cfg.Builds[name]
+	if !ok {
+		return fmt.Errorf("no build %q in config (see `llmctl builds`)", name)
+	}
+	if opts.Ref != "" {
+		if bc.Path != "" {
+			return fmt.Errorf("build %q is a local checkout; --ref only applies to repo builds", name)
+		}
+		bc.Ref = opts.Ref
+	}
+	rb, err := resolveBuildConfig(name, bc)
+	if err != nil {
+		return err
+	}
+	repo := buildRepo(name)
+
+	// Rollback: an existing image for a (short) commit just becomes :latest.
+	if bc.Repo != "" && (shortSHARe.MatchString(bc.Ref) || fullSHARe.MatchString(bc.Ref)) {
+		if ref, err := findBuildImage(name, bc.Ref); err == nil && !opts.Force {
+			if _, err := dockerExec("tag", ref, repo+":latest"); err != nil {
+				return err
+			}
+			fmt.Printf("✓ %s:latest → %s (already built)\n", repo, ref)
+			return nil
+		}
+	}
+
+	srcDir := buildSourceDir(name)
+	var commit, tag, ref, source string
+	if bc.Repo != "" {
+		ref = bc.Ref
+		if ref == "" {
+			ref = "HEAD"
+		}
+		source = bc.Repo
+		fmt.Printf("Resolving %s @ %s...\n", bc.Repo, ref)
+		commit, err = resolveRemoteCommit(bc.Repo, ref)
+		if err != nil {
+			return err
+		}
+		tag = commit[:12]
+		if !opts.Force {
+			if _, err := dockerExec("image", "inspect", repo+":"+tag); err == nil {
+				if _, err := dockerExec("tag", repo+":"+tag, repo+":latest"); err != nil {
+					return err
+				}
+				fmt.Printf("✓ %s is up to date (%s:%s)\n", name, repo, tag)
+				return nil
+			}
+		}
+		fmt.Printf("Fetching %s...\n", commit[:12])
+		if commit, err = fetchRemoteSource(srcDir, bc.Repo, ref, commit); err != nil {
+			return err
+		}
+		tag = commit[:12]
+	} else {
+		path := expandHome(bc.Path)
+		source = path
+		ref = "local"
+		head, dirty, err := localSourceState(path)
+		if err != nil {
+			return err
+		}
+		commit, tag = head, head[:12]
+		if dirty != "" {
+			tag += "-dirty-" + dirty
+		}
+		if !opts.Force {
+			if _, err := dockerExec("image", "inspect", repo+":"+tag); err == nil {
+				if _, err := dockerExec("tag", repo+":"+tag, repo+":latest"); err != nil {
+					return err
+				}
+				fmt.Printf("✓ %s is up to date (%s:%s)\n", name, repo, tag)
+				return nil
+			}
+		}
+		fmt.Printf("Copying %s...\n", path)
+		if err := copyLocalSource(path, srcDir); err != nil {
+			return err
+		}
+	}
+
+	dockerfile := rb.Dockerfile
+	if dockerfile == "" {
+		f, err := os.CreateTemp("", "llmctl-*.Dockerfile")
+		if err != nil {
+			return err
+		}
+		defer func() { _ = os.Remove(f.Name()) }()
+		_, werr := f.WriteString(llamaServerDockerfile)
+		if cerr := f.Close(); werr == nil {
+			werr = cerr
+		}
+		if werr != nil {
+			return werr
+		}
+		dockerfile = f.Name()
+	} else if !filepath.IsAbs(expandHome(dockerfile)) {
+		dockerfile = filepath.Join(srcDir, dockerfile)
+	} else {
+		dockerfile = expandHome(dockerfile)
+	}
+
+	spec := buildImageSpec{
+		Build:      rb,
+		ContextDir: srcDir,
+		Dockerfile: dockerfile,
+		Tag:        tag,
+		Commit:     commit,
+		Ref:        ref,
+		Source:     source,
+		UnixSocket: sourceSupportsUnixSocket(srcDir),
+		BuiltAt:    time.Now(),
+	}
+	fmt.Printf("Building %s:%s (%s, CUDA arch %s, base %s)...\n", repo, tag, rb.Backend, rb.CudaArch, rb.BaseImage)
+	if !spec.UnixSocket {
+		fmt.Println("  note: this source has no unix-socket support in llama-server; load it with --network internal (or docker_network \"internal\")")
+	}
+	start := time.Now()
+	cmd := exec.Command(dockerBin, dockerBuildArgs(spec)...)
+	cmd.Env = append(os.Environ(), "DOCKER_BUILDKIT=1")
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("docker build failed: %w", err)
+	}
+	fmt.Printf("✓ Built %s:%s in %s\n", repo, tag, time.Since(start).Round(time.Second))
+	pruneBuildImages(name, rb.Keep, true)
+	return nil
+}
+
+// findBuildImage returns the image ref for a build, optionally pinned to a
+// commit prefix ("" = :latest).
+func findBuildImage(name, commit string) (string, error) {
+	repo := buildRepo(name)
+	if commit == "" {
+		if _, err := dockerExec("image", "inspect", repo+":latest"); err != nil {
+			return "", fmt.Errorf("build %q has no image yet; run `llmctl build %s`", name, name)
+		}
+		return repo + ":latest", nil
+	}
+	imgs, err := listBuildImages(name)
+	if err != nil {
+		return "", err
+	}
+	commit = strings.ToLower(commit)
+	var matches []string
+	for _, img := range imgs {
+		if img.Tag != "latest" && (strings.HasPrefix(img.Tag, commit) || strings.HasPrefix(commit, img.Tag)) {
+			matches = append(matches, img.Ref)
+		}
+	}
+	switch len(matches) {
+	case 0:
+		return "", fmt.Errorf("build %q has no image for commit %s; run `llmctl build %s --ref <full sha>`", name, commit, name)
+	case 1:
+		return matches[0], nil
+	}
+	return "", fmt.Errorf("commit %s is ambiguous for build %q: %s", commit, name, strings.Join(matches, ", "))
+}
+
+// buildImageInfo returns a build image's commit and unix-socket support.
+func buildImageInfo(image string) (commit string, unixSocket bool, err error) {
+	out, err := dockerExec("image", "inspect", "-f",
+		fmt.Sprintf("{{index .Config.Labels %q}}|{{index .Config.Labels %q}}", buildCommitLabel, buildSocketLabel), image)
+	if err != nil {
+		return "", false, err
+	}
+	f := strings.SplitN(strings.TrimSpace(out), "|", 2)
+	if len(f) != 2 {
+		return "", false, fmt.Errorf("unexpected inspect output %q", out)
+	}
+	return f[0], f[1] == "true", nil
+}
+
+// splitBuildRef splits "name@commit" into its parts.
+func shortCommit(c string) string {
+	if len(c) > 12 {
+		return c[:12]
+	}
+	return c
+}
+
+func splitBuildRef(ref string) (name, commit string) {
+	if i := strings.LastIndex(ref, "@"); i >= 0 {
+		return ref[:i], ref[i+1:]
+	}
+	return ref, ""
+}
+
+var (
+	githubURLRe   = regexp.MustCompile(`^(?:https?://)?(?:www\.)?github\.com/([^/\s]+)/([^/\s#?]+?)(?:\.git)?(?:/(tree|pull|commit)/(.+?))?/?(?:[#?].*)?$`)
+	ownerRepoRe   = regexp.MustCompile(`^([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)$`)
+	reservedBuild = map[string]bool{"add": true, "rm": true, "remove": true, "ls": true, "list": true}
+)
+
+// parseBuildSource turns what a user pastes (a GitHub URL — repo, branch,
+// PR or commit page —, owner/repo, any git URL, or a local path) into a
+// BuildConfig and a suggested build name. ok is false if arg doesn't look
+// like a source (e.g. it is the name of a configured build).
+func parseBuildSource(arg string) (bc BuildConfig, name string, ok bool) {
+	if arg == "" {
+		return bc, "", false
+	}
+	if strings.HasPrefix(arg, "/") || strings.HasPrefix(arg, "./") || strings.HasPrefix(arg, "../") ||
+		strings.HasPrefix(arg, "~") || arg == "." {
+		p := expandHome(arg)
+		if abs, err := filepath.Abs(p); err == nil {
+			p = abs
+		}
+		return BuildConfig{Path: p}, filepath.Base(p), true
+	}
+	if m := githubURLRe.FindStringSubmatch(arg); m != nil {
+		owner, repo := m[1], m[2]
+		bc.Repo = "https://github.com/" + owner + "/" + repo
+		name = owner
+		switch m[3] {
+		case "tree":
+			bc.Ref = m[4]
+		case "pull":
+			n := strings.SplitN(m[4], "/", 2)[0] // drop /files, /commits, ...
+			bc.Ref = "#" + n
+			name = owner + "-pr" + n
+		case "commit":
+			bc.Ref = m[4]
+		}
+		return bc, name, true
+	}
+	if strings.Contains(arg, "://") || strings.HasPrefix(arg, "git@") {
+		base := arg[strings.LastIndexAny(arg, "/:")+1:]
+		return BuildConfig{Repo: arg}, strings.TrimSuffix(base, ".git"), true
+	}
+	if m := ownerRepoRe.FindStringSubmatch(arg); m != nil {
+		if _, err := os.Stat(arg); err != nil { // not a relative directory
+			return BuildConfig{Repo: "https://github.com/" + m[1] + "/" + m[2]}, m[1], true
+		}
+		p, _ := filepath.Abs(arg)
+		return BuildConfig{Path: p}, filepath.Base(p), true
+	}
+	return bc, "", false
+}
+
+// sanitizeBuildName makes a build name that is also a valid image/dir name.
+func sanitizeBuildName(name string) string {
+	n := strings.Trim(strings.TrimPrefix(buildRepo(name), "llmctl/"), "-.")
+	if n == "" || reservedBuild[n] {
+		n = "build-" + n
+	}
+	return n
+}
+
+// sameBuildSource reports whether two builds fetch the same thing.
+func sameBuildSource(a, b BuildConfig) bool {
+	return a.Repo == b.Repo && a.Path == b.Path && a.Ref == b.Ref
+}
+
+// uniqueBuildName returns name, or name-2, name-3... if name is taken by a
+// build with a different source. Reusing an identical source keeps the name.
+func uniqueBuildName(builds map[string]BuildConfig, name string, bc BuildConfig) string {
+	candidate := name
+	for i := 2; ; i++ {
+		existing, taken := builds[candidate]
+		if !taken || sameBuildSource(existing, bc) {
+			return candidate
+		}
+		candidate = fmt.Sprintf("%s-%d", name, i)
+	}
+}
+
+// buildFlags are the `llmctl build` flags that define (not just run) a build.
+type buildFlags struct {
+	Ref, Backend, CudaArch, Dockerfile string
+	CmakeArgs                          []string
+}
+
+func (f buildFlags) apply(bc *BuildConfig) {
+	if f.Ref != "" {
+		bc.Ref = f.Ref
+	}
+	if f.Backend != "" {
+		bc.Backend = f.Backend
+	}
+	if f.CudaArch != "" {
+		bc.CudaArch = f.CudaArch
+	}
+	if f.Dockerfile != "" {
+		bc.Dockerfile = f.Dockerfile
+	}
+	if len(f.CmakeArgs) > 0 {
+		bc.CmakeArgs = f.CmakeArgs
+	}
+}
+
+// addBuild stores a build in the config and returns its (possibly adjusted) name.
+func addBuild(cfg *Config, name string, bc BuildConfig) (string, error) {
+	if cfg.Builds == nil {
+		cfg.Builds = map[string]BuildConfig{}
+	}
+	if _, err := resolveBuildSpecOnly(name, bc); err != nil {
+		return "", err
+	}
+	cfg.Builds[name] = bc
+	return name, saveConfig(*cfg)
+}
+
+// resolveBuildSpecOnly validates a build without host probing (nvidia-smi).
+func resolveBuildSpecOnly(name string, bc BuildConfig) (resolvedBuild, error) {
+	if bc.CudaArch == "" {
+		bc.CudaArch = "0" // placeholder: arch is detected at build time
+	}
+	return resolveBuildConfig(name, bc)
+}
+
+// removeBuild deletes a build from the config plus its images and source.
+func removeBuild(cfg *Config, name string) error {
+	if _, ok := cfg.Builds[name]; !ok {
+		return fmt.Errorf("no build %q in config", name)
+	}
+	imgs, _ := listBuildImages(name)
+	inUse := inUseImageIDs()
+	for _, img := range imgs {
+		if inUse[img.ID] {
+			return fmt.Errorf("build %q is used by a loaded model (%s); unload it first", name, img.Ref)
+		}
+	}
+	for _, img := range imgs {
+		_, _ = dockerExec("image", "rm", img.Ref)
+	}
+	_ = os.RemoveAll(buildSourceDir(name))
+	delete(cfg.Builds, name)
+	return saveConfig(*cfg)
+}
+
+// cmdBuildCLI handles `llmctl build ...`.
+func cmdBuildCLI(cfg Config, args []string) {
+	usage := func() {
+		fmt.Fprintln(os.Stderr, `Usage:
+  llmctl build <name|source>... [--ref R] [--force] [--backend cuda|jetson] [--cuda-arch A] [--cmake-arg ARG]... [--dockerfile F]
+  llmctl build --all
+  llmctl build add <name> <source> [flags]
+  llmctl build rm <name>
+
+<source> is a GitHub URL (repo, /tree/<branch>, /pull/<N>, /commit/<sha>), owner/repo, any git URL, or a local path.`)
+		os.Exit(1)
+	}
+	var f buildFlags
+	var positional []string
+	force, all := false, false
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		val := func() string {
+			if k, v, ok := strings.Cut(a, "="); ok && strings.HasPrefix(k, "--") {
+				return v
+			}
+			if i+1 >= len(args) {
+				fmt.Fprintf(os.Stderr, "Error: %s needs a value\n", a)
+				os.Exit(1)
+			}
+			i++
+			return args[i]
+		}
+		flag, _, _ := strings.Cut(a, "=")
+		switch flag {
+		case "--ref":
+			f.Ref = val()
+		case "--backend":
+			f.Backend = val()
+		case "--cuda-arch":
+			f.CudaArch = val()
+		case "--dockerfile":
+			f.Dockerfile = val()
+		case "--cmake-arg":
+			f.CmakeArgs = append(f.CmakeArgs, val())
+		case "--force", "-f":
+			force = true
+		case "--all":
+			all = true
+		case "-h", "--help":
+			usage()
+		default:
+			if strings.HasPrefix(a, "-") {
+				fmt.Fprintf(os.Stderr, "Unknown flag: %s\n", a)
+				usage()
+			}
+			positional = append(positional, a)
+		}
+	}
+	fail := func(err error) {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+
+	if len(positional) > 0 && (positional[0] == "rm" || positional[0] == "remove") {
+		if len(positional) != 2 {
+			usage()
+		}
+		if err := removeBuild(&cfg, positional[1]); err != nil {
+			fail(err)
+		}
+		fmt.Printf("✓ Removed build %q (config, images, source)\n", positional[1])
+		return
+	}
+
+	if len(positional) > 0 && positional[0] == "add" {
+		if len(positional) != 3 {
+			usage()
+		}
+		bc, _, ok := parseBuildSource(positional[2])
+		if !ok {
+			fail(fmt.Errorf("%q is not a git URL, owner/repo or path", positional[2]))
+		}
+		f.apply(&bc)
+		name := sanitizeBuildName(positional[1])
+		if _, err := addBuild(&cfg, name, bc); err != nil {
+			fail(err)
+		}
+		fmt.Printf("✓ Added build %q. Build it with: llmctl build %s\n", name, name)
+		return
+	}
+
+	if all {
+		cmdBuild(cfg, nil, true, buildOptions{Ref: f.Ref, Force: force})
+		return
+	}
+	if len(positional) == 0 {
+		usage()
+	}
+
+	// Positional args are configured build names, or sources to add first.
+	defines := f.Backend != "" || f.CudaArch != "" || f.Dockerfile != "" || len(f.CmakeArgs) > 0
+	var names []string
+	refForRun := f.Ref
+	for _, arg := range positional {
+		if bc, ok := cfg.Builds[arg]; ok {
+			if defines {
+				f.apply(&bc)
+				bc.Ref = cfg.Builds[arg].Ref // --ref stays a one-off override for existing builds
+				if _, err := addBuild(&cfg, arg, bc); err != nil {
+					fail(err)
+				}
+			}
+			names = append(names, arg)
+			continue
+		}
+		bc, suggested, ok := parseBuildSource(arg)
+		if !ok {
+			fail(fmt.Errorf("no build %q in config, and it's not a git URL, owner/repo or path (see `llmctl builds`)", arg))
+		}
+		f.apply(&bc)
+		name := uniqueBuildName(cfg.Builds, sanitizeBuildName(suggested), bc)
+		if _, exists := cfg.Builds[name]; !exists {
+			if _, err := addBuild(&cfg, name, bc); err != nil {
+				fail(err)
+			}
+			fmt.Printf("Added build %q → %s\n", name, describeBuildSource(bc))
+		}
+		refForRun = "" // the ref is part of the new build's definition
+		names = append(names, name)
+	}
+	if refForRun != "" && len(names) != 1 {
+		fail(fmt.Errorf("--ref needs exactly one build"))
+	}
+	cmdBuild(cfg, names, false, buildOptions{Ref: refForRun, Force: force})
+	if len(names) == 1 {
+		fmt.Printf("\n  Try it: llmctl load <model> --build %s\n", names[0])
+	}
+}
+
+func describeBuildSource(bc BuildConfig) string {
+	if bc.Path != "" {
+		return bc.Path
+	}
+	ref := bc.Ref
+	if ref == "" {
+		ref = "HEAD"
+	}
+	return bc.Repo + " @ " + ref
+}
+
+func cmdBuild(cfg Config, names []string, all bool, opts buildOptions) {
+	if all {
+		names = names[:0]
+		for name := range cfg.Builds {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+	}
+	if len(names) == 0 {
+		fmt.Fprintln(os.Stderr, "Usage: llmctl build <name>... [--ref <ref>] [--force] | --all")
+		os.Exit(1)
+	}
+	failed := 0
+	for _, name := range names {
+		if err := runBuild(cfg, name, opts); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %s: %v\n", name, err)
+			failed++
+		}
+	}
+	if failed > 0 {
+		os.Exit(1)
+	}
+}
+
+func cmdBuilds(cfg Config) {
+	if len(cfg.Builds) == 0 {
+		fmt.Println("No builds configured. Add a `builds` section to ~/.llmctl.json.")
+		return
+	}
+	names := make([]string, 0, len(cfg.Builds))
+	for name := range cfg.Builds {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	usedBy := map[string][]string{}
+	for model, mc := range cfg.Models {
+		if mc.DockerBuild != nil {
+			b, _ := splitBuildRef(*mc.DockerBuild)
+			usedBy[b] = append(usedBy[b], model)
+		}
+	}
+	if cfg.Docker.Build != "" {
+		b, _ := splitBuildRef(cfg.Docker.Build)
+		usedBy[b] = append(usedBy[b], "(default)")
+	}
+
+	fmt.Printf("  %-16s %-8s %-14s %-12s %s\n", "NAME", "BACKEND", "LATEST", "BUILT", "SOURCE")
+	fmt.Printf("  %-16s %-8s %-14s %-12s %s\n", "────", "───────", "──────", "─────", "──────")
+	for _, name := range names {
+		bc := cfg.Builds[name]
+		source := describeBuildSource(bc)
+		backend := bc.Backend
+		if backend == "" {
+			backend = backendCUDA
+		}
+		latest, built := "-", "never"
+		imgs, _ := listBuildImages(name)
+		latestID := ""
+		for _, img := range imgs {
+			if img.Tag == "latest" {
+				latestID = img.ID
+				built = formatAge(img.Created)
+			}
+		}
+		count := 0
+		for _, img := range imgs {
+			if img.Tag == "latest" {
+				continue
+			}
+			count++
+			if img.ID == latestID {
+				latest = img.Tag
+				if len(latest) > 14 {
+					latest = latest[:14]
+				}
+			}
+		}
+		fmt.Printf("  %-16s %-8s %-14s %-12s %s\n", name, backend, latest, built, source)
+		if count > 1 {
+			fmt.Printf("    images: %d kept\n", count)
+		}
+		if models := usedBy[name]; len(models) > 0 {
+			sort.Strings(models)
+			fmt.Printf("    used by: %s\n", strings.Join(models, ", "))
+		}
+	}
+}
+
+func formatAge(t time.Time) string {
+	if t.IsZero() {
+		return "?"
+	}
+	d := time.Since(t)
+	switch {
+	case d < time.Hour:
+		return fmt.Sprintf("%dm ago", int(d.Minutes()))
+	case d < 48*time.Hour:
+		return fmt.Sprintf("%dh ago", int(d.Hours()))
+	}
+	return fmt.Sprintf("%dd ago", int(d.Hours()/24))
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -690,12 +2324,9 @@ func findInHFCache(modelsDir, name string) string {
 			continue
 		}
 		for _, e := range entries {
-			snapPath := filepath.Join(snapshotsDir, e.Name())
-			files, _ := os.ReadDir(snapPath)
-			for _, f := range files {
-				if f.Name() == parts[1] {
-					return filepath.Join(snapPath, f.Name())
-				}
+			candidate := filepath.Join(snapshotsDir, e.Name(), filepath.FromSlash(parts[1]))
+			if _, err := os.Stat(candidate); err == nil {
+				return candidate
 			}
 		}
 	}
@@ -899,21 +2530,21 @@ func markInstanceUsed(name string) {
 	}
 }
 
-func autoswitchModel(cfg Config, targetName string) (*url.URL, string, error) {
+func autoswitchModel(cfg Config, targetName string) (backendTarget, string, error) {
 	if !cfg.Autoswitch.Enabled {
-		return nil, "", fmt.Errorf("model %q is not loaded", targetName)
+		return backendTarget{}, "", fmt.Errorf("model %q is not loaded", targetName)
 	}
 
 	spec, err := resolveLoadSpec(cfg, loadOptions{ModelName: targetName})
 	if err != nil {
-		return nil, "", err
+		return backendTarget{}, "", err
 	}
 	if spec.ConfigKey == "" {
-		return nil, "", fmt.Errorf("model %q is not configured for autoswitch", targetName)
+		return backendTarget{}, "", fmt.Errorf("model %q is not configured for autoswitch", targetName)
 	}
 	mc := cfg.Models[spec.ConfigKey]
 	if !mc.AutoLoad {
-		return nil, "", fmt.Errorf("model %q is not configured with auto_load", targetName)
+		return backendTarget{}, "", fmt.Errorf("model %q is not configured with auto_load", targetName)
 	}
 	requiredMB := mc.VramMB
 
@@ -922,18 +2553,18 @@ func autoswitchModel(cfg Config, targetName string) (*url.URL, string, error) {
 
 	availableMB, err := autoswitchAvailableMB(cfg)
 	if err != nil {
-		return nil, "", err
+		return backendTarget{}, "", err
 	}
 
 	if availableMB < requiredMB {
 		candidates, hasCandidates := autoswitchEvictionPlan(reg, spec.InstanceName, requiredMB, availableMB)
 		if !hasCandidates {
-			return nil, "", fmt.Errorf("model %q needs %d MB but only %d MB available on GPU 0, no auto_unload models to evict", targetName, requiredMB, availableMB)
+			return backendTarget{}, "", fmt.Errorf("model %q needs %d MB but only %d MB available on GPU 0, no auto_unload models to evict", targetName, requiredMB, availableMB)
 		}
 		evicted := 0
 		for _, inst := range candidates {
 			if err := unloadInstance(inst.Name, false); err != nil {
-				return nil, "", fmt.Errorf("failed to evict %q: %w", inst.Name, err)
+				return backendTarget{}, "", fmt.Errorf("failed to evict %q: %w", inst.Name, err)
 			}
 			evicted++
 			newAvail, checkErr := autoswitchAvailableMB(cfg)
@@ -943,10 +2574,10 @@ func autoswitchModel(cfg Config, targetName string) (*url.URL, string, error) {
 		}
 		availableMB, err = autoswitchAvailableMB(cfg)
 		if err != nil {
-			return nil, "", err
+			return backendTarget{}, "", err
 		}
 		if availableMB < requiredMB {
-			return nil, "", fmt.Errorf("model %q needs %d MB but only %d MB available after evicting %d auto_unload models", targetName, requiredMB, availableMB, evicted)
+			return backendTarget{}, "", fmt.Errorf("model %q needs %d MB but only %d MB available after evicting %d auto_unload models", targetName, requiredMB, availableMB, evicted)
 		}
 	}
 
@@ -958,17 +2589,16 @@ func autoswitchModel(cfg Config, targetName string) (*url.URL, string, error) {
 		EstimatedVramMB: requiredMB,
 	})
 	if err != nil {
-		return nil, "", err
+		return backendTarget{}, "", err
 	}
 	if !healthy {
-		stopProcess(inst.PID)
+		stopInstance(inst)
 		reg := loadRegistry()
 		reg.Remove(inst.Name)
 		saveRegistry(reg)
-		return nil, "", fmt.Errorf("model %q did not become healthy before timeout", inst.Name)
+		return backendTarget{}, "", fmt.Errorf("model %q did not become healthy before timeout", inst.Name)
 	}
-	u, _ := url.Parse(fmt.Sprintf("http://127.0.0.1:%d", inst.Port))
-	return u, inst.Name, nil
+	return instanceBackend(inst), inst.Name, nil
 }
 
 //go:embed web/index.html
@@ -1045,7 +2675,7 @@ func handleUIModels(w http.ResponseWriter, cfg Config) {
 			if vram == 0 {
 				vram = cfg.Models[name].VramMB
 			}
-			out = append(out, row{name, isRunning(inst.PID), vram, inst.Port})
+			out = append(out, row{name, instanceRunning(*inst), vram, inst.Port})
 			continue
 		}
 		// Configured but not currently loaded.
@@ -1080,7 +2710,7 @@ func handleUIUnload(w http.ResponseWriter, r *http.Request, cfg Config) {
 		jsonResp(w, map[string]string{"error": "model not found"})
 		return
 	}
-	stopProcess(inst.PID)
+	stopInstance(*inst)
 	reg.Remove(name)
 	saveRegistry(reg)
 	addEvent("Unloaded model " + name)
@@ -1113,7 +2743,7 @@ func startProxy(cfg Config) {
 	}
 
 	var mu sync.RWMutex
-	backends := map[string]*url.URL{}
+	backends := map[string]backendTarget{}
 
 	rebuildBackends := func() {
 		mu.Lock()
@@ -1124,8 +2754,7 @@ func startProxy(cfg Config) {
 			delete(backends, k)
 		}
 		for _, inst := range r.Instances {
-			u, _ := url.Parse(fmt.Sprintf("http://127.0.0.1:%d", inst.Port))
-			backends[inst.Name] = u
+			backends[inst.Name] = instanceBackend(inst)
 		}
 	}
 	rebuildBackends()
@@ -1246,7 +2875,7 @@ func startProxy(cfg Config) {
 		if !ok && shouldFallbackToDefault(targetName, autoswitchErr) {
 			reg := loadRegistry()
 			if def := reg.Default(); def != nil {
-				target, _ = url.Parse(fmt.Sprintf("http://127.0.0.1:%d", def.Port))
+				target = instanceBackend(*def)
 				ok = true
 				routedName = def.Name
 				markInstanceUsed(routedName)
@@ -1265,10 +2894,11 @@ func startProxy(cfg Config) {
 		// Proxy the request
 		proxy := &httputil.ReverseProxy{
 			Director: func(req *http.Request) {
-				req.URL.Scheme = target.Scheme
-				req.URL.Host = target.Host
-				req.Host = target.Host
+				req.URL.Scheme = target.URL.Scheme
+				req.URL.Host = target.URL.Host
+				req.Host = target.URL.Host
 			},
+			Transport: target.Transport,
 		}
 		proxy.ServeHTTP(w, r)
 	})
@@ -1288,7 +2918,7 @@ func startProxy(cfg Config) {
 		if inst := reg.FindByName(name); inst != nil && inst.IsDefault {
 			def = " (default)"
 		}
-		fmt.Printf("    %-28s → %s%s\n", name, u.String(), def)
+		fmt.Printf("    %-28s → %s%s\n", name, u, def)
 	}
 	mu.RUnlock()
 	if routeCount == 0 && hasAutoLoadModels(cfg) {
@@ -1416,6 +3046,8 @@ type loadOptions struct {
 	Verbose         bool
 	AutoUnload      bool
 	EstimatedVramMB int
+	Build           string // one-off `--build name[@commit]`, overrides config
+	Network         string // one-off `--network mode`, overrides config
 }
 
 type loadSpec struct {
@@ -1454,11 +3086,36 @@ func resolveLoadSpec(cfg Config, opts loadOptions) (loadSpec, error) {
 		} else {
 			instanceName = deriveInstanceName(modelRef(cfg.ModelsDir, modelPath))
 		}
+		if opts.Build != "" {
+			// Run a one-off build next to the regular instance, not over it.
+			b, _ := splitBuildRef(opts.Build)
+			instanceName += "-" + b
+		}
 	}
 
 	configKey := modelConfigKey(cfg, opts.ModelName, instanceName, modelPath)
 	if configKey != "" {
 		cfg = configForModel(cfg, configKey)
+	}
+	if opts.Build != "" {
+		cfg.Docker.Build = opts.Build
+	}
+	if opts.Network != "" {
+		if !validNetworkMode(opts.Network) {
+			return loadSpec{}, fmt.Errorf("--network must be none, internal or bridge, got %q", opts.Network)
+		}
+		cfg.Docker.Network = opts.Network
+	}
+
+	// Isolated containers can't download, so fetch -hf models on the host
+	// and load them as local files.
+	hfRepo := opts.HFRepo
+	if hfRepo != "" && cfg.Docker.Network != netBridge {
+		local, err := prefetchHF(cfg, hfRepo, opts.Verbose)
+		if err != nil {
+			return loadSpec{}, err
+		}
+		modelPath, hfRepo = local, ""
 	}
 
 	var mmprojPath string
@@ -1481,7 +3138,7 @@ func resolveLoadSpec(cfg Config, opts loadOptions) (loadSpec, error) {
 		ModelName:    opts.ModelName,
 		InstanceName: instanceName,
 		ModelPath:    modelPath,
-		HFRepo:       opts.HFRepo,
+		HFRepo:       hfRepo,
 		MmprojPath:   mmprojPath,
 		AliasUsed:    aliasUsed,
 		ConfigKey:    configKey,
@@ -1511,22 +3168,66 @@ func loadInstance(cfg Config, opts loadOptions) (Instance, bool, error) {
 	reg.CleanDead()
 
 	if existing := reg.FindByName(spec.InstanceName); existing != nil {
-		if isRunning(existing.PID) {
-			if opts.Verbose {
-				fmt.Printf("Replacing instance '%s'...\n", spec.InstanceName)
-			}
-			stopProcess(existing.PID)
+		if opts.Verbose {
+			fmt.Printf("Replacing instance '%s'...\n", spec.InstanceName)
 		}
+		stopInstance(*existing)
 		reg.Remove(spec.InstanceName)
 	}
 
-	backendPort := reg.NextPort()
+	network := cfg.Docker.Network
+	if !validNetworkMode(network) {
+		return Instance{}, false, fmt.Errorf("invalid docker network mode %q (want none, internal or bridge)", network)
+	}
+	container := containerName(spec.InstanceName)
+
+	// A model using an llmctl build runs that build's (local) image.
+	buildName, buildCommit := "", ""
+	if cfg.Docker.Build != "" {
+		name, pin := splitBuildRef(cfg.Docker.Build)
+		if _, ok := cfg.Builds[name]; !ok {
+			return Instance{}, false, fmt.Errorf("build %q is not configured; add it with `llmctl build <url>` (see `llmctl builds`)", name)
+		}
+		image, err := findBuildImage(name, pin)
+		if err != nil {
+			return Instance{}, false, err
+		}
+		commit, unixSocket, err := buildImageInfo(image)
+		if err != nil {
+			return Instance{}, false, fmt.Errorf("inspecting %s: %w", image, err)
+		}
+		if network == netNone && !unixSocket {
+			return Instance{}, false, fmt.Errorf("build %q (%s) has no unix-socket support in llama-server, so it can't run with docker network \"none\"; load with --network internal or set \"docker_network\": \"internal\" for this model", name, shortCommit(commit))
+		}
+		cfg.Docker.Image = image
+		buildName, buildCommit = name, commit
+	}
+
+	// Network none: llama-server listens on a unix socket in a per-instance
+	// directory; no TCP port is used.
+	backendPort := 0
+	sockPath := ""
+	if network == netNone {
+		dir := socketDir(container)
+		removeSocketDir(container)
+		if err := os.MkdirAll(dir, 0700); err != nil {
+			return Instance{}, false, fmt.Errorf("creating socket dir: %w", err)
+		}
+		sockPath = filepath.Join(dir, "llama.sock")
+	} else {
+		backendPort = reg.NextPort()
+	}
+
 	displayName := spec.ModelPath
 	if spec.HFRepo != "" {
 		displayName = spec.HFRepo
 	}
 	if opts.Verbose {
-		fmt.Printf("Loading %s as '%s' (backend :%d)...\n", shortName(displayName), spec.InstanceName, backendPort)
+		where := fmt.Sprintf("backend :%d", backendPort)
+		if sockPath != "" {
+			where = "no network, unix socket"
+		}
+		fmt.Printf("Loading %s as '%s' (%s)...\n", shortName(displayName), spec.InstanceName, where)
 	}
 	if err := validateExtraArgs(cfg.ExtraArgs); err != nil {
 		return Instance{}, false, err
@@ -1538,11 +3239,15 @@ func loadInstance(cfg Config, opts loadOptions) (Instance, bool, error) {
 	} else {
 		args = append(args, "--model", spec.ModelPath)
 	}
-	args = append(args,
-		"--host", "127.0.0.1",
-		"--port", strconv.Itoa(backendPort),
-		"--ctx-size", strconv.Itoa(cfg.CtxSize),
-	)
+	if sockPath != "" {
+		// llama-server binds a unix socket when --host ends in .sock.
+		args = append(args, "--host", sockPath)
+	} else {
+		// Inside the container llama-server must listen on all interfaces;
+		// it is only reachable via 127.0.0.1 (bridge) or the internal network.
+		args = append(args, "--host", "0.0.0.0", "--port", strconv.Itoa(backendPort))
+	}
+	args = append(args, "--ctx-size", strconv.Itoa(cfg.CtxSize))
 	if cfg.GpuLayers != 0 {
 		args = append(args, "--n-gpu-layers", strconv.Itoa(cfg.GpuLayers))
 	}
@@ -1554,22 +3259,65 @@ func loadInstance(cfg Config, opts loadOptions) (Instance, bool, error) {
 	}
 	args = append(args, cfg.ExtraArgs...)
 
-	cmd := exec.Command(cfg.ServerBin, args...)
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
-
-	logDir := filepath.Join(homeDir(), ".llmctl-logs")
-	os.MkdirAll(logDir, 0755)
-	logFile, _ := os.Create(filepath.Join(logDir, spec.InstanceName+".log"))
-	cmd.Stdout = logFile
-	cmd.Stderr = logFile
-
-	if err := cmd.Start(); err != nil {
-		return Instance{}, false, fmt.Errorf("error starting server: %w; is %q installed and in PATH?", err, cfg.ServerBin)
+	var files []string
+	if spec.HFRepo == "" {
+		files = append(files, spec.ModelPath)
 	}
-	exitCh := make(chan error, 1)
-	go func() {
-		exitCh <- cmd.Wait()
-	}()
+	if spec.MmprojPath != "" {
+		files = append(files, spec.MmprojPath)
+	}
+	// The HF cache is only mounted (read-write) when the container may
+	// download models itself, i.e. on the bridge network.
+	hfCache := ""
+	if network == netBridge && cfg.Docker.HFCacheDir != "" {
+		hfCache = cfg.Docker.HFCacheDir
+		// Create it as the current user; otherwise docker creates it as root.
+		_ = os.MkdirAll(hfCache, 0755)
+	}
+	mounts := backendMounts(cfg.ModelsDir, hfCache, files, cfg.ExtraArgs)
+	if sockPath != "" {
+		mounts = append(mounts, containerMount{Host: filepath.Dir(sockPath)})
+	}
+	runArgs := dockerRunArgs(dockerRunSpec{
+		Docker:     cfg.Docker,
+		Container:  container,
+		Instance:   spec.InstanceName,
+		Port:       backendPort,
+		Mounts:     mounts,
+		ServerArgs: args,
+	})
+
+	if buildName == "" {
+		if err := ensureImage(cfg.Docker.Image, opts.Verbose); err != nil {
+			return Instance{}, false, fmt.Errorf("error pulling image %s: %w", cfg.Docker.Image, err)
+		}
+	}
+	if network == netInternal {
+		if err := ensureInternalNetwork(); err != nil {
+			return Instance{}, false, fmt.Errorf("error creating network %s: %w", internalNetwork, err)
+		}
+	}
+	// Clear any leftover container with the same name (e.g. from a crash).
+	_, _ = dockerExec("rm", "-f", container)
+	if _, err := dockerExec(runArgs...); err != nil {
+		_, _ = dockerExec("rm", "-f", container)
+		removeSocketDir(container)
+		return Instance{}, false, fmt.Errorf("error starting container: %w", err)
+	}
+	invalidateLiveContainers()
+
+	addr := ""
+	switch network {
+	case netInternal:
+		ip, err := containerIP(container, internalNetwork)
+		if err != nil {
+			removeContainer(container, instanceLogPath(spec.InstanceName))
+			return Instance{}, false, err
+		}
+		addr = net.JoinHostPort(ip, strconv.Itoa(backendPort))
+	case netBridge:
+		addr = fmt.Sprintf("127.0.0.1:%d", backendPort)
+	}
 
 	isDefault := len(reg.Instances) == 0
 
@@ -1577,12 +3325,17 @@ func loadInstance(cfg Config, opts loadOptions) (Instance, bool, error) {
 		Name:            spec.InstanceName,
 		Model:           spec.ModelPath,
 		Mmproj:          spec.MmprojPath,
-		PID:             cmd.Process.Pid,
+		Container:       container,
+		Image:           cfg.Docker.Image,
+		Build:           buildName,
+		Commit:          buildCommit,
+		Network:         network,
+		Socket:          sockPath,
+		Addr:            addr,
 		Port:            backendPort,
 		IsDefault:       isDefault,
 		CtxSize:         cfg.CtxSize,
 		GpuLayers:       cfg.GpuLayers,
-		ServerBin:       cfg.ServerBin,
 		ExtraArgs:       cfg.ExtraArgs,
 		AutoUnload:      autoUnload,
 		EstimatedVramMB: estimatedVramMB,
@@ -1598,12 +3351,17 @@ func loadInstance(cfg Config, opts loadOptions) (Instance, bool, error) {
 	if timeout <= 0 {
 		timeout = 60 * time.Second
 	}
-	if waitForHealth(backendPort, timeout) {
+	target := instanceBackend(inst)
+	healthy, exited, exitCode := waitForHealth(target, container, timeout)
+	if healthy {
 		if opts.Verbose {
-			fmt.Printf("✓ '%s' ready (PID %d, backend :%d)\n", spec.InstanceName, inst.PID, backendPort)
+			fmt.Printf("✓ '%s' ready (container %s, network %s)\n", spec.InstanceName, container, network)
 		}
 	} else {
-		if exitErr, exited := backendExited(exitCh); exited {
+		if exited {
+			logPath := instanceLogPath(spec.InstanceName)
+			removeContainer(container, logPath)
+			removeSocketDir(container)
 			reg := loadRegistry()
 			reg.Remove(spec.InstanceName)
 			if isDefault && len(reg.Instances) > 0 {
@@ -1611,18 +3369,15 @@ func loadInstance(cfg Config, opts loadOptions) (Instance, bool, error) {
 			}
 			saveRegistry(reg)
 			if opts.Verbose {
-				fmt.Fprintf(os.Stderr, "Error: '%s' exited before becoming healthy. Check: llmctl logs %s\n",
-					spec.InstanceName, spec.InstanceName)
-				if exitErr != nil {
-					fmt.Fprintf(os.Stderr, "Backend exit: %v\n", exitErr)
-				}
-				printLogTail(filepath.Join(logDir, spec.InstanceName+".log"), 20)
+				fmt.Fprintf(os.Stderr, "Error: '%s' exited (code %d) before becoming healthy. Check: llmctl logs %s\n",
+					spec.InstanceName, exitCode, spec.InstanceName)
+				printLogTail(logPath, 20)
 			}
-			return Instance{}, false, fmt.Errorf("%q exited before becoming healthy: %v", spec.InstanceName, exitErr)
+			return Instance{}, false, fmt.Errorf("%q exited with code %d before becoming healthy", spec.InstanceName, exitCode)
 		}
 		if opts.Verbose {
-			fmt.Printf("⚠ '%s' started (PID %d) but not yet healthy. Check: llmctl logs %s\n",
-				spec.InstanceName, inst.PID, spec.InstanceName)
+			fmt.Printf("⚠ '%s' started (container %s) but not yet healthy. Check: llmctl logs %s\n",
+				spec.InstanceName, container, spec.InstanceName)
 		}
 		return inst, false, nil
 	}
@@ -1633,20 +3388,19 @@ func loadInstance(cfg Config, opts loadOptions) (Instance, bool, error) {
 	if opts.Verbose {
 		fmt.Printf("\n  Proxy endpoint: http://%s:%d/v1\n", displayHost(cfg.Host), cfg.Port)
 		fmt.Printf("  Model name:     %s\n", spec.InstanceName)
-		fmt.Printf("  Direct backend: http://127.0.0.1:%d\n", backendPort)
+		if sockPath != "" {
+			fmt.Printf("  Direct backend: curl --unix-socket %s http://localhost/health\n", sockPath)
+		} else {
+			fmt.Printf("  Direct backend: %s\n", target)
+		}
 	}
 	return inst, true, nil
 }
 
-func cmdLoad(cfg Config, modelName string, instanceName string, hfRepo string, mmprojArg string) {
-	_, _, err := loadInstance(cfg, loadOptions{
-		ModelName:    modelName,
-		InstanceName: instanceName,
-		HFRepo:       hfRepo,
-		MmprojArg:    mmprojArg,
-		WaitTimeout:  60 * time.Second,
-		Verbose:      true,
-	})
+func cmdLoad(cfg Config, opts loadOptions) {
+	opts.WaitTimeout = 60 * time.Second
+	opts.Verbose = true
+	_, _, err := loadInstance(cfg, opts)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
@@ -1677,9 +3431,9 @@ func unloadInstance(name string, verbose bool) error {
 	}
 
 	if verbose {
-		fmt.Printf("Stopping '%s' (PID %d)...\n", inst.Name, inst.PID)
+		fmt.Printf("Stopping '%s' (container %s)...\n", inst.Name, inst.Container)
 	}
-	stopProcess(inst.PID)
+	stopInstance(*inst)
 	wasDefault := inst.IsDefault
 	reg.Remove(inst.Name)
 
@@ -1711,9 +3465,17 @@ func cmdStopAll() {
 		stopProcess(reg.ProxyPID)
 	}
 	for _, inst := range reg.Instances {
-		if isRunning(inst.PID) {
-			fmt.Printf("Stopping '%s' (PID %d)...\n", inst.Name, inst.PID)
-			stopProcess(inst.PID)
+		if inst.Container != "" {
+			fmt.Printf("Stopping '%s' (container %s)...\n", inst.Name, inst.Container)
+			stopInstance(inst)
+		}
+	}
+	// Also remove any llmctl-managed containers the registry lost track of.
+	if out, err := dockerExec("ps", "-a", "--filter", "label="+containerLabel, "--format", "{{.Names}}"); err == nil {
+		for _, name := range strings.Fields(out) {
+			fmt.Printf("Removing orphan container %s...\n", name)
+			_, _ = dockerExec("stop", "-t", "10", name)
+			removeContainer(name, "")
 		}
 	}
 	reg.Instances = nil
@@ -1756,8 +3518,8 @@ func cmdPS() {
 
 	fmt.Println("Loaded models:")
 	fmt.Println()
-	fmt.Printf("  %-3s %-20s %-26s %-8s %-8s %-8s %s\n", "", "NAME", "MODEL", "PID", "PORT", "CTX", "STATUS")
-	fmt.Printf("  %-3s %-20s %-26s %-8s %-8s %-8s %s\n", "", "────", "─────", "───", "────", "───", "──────")
+	fmt.Printf("  %-3s %-20s %-26s %-8s %-8s %s\n", "", "NAME", "MODEL", "PORT", "CTX", "STATUS")
+	fmt.Printf("  %-3s %-20s %-26s %-8s %-8s %s\n", "", "────", "─────", "────", "───", "──────")
 
 	for _, inst := range reg.Instances {
 		marker := "  "
@@ -1765,18 +3527,8 @@ func cmdPS() {
 			marker = "★ "
 		}
 		status := "stopped"
-		if isRunning(inst.PID) {
-			resp, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d/health", inst.Port))
-			if err == nil {
-				resp.Body.Close()
-				if resp.StatusCode == 200 {
-					status = "healthy"
-				} else {
-					status = "loading"
-				}
-			} else {
-				status = "running"
-			}
+		if instanceRunning(inst) {
+			status = backendStatus(inst)
 		}
 		model := shortName(inst.Model)
 		if len(model) > 26 {
@@ -1786,13 +3538,20 @@ func cmdPS() {
 		if inst.CtxSize > 0 {
 			ctxStr = strconv.Itoa(inst.CtxSize)
 		}
-		fmt.Printf("  %s%-20s %-26s %-8d %-8d %-8s %s\n",
-			marker, inst.Name, model, inst.PID, inst.Port, ctxStr, status)
+		portStr := strconv.Itoa(inst.Port)
+		if inst.Socket != "" {
+			portStr = "socket"
+		}
+		fmt.Printf("  %s%-20s %-26s %-8s %-8s %s\n",
+			marker, inst.Name, model, portStr, ctxStr, status)
 		if inst.AutoUnload || inst.EstimatedVramMB > 0 {
 			fmt.Printf("    autoswitch: auto_unload=%t estimated_vram_mb=%d\n", inst.AutoUnload, inst.EstimatedVramMB)
 		}
 		if len(inst.Aliases) > 0 {
 			fmt.Printf("    aliases: %s\n", strings.Join(inst.Aliases, ", "))
+		}
+		if inst.Build != "" {
+			fmt.Printf("    build: %s @ %s\n", inst.Build, shortCommit(inst.Commit))
 		}
 	}
 
@@ -1825,18 +3584,8 @@ func cmdInfo(name string) {
 	}
 
 	status := "stopped"
-	if isRunning(inst.PID) {
-		resp, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d/health", inst.Port))
-		if err == nil {
-			resp.Body.Close()
-			if resp.StatusCode == 200 {
-				status = "healthy"
-			} else {
-				status = "loading"
-			}
-		} else {
-			status = "running"
-		}
+	if instanceRunning(*inst) {
+		status = backendStatus(*inst)
 	}
 
 	fmt.Printf("Instance:   %s\n", inst.Name)
@@ -1847,13 +3596,19 @@ func cmdInfo(name string) {
 		fmt.Println("Default:    ★ yes")
 	}
 	fmt.Printf("Status:     %s\n", status)
-	fmt.Printf("PID:        %d\n", inst.PID)
+	fmt.Printf("Container:  %s\n", inst.Container)
+	fmt.Printf("Image:      %s\n", inst.Image)
+	if inst.Build != "" {
+		fmt.Printf("Build:      %s @ %s\n", inst.Build, inst.Commit)
+	}
 	fmt.Printf("Model:      %s\n", inst.Model)
 	if inst.Mmproj != "" {
 		fmt.Printf("Mmproj:     %s\n", inst.Mmproj)
 	}
-	fmt.Printf("Backend:    http://127.0.0.1:%d\n", inst.Port)
-	fmt.Printf("Server:     %s\n", inst.ServerBin)
+	fmt.Printf("Backend:    %s\n", instanceBackend(*inst))
+	if inst.Network != "" {
+		fmt.Printf("Network:    %s\n", inst.Network)
+	}
 	fmt.Printf("Ctx size:   %d\n", inst.CtxSize)
 	fmt.Printf("GPU layers: %d\n", inst.GpuLayers)
 	if inst.AutoUnload || inst.EstimatedVramMB > 0 || inst.LastUsedAt > 0 {
@@ -1962,15 +3717,27 @@ func cmdList(cfg Config) {
 }
 
 func cmdLogs(name string) {
-	logDir := filepath.Join(homeDir(), ".llmctl-logs")
-	logPath := filepath.Join(logDir, name+".log")
+	// Running instance: read straight from the container.
+	reg := loadRegistry()
+	if inst := findInstanceByNameFuzzy(reg, name); inst != nil && inst.Container != "" {
+		if _, _, exists := containerState(inst.Container); exists {
+			cmd := exec.Command(dockerBin, "logs", "--tail", "50", inst.Container)
+			cmd.Stdout = os.Stdout
+			cmd.Stderr = os.Stdout // llama-server logs to stderr
+			if cmd.Run() == nil {
+				return
+			}
+		}
+	}
 
+	// Stopped instance: logs saved when the container was removed.
+	logPath := instanceLogPath(name)
 	if _, err := os.Stat(logPath); err != nil {
-		entries, _ := os.ReadDir(logDir)
+		entries, _ := os.ReadDir(logDir())
 		lower := strings.ToLower(name)
 		for _, e := range entries {
 			if strings.Contains(strings.ToLower(e.Name()), lower) {
-				logPath = filepath.Join(logDir, e.Name())
+				logPath = filepath.Join(logDir(), e.Name())
 				break
 			}
 		}
@@ -2030,6 +3797,191 @@ func parsePullTarget(target string) (user string, repoName string, repoID string
 	return user, repoName, repoID, specificFile, nil
 }
 
+// f16Re matches an F16 (not BF16) file name, the mmproj llama.cpp prefers.
+var f16Re = regexp.MustCompile(`(?i)(^|[^b])f16`)
+
+var splitGGUFRe = regexp.MustCompile(`(?i)-(\d{5})-of-(\d{5})\.gguf$`)
+
+// hfSelectFiles picks the repo files to fetch for `-hf repo[:tag]`, mirroring
+// llama.cpp: the gguf whose name contains the quant tag (default Q4_K_M,
+// falling back to the first gguf when no tag was given), all parts of a split
+// model, and an mmproj file if the repo has one. A tag ending in .gguf names
+// the file directly.
+func hfSelectFiles(files []string, tag string) (model []string, mmproj string, err error) {
+	var ggufs, mmprojs []string
+	for _, f := range files {
+		lower := strings.ToLower(f)
+		if !strings.HasSuffix(lower, ".gguf") {
+			continue
+		}
+		if strings.HasPrefix(strings.ToLower(path.Base(f)), "mmproj") {
+			mmprojs = append(mmprojs, f)
+		} else {
+			ggufs = append(ggufs, f)
+		}
+	}
+	sort.Strings(ggufs)
+	sort.Strings(mmprojs)
+	if len(ggufs) == 0 {
+		return nil, "", fmt.Errorf("no .gguf files in repo")
+	}
+
+	var chosen string
+	if strings.HasSuffix(strings.ToLower(tag), ".gguf") {
+		for _, f := range ggufs {
+			if f == tag || path.Base(f) == tag {
+				chosen = f
+				break
+			}
+		}
+		if chosen == "" {
+			return nil, "", fmt.Errorf("file %q not found in repo", tag)
+		}
+	} else {
+		want := tag
+		if want == "" {
+			want = "Q4_K_M"
+		}
+		want = strings.ToLower(want)
+		for _, f := range ggufs {
+			if strings.Contains(strings.ToLower(f), want) {
+				chosen = f
+				break
+			}
+		}
+		if chosen == "" {
+			if tag != "" {
+				return nil, "", fmt.Errorf("no .gguf matching %q; available: %s", tag, strings.Join(ggufs, ", "))
+			}
+			chosen = ggufs[0]
+		}
+	}
+
+	if m := splitGGUFRe.FindStringSubmatchIndex(chosen); m != nil {
+		stem := chosen[:m[0]]
+		total := chosen[m[4]:m[5]]
+		for _, f := range ggufs {
+			if sm := splitGGUFRe.FindStringSubmatchIndex(f); sm != nil && f[:sm[0]] == stem && f[sm[4]:sm[5]] == total {
+				model = append(model, f)
+			}
+		}
+	} else {
+		model = []string{chosen}
+	}
+
+	if len(mmprojs) > 0 {
+		mmproj = mmprojs[0]
+		for _, f := range mmprojs {
+			if f16Re.MatchString(path.Base(f)) {
+				mmproj = f
+				break
+			}
+		}
+	}
+	return model, mmproj, nil
+}
+
+func hfListFiles(user, repoName string) ([]string, error) {
+	apiURL := fmt.Sprintf("https://huggingface.co/api/models/%s/%s", user, repoName)
+	resp, err := http.Get(apiURL)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("huggingface API %s: %s", apiURL, resp.Status)
+	}
+	var repoInfo struct {
+		Siblings []struct {
+			Filename string `json:"rfilename"`
+		} `json:"siblings"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&repoInfo); err != nil {
+		return nil, err
+	}
+	files := make([]string, 0, len(repoInfo.Siblings))
+	for _, s := range repoInfo.Siblings {
+		files = append(files, s.Filename)
+	}
+	return files, nil
+}
+
+// hfDownloadCmd builds the host-side huggingface_hub download command that
+// stores the file in the HF cache layout under models_dir.
+func hfDownloadCmd(cfg Config, repoID, file string) (*exec.Cmd, error) {
+	var cmd *exec.Cmd
+	if p, err := exec.LookPath("hf"); err == nil {
+		cmd = exec.Command(p, "download", repoID, file)
+	} else if p, err := exec.LookPath("huggingface-cli"); err == nil {
+		cmd = exec.Command(p, "download", repoID, file)
+	} else if p, err := exec.LookPath("python3"); err == nil {
+		cmd = exec.Command(p, "-m", "huggingface_hub", "download", repoID, file)
+	} else if p, err := exec.LookPath("python"); err == nil {
+		cmd = exec.Command(p, "-m", "huggingface_hub", "download", repoID, file)
+	} else {
+		return nil, fmt.Errorf("huggingface_hub not installed (pip install huggingface_hub)")
+	}
+	cmd.Env = append(os.Environ(), "HF_HOME="+cfg.ModelsDir)
+	return cmd, nil
+}
+
+// prefetchHF downloads the files `-hf repo[:tag]` needs into models_dir on
+// the host and returns the local model path (first part for split models).
+func prefetchHF(cfg Config, hfRepo string, verbose bool) (string, error) {
+	user, repoName, repoID, tag, err := parsePullTarget(hfRepo)
+	if err != nil {
+		return "", fmt.Errorf("invalid -hf repo %q", hfRepo)
+	}
+	cacheKey := func(f string) string { return "models--" + user + "--" + repoName + "/" + f }
+
+	// A tag naming a file that is already cached needs no network.
+	if strings.HasSuffix(strings.ToLower(tag), ".gguf") {
+		if p := findInHFCache(cfg.ModelsDir, cacheKey(tag)); p != "" {
+			return p, nil
+		}
+	}
+
+	files, err := hfListFiles(user, repoName)
+	if err != nil {
+		return "", fmt.Errorf("listing %s: %w", repoID, err)
+	}
+	modelFiles, mmproj, err := hfSelectFiles(files, tag)
+	if err != nil {
+		return "", fmt.Errorf("%s: %w", repoID, err)
+	}
+	toFetch := append([]string{}, modelFiles...)
+	if mmproj != "" {
+		toFetch = append(toFetch, mmproj)
+	}
+	for _, f := range toFetch {
+		if findInHFCache(cfg.ModelsDir, cacheKey(f)) != "" {
+			continue
+		}
+		if verbose {
+			fmt.Printf("Downloading %s:%s on the host (containers have no network)...\n", repoID, f)
+		}
+		cmd, err := hfDownloadCmd(cfg, repoID, f)
+		if err != nil {
+			return "", err
+		}
+		if verbose {
+			cmd.Stdout = os.Stdout
+			cmd.Stderr = os.Stderr
+			err = cmd.Run()
+		} else if out, cerr := cmd.CombinedOutput(); cerr != nil {
+			err = fmt.Errorf("%v: %s", cerr, strings.TrimSpace(string(out)))
+		}
+		if err != nil {
+			return "", fmt.Errorf("downloading %s:%s: %w", repoID, f, err)
+		}
+	}
+	p := findInHFCache(cfg.ModelsDir, cacheKey(modelFiles[0]))
+	if p == "" {
+		return "", fmt.Errorf("downloaded %s:%s but could not find it under %s", repoID, modelFiles[0], cfg.ModelsDir)
+	}
+	return p, nil
+}
+
 func cmdPull(cfg Config, repo string) {
 	user, repoName, repoID, specificFile, err := parsePullTarget(repo)
 	if err != nil {
@@ -2038,26 +3990,16 @@ func cmdPull(cfg Config, repo string) {
 	}
 
 	if specificFile == "" {
-		apiURL := fmt.Sprintf("https://huggingface.co/api/models/%s/%s", user, repoName)
-		resp, err := http.Get(apiURL)
+		files, err := hfListFiles(user, repoName)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
 		}
-		body, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
-
-		var repoInfo struct {
-			Siblings []struct {
-				Filename string `json:"rfilename"`
-			} `json:"siblings"`
-		}
-		json.Unmarshal(body, &repoInfo)
 
 		var ggufFiles []string
-		for _, s := range repoInfo.Siblings {
-			if strings.HasSuffix(strings.ToLower(s.Filename), ".gguf") {
-				ggufFiles = append(ggufFiles, s.Filename)
+		for _, f := range files {
+			if strings.HasSuffix(strings.ToLower(f), ".gguf") {
+				ggufFiles = append(ggufFiles, f)
 			}
 		}
 
@@ -2103,27 +4045,14 @@ func cmdPull(cfg Config, repo string) {
 	fmt.Println("  (This uses huggingface_hub to populate the proper cache format)")
 	fmt.Println("  Press Ctrl+C to cancel")
 
-	var cmd *exec.Cmd
-	env := os.Environ()
-	env = append(env, "HF_HOME="+cfg.ModelsDir)
-
-	if p, err := exec.LookPath("hf"); err == nil {
-		cmd = exec.Command(p, "download", repoID, specificFile)
-	} else if p, err := exec.LookPath("huggingface-cli"); err == nil {
-		cmd = exec.Command(p, "download", repoID, specificFile)
-	} else if p, err := exec.LookPath("python3"); err == nil {
-		cmd = exec.Command(p, "-m", "huggingface_hub", "download", repoID, specificFile)
-	} else if p, err := exec.LookPath("python"); err == nil {
-		cmd = exec.Command(p, "-m", "huggingface_hub", "download", repoID, specificFile)
-	} else {
-		fmt.Fprintf(os.Stderr, "Error: huggingface_hub not installed.\n")
-		fmt.Fprintf(os.Stderr, "  Run: pip install huggingface_hub\n")
+	cmd, err := hfDownloadCmd(cfg, repoID, specificFile)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	cmd.Stdin = os.Stdin
-	cmd.Env = env
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
@@ -2159,7 +4088,7 @@ func cmdRM(cfg Config, modelName string) {
 	}
 	reg := loadRegistry()
 	for _, inst := range reg.Instances {
-		if inst.Model == modelPath && isRunning(inst.PID) {
+		if inst.Model == modelPath && instanceRunning(inst) {
 			fmt.Fprintf(os.Stderr, "Error: model loaded as '%s'. Unload first.\n", inst.Name)
 			os.Exit(1)
 		}
@@ -2178,7 +4107,23 @@ func cmdConfig(cfg Config) {
 	fmt.Println("Configuration:")
 	fmt.Printf("  Config:      %s\n", configPath())
 	fmt.Printf("  Models dir:  %s\n", cfg.ModelsDir)
-	fmt.Printf("  Server bin:  %s\n", cfg.ServerBin)
+	fmt.Println("  Docker:")
+	fmt.Printf("    bin:          %s\n", cfg.Docker.Bin)
+	fmt.Printf("    image:        %s\n", cfg.Docker.Image)
+	if cfg.Docker.Build != "" {
+		fmt.Printf("    build:        %s\n", cfg.Docker.Build)
+	}
+	if cfg.Docker.Entrypoint != "" {
+		fmt.Printf("    entrypoint:   %s\n", cfg.Docker.Entrypoint)
+	}
+	fmt.Printf("    gpu:          %s\n", cfg.Docker.GPU)
+	fmt.Printf("    network:      %s\n", cfg.Docker.Network)
+	fmt.Printf("    read_only:    %t\n", cfg.Docker.readOnly())
+	fmt.Printf("    pids_limit:   %d\n", cfg.Docker.PidsLimit)
+	fmt.Printf("    hf_cache_dir: %s\n", cfg.Docker.HFCacheDir)
+	if len(cfg.Docker.Args) > 0 {
+		fmt.Printf("    args:         %s\n", strings.Join(cfg.Docker.Args, " "))
+	}
 	fmt.Printf("  Proxy:       %s:%d\n", cfg.Host, cfg.Port)
 	fmt.Printf("  GPU layers:  %d (-1 = all)\n", cfg.GpuLayers)
 	fmt.Printf("  Ctx size:    %d\n", cfg.CtxSize)
@@ -2201,12 +4146,43 @@ func cmdConfig(cfg Config) {
 			fmt.Printf("    %s → %s\n", k, v)
 		}
 	}
+	if len(cfg.Builds) > 0 {
+		fmt.Println("  Builds:")
+		names := make([]string, 0, len(cfg.Builds))
+		for name := range cfg.Builds {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			bc := cfg.Builds[name]
+			src := bc.Path
+			if bc.Repo != "" {
+				src = bc.Repo
+				if bc.Ref != "" {
+					src += " @ " + bc.Ref
+				}
+			}
+			fmt.Printf("    %s → %s\n", name, src)
+		}
+	}
 	if len(cfg.Models) > 0 {
 		fmt.Println("  Model overrides:")
 		for name, mc := range cfg.Models {
 			fmt.Printf("    [%s]\n", name)
-			if mc.ServerBin != nil {
-				fmt.Printf("      server_bin:  %s\n", *mc.ServerBin)
+			if mc.DockerImage != nil {
+				fmt.Printf("      docker_image: %s\n", *mc.DockerImage)
+			}
+			if mc.DockerEntrypoint != nil {
+				fmt.Printf("      docker_entrypoint: %s\n", *mc.DockerEntrypoint)
+			}
+			if mc.DockerArgs != nil {
+				fmt.Printf("      docker_args: %s\n", strings.Join(mc.DockerArgs, " "))
+			}
+			if mc.DockerNetwork != nil {
+				fmt.Printf("      docker_network: %s\n", *mc.DockerNetwork)
+			}
+			if mc.DockerBuild != nil {
+				fmt.Printf("      docker_build: %s\n", *mc.DockerBuild)
 			}
 			if mc.GpuLayers != nil {
 				fmt.Printf("      gpu_layers:  %d\n", *mc.GpuLayers)
@@ -2234,8 +4210,42 @@ func cmdSet(cfg Config, key, value string) {
 	switch key {
 	case "models_dir":
 		cfg.ModelsDir = value
-	case "server_bin":
-		cfg.ServerBin = value
+	case "docker.bin":
+		cfg.Docker.Bin = value
+	case "docker.image":
+		cfg.Docker.Image = value
+	case "docker.entrypoint":
+		cfg.Docker.Entrypoint = value
+	case "docker.gpu":
+		switch value {
+		case "nvidia", "jetson", "none":
+		default:
+			fmt.Fprintln(os.Stderr, "Error: docker.gpu must be nvidia, jetson or none")
+			os.Exit(1)
+		}
+		cfg.Docker.GPU = value
+	case "docker.hf_cache_dir":
+		cfg.Docker.HFCacheDir = value
+	case "docker.network":
+		if !validNetworkMode(value) {
+			fmt.Fprintln(os.Stderr, "Error: docker.network must be none, internal or bridge")
+			os.Exit(1)
+		}
+		cfg.Docker.Network = value
+	case "docker.read_only":
+		v, err := strconv.ParseBool(value)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Error: must be true or false")
+			os.Exit(1)
+		}
+		cfg.Docker.ReadOnly = &v
+	case "docker.pids_limit":
+		n, err := strconv.Atoi(value)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Error: must be a number (<= 0 disables)")
+			os.Exit(1)
+		}
+		cfg.Docker.PidsLimit = n
 	case "host":
 		cfg.Host = value
 	case "port":
@@ -2355,6 +4365,18 @@ Instance Management:
   info <name>                 Show detailed info for an instance
   logs <name>                 Show instance logs
 
+Custom llama.cpp builds:
+  build <url|owner/repo|path> Add a build for a fork/branch/PR/commit/local checkout and build it
+  build <name>... [--ref R] [--force]  (Re)build configured builds; --ref is a one-off override
+  build add <name> <source>   Add a build under a chosen name without building
+  build rm <name>             Remove a build, its images and fetched source
+  build --all                 Build every configured build (skips ones already up to date)
+  builds                      List builds, their latest commit and which models use them
+    flags: --ref R  --backend cuda|jetson  --cuda-arch A  --cmake-arg ARG (repeatable)  --dockerfile F
+
+  load <model> --build <name>[@commit]   Run a model with a build (instance "<model>-<name>")
+  load <model> --network internal        For builds without unix-socket support
+
 Proxy:
   proxy                       Start the OpenAI-compatible proxy
   status                      Overview
@@ -2367,6 +4389,8 @@ Workflow:
   llmctl load mistral                              # backend on :9100
   llmctl load llama3 --name chat                   # backend on :9101
   llmctl load "" -hf unsloth/Qwen3.5-27B-GGUF     # direct from HF
+  llmctl build https://github.com/someone/llama.cpp/tree/branch
+  llmctl load mistral --build someone             # try a fork next to the regular one
   llmctl default chat
   llmctl proxy                                     # proxy on :8080
 
@@ -2387,19 +4411,29 @@ func main() {
 	}
 
 	cfg := loadConfig()
+	dockerBin = cfg.Docker.Bin
 
 	switch os.Args[1] {
 	case "list", "ls":
 		cmdList(cfg)
 	case "load", "run":
 		if len(os.Args) < 3 {
-			fmt.Fprintln(os.Stderr, "Usage: llmctl load <model> [-hf <huggingface_repo>] [--name NAME] [--mmproj <path>]")
+			fmt.Fprintln(os.Stderr, "Usage: llmctl load <model> [-hf <huggingface_repo>] [--name NAME] [--mmproj <path>] [--build <build>[@commit]] [--network none|internal|bridge]")
 			os.Exit(1)
 		}
 		name, args := extractFlag(os.Args[3:], "--name")
-		hf, _ := extractFlag(args, "-hf")
-		mmproj, _ := extractFlag(args, "--mmproj")
-		cmdLoad(cfg, os.Args[2], name, hf, mmproj)
+		hf, args := extractFlag(args, "-hf")
+		mmproj, args := extractFlag(args, "--mmproj")
+		build, args := extractFlag(args, "--build")
+		network, _ := extractFlag(args, "--network")
+		cmdLoad(cfg, loadOptions{
+			ModelName:    os.Args[2],
+			InstanceName: name,
+			HFRepo:       hf,
+			MmprojArg:    mmproj,
+			Build:        build,
+			Network:      network,
+		})
 	case "unload":
 		if len(os.Args) < 3 {
 			fmt.Fprintln(os.Stderr, "Usage: llmctl unload <name>")
@@ -2450,6 +4484,10 @@ func main() {
 			os.Exit(1)
 		}
 		cmdAlias(cfg, os.Args[2], os.Args[3])
+	case "build":
+		cmdBuildCLI(cfg, os.Args[2:])
+	case "builds":
+		cmdBuilds(cfg)
 	case "config", "cfg":
 		cmdConfig(cfg)
 	case "set":
