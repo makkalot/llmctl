@@ -4,7 +4,9 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"embed"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -58,6 +60,7 @@ type ModelConfig struct {
 	DockerEntrypoint *string  `json:"docker_entrypoint,omitempty"`
 	DockerArgs       []string `json:"docker_args,omitempty"`
 	DockerNetwork    *string  `json:"docker_network,omitempty"`
+	DockerBuild      *string  `json:"docker_build,omitempty"` // name of an entry in `builds` (optionally name@commit)
 	GpuLayers        *int     `json:"gpu_layers,omitempty"`
 	CtxSize          *int     `json:"ctx_size,omitempty"`
 	Mmproj           string   `json:"mmproj,omitempty"`
@@ -103,6 +106,23 @@ type Config struct {
 	Aliases    map[string]string      `json:"aliases,omitempty"`
 	Models     map[string]ModelConfig `json:"models,omitempty"`
 	Autoswitch AutoswitchConfig       `json:"autoswitch,omitempty"`
+	Builds     map[string]BuildConfig `json:"builds,omitempty"`
+}
+
+// BuildConfig describes a llama.cpp (or fork) build made by `llmctl build`.
+// Exactly one of Repo or Path is set.
+type BuildConfig struct {
+	Repo         string   `json:"repo,omitempty"`          // git URL
+	Ref          string   `json:"ref,omitempty"`           // branch, tag, full SHA or "#<PR number>"; default HEAD
+	Path         string   `json:"path,omitempty"`          // local git checkout (uncommitted changes included)
+	Backend      string   `json:"backend,omitempty"`       // "cuda" (default) or "jetson"
+	CudaArch     string   `json:"cuda_arch,omitempty"`     // CMAKE_CUDA_ARCHITECTURES; default: host GPU (cuda) / 87 (jetson)
+	BaseImage    string   `json:"base_image,omitempty"`    // build-stage image
+	RuntimeImage string   `json:"runtime_image,omitempty"` // runtime-stage image
+	CmakeArgs    []string `json:"cmake_args,omitempty"`
+	Target       string   `json:"target,omitempty"`     // cmake target, default llama-server
+	Dockerfile   string   `json:"dockerfile,omitempty"` // custom Dockerfile (relative to the source tree)
+	Keep         int      `json:"keep,omitempty"`       // images to keep per build, default 3
 }
 
 // DockerConfig controls how llama-server backends are run as containers.
@@ -116,6 +136,7 @@ type DockerConfig struct {
 	ReadOnly   *bool    `json:"read_only,omitempty"`  // read-only root fs (default true)
 	PidsLimit  int      `json:"pids_limit"`           // --pids-limit; <= 0 disables
 	Args       []string `json:"args,omitempty"`       // extra `docker run` flags
+	Build      string   `json:"build,omitempty"`      // default build (entry in `builds`) instead of Image
 }
 
 func (d DockerConfig) readOnly() bool { return d.ReadOnly == nil || *d.ReadOnly }
@@ -302,6 +323,13 @@ func configForModel(cfg Config, modelKey string) Config {
 	if mc.DockerNetwork != nil {
 		cfg.Docker.Network = *mc.DockerNetwork
 	}
+	if mc.DockerBuild != nil {
+		cfg.Docker.Build = *mc.DockerBuild
+	}
+	if mc.DockerImage != nil && mc.DockerBuild == nil {
+		// An explicit per-model image wins over a global default build.
+		cfg.Docker.Build = ""
+	}
 	if mc.GpuLayers != nil {
 		cfg.GpuLayers = *mc.GpuLayers
 	}
@@ -394,6 +422,8 @@ type Instance struct {
 	AutoUnload      bool     `json:"auto_unload,omitempty"`
 	EstimatedVramMB int      `json:"estimated_vram_mb,omitempty"`
 	LastUsedAt      int64    `json:"last_used_at,omitempty"`
+	Build           string   `json:"build,omitempty"`  // llmctl build name, if any
+	Commit          string   `json:"commit,omitempty"` // source commit of the build image
 }
 
 type Registry struct {
@@ -963,6 +993,839 @@ func printLogTail(path string, maxLines int) {
 	for _, line := range lines[start:] {
 		fmt.Fprintln(os.Stderr, "  "+line)
 	}
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Custom llama.cpp builds — `llmctl build` turns a git ref / PR / local
+// checkout of llama.cpp (or a fork) into a llama-server image.
+// ═══════════════════════════════════════════════════════════════════════════
+
+//go:embed docker/llama-server.Dockerfile
+var llamaServerDockerfile string
+
+const (
+	backendCUDA   = "cuda"
+	backendJetson = "jetson"
+
+	defaultCUDABuildImage   = "nvidia/cuda:12.8.1-devel-ubuntu24.04"
+	defaultCUDARuntimeImage = "nvidia/cuda:12.8.1-runtime-ubuntu24.04"
+	defaultJetsonImage      = "nvcr.io/nvidia/l4t-jetpack:r36.4.0"
+	defaultJetsonCudaArch   = "87" // Orin
+	defaultBuildKeep        = 3
+
+	buildLabel       = "llmctl.build"
+	buildCommitLabel = "llmctl.commit"
+	buildRefLabel    = "llmctl.ref"
+	buildSourceLabel = "llmctl.source"
+	buildSocketLabel = "llmctl.unix_socket"
+	buildTimeLabel   = "llmctl.built_at" // RFC3339Nano; image Created is not reliable for ordering
+)
+
+// gitExec runs git and returns stdout. A variable so tests can stub it.
+var gitExec = func(args ...string) (string, error) {
+	cmd := exec.Command("git", args...)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
+	if err != nil {
+		msg := strings.TrimSpace(stderr.String())
+		if msg == "" {
+			msg = err.Error()
+		}
+		return string(out), fmt.Errorf("git %s: %s", strings.Join(args, " "), msg)
+	}
+	return string(out), nil
+}
+
+// buildRepo is the image repository for a build, e.g. "llmctl/ik".
+func buildRepo(name string) string {
+	return "llmctl/" + strings.Map(func(r rune) rune {
+		switch {
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9', r == '.', r == '_', r == '-':
+			return r
+		case r >= 'A' && r <= 'Z':
+			return r + ('a' - 'A')
+		}
+		return '-'
+	}, name)
+}
+
+func expandHome(p string) string {
+	if p == "~" {
+		return homeDir()
+	}
+	if strings.HasPrefix(p, "~/") {
+		return filepath.Join(homeDir(), p[2:])
+	}
+	return p
+}
+
+var (
+	fullSHARe  = regexp.MustCompile(`^[0-9a-fA-F]{40}$`)
+	shortSHARe = regexp.MustCompile(`^[0-9a-fA-F]{7,39}$`)
+	prRefRe    = regexp.MustCompile(`^#(\d+)$`)
+)
+
+// gitRefQuery maps a build ref to what `git ls-remote` should look up.
+func gitRefQuery(ref string) string {
+	if ref == "" {
+		return "HEAD"
+	}
+	if m := prRefRe.FindStringSubmatch(ref); m != nil {
+		return "refs/pull/" + m[1] + "/head"
+	}
+	return ref
+}
+
+// pickLsRemote picks the commit for ref from `git ls-remote` output,
+// preferring branches over tags and peeled (^{}) tags over tag objects.
+func pickLsRemote(out, ref string) (string, error) {
+	refs := map[string]string{}
+	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+		f := strings.Fields(line)
+		if len(f) == 2 {
+			refs[f[1]] = f[0]
+		}
+	}
+	q := gitRefQuery(ref)
+	for _, cand := range []string{q, "refs/heads/" + q, "refs/tags/" + q + "^{}", "refs/tags/" + q} {
+		if sha, ok := refs[cand]; ok {
+			return sha, nil
+		}
+	}
+	return "", fmt.Errorf("ref %q not found", ref)
+}
+
+// resolveRemoteCommit returns the full commit SHA ref points to in repo.
+func resolveRemoteCommit(repo, ref string) (string, error) {
+	if fullSHARe.MatchString(ref) {
+		return strings.ToLower(ref), nil
+	}
+	if shortSHARe.MatchString(ref) {
+		return "", fmt.Errorf("short commit %q can't be resolved remotely; use the full 40-character SHA", ref)
+	}
+	out, err := gitExec("ls-remote", repo, gitRefQuery(ref))
+	if err != nil {
+		return "", err
+	}
+	sha, err := pickLsRemote(out, ref)
+	if err != nil {
+		return "", fmt.Errorf("%s: %w", repo, err)
+	}
+	return sha, nil
+}
+
+// buildSourceDir is where llmctl keeps the fetched source for a build.
+func buildSourceDir(name string) string {
+	return filepath.Join(homeDir(), ".cache", "llmctl", "src", strings.TrimPrefix(buildRepo(name), "llmctl/"))
+}
+
+// fetchRemoteSource shallow-fetches commit (falling back to the ref) into dir
+// and checks it out. Returns the checked-out commit.
+func fetchRemoteSource(dir, repo, ref, commit string) (string, error) {
+	if _, err := os.Stat(filepath.Join(dir, ".git")); err != nil {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			return "", err
+		}
+		if _, err := gitExec("-C", dir, "init", "-q"); err != nil {
+			return "", err
+		}
+	}
+	if _, err := gitExec("-C", dir, "fetch", "-q", "--depth", "1", "--no-tags", repo, commit); err != nil {
+		// Some servers don't allow fetching by SHA; fetch the ref instead.
+		if _, err2 := gitExec("-C", dir, "fetch", "-q", "--depth", "1", "--no-tags", repo, gitRefQuery(ref)); err2 != nil {
+			return "", err2
+		}
+	}
+	if _, err := gitExec("-C", dir, "checkout", "-q", "--force", "--detach", "FETCH_HEAD^{commit}"); err != nil {
+		return "", err
+	}
+	if _, err := gitExec("-C", dir, "clean", "-q", "-ffdx"); err != nil {
+		return "", err
+	}
+	out, err := gitExec("-C", dir, "rev-parse", "HEAD")
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(out), nil
+}
+
+// localSourceState returns the HEAD commit of a local checkout and, if it has
+// uncommitted changes, a short hash of them.
+func localSourceState(path string) (commit, dirty string, err error) {
+	out, err := gitExec("-C", path, "rev-parse", "HEAD")
+	if err != nil {
+		return "", "", fmt.Errorf("%s is not a git checkout: %w", path, err)
+	}
+	commit = strings.TrimSpace(out)
+	status, err := gitExec("-C", path, "status", "--porcelain", "--untracked-files=all")
+	if err != nil {
+		return "", "", err
+	}
+	if strings.TrimSpace(status) == "" {
+		return commit, "", nil
+	}
+	h := sha256.New()
+	diff, err := gitExec("-C", path, "diff", "HEAD", "--binary")
+	if err != nil {
+		return "", "", err
+	}
+	_, _ = io.WriteString(h, diff)
+	untracked, err := gitExec("-C", path, "ls-files", "-z", "--others", "--exclude-standard")
+	if err != nil {
+		return "", "", err
+	}
+	for _, f := range strings.Split(untracked, "\x00") {
+		if f == "" {
+			continue
+		}
+		_, _ = io.WriteString(h, f+"\x00")
+		if data, err := os.ReadFile(filepath.Join(path, f)); err == nil {
+			_, _ = h.Write(data)
+		}
+	}
+	return commit, hex.EncodeToString(h.Sum(nil))[:8], nil
+}
+
+// copyLocalSource copies a checkout's tracked and untracked-but-not-ignored
+// files into dst, so ignored build output (build/, models) stays out of the
+// docker build context.
+func copyLocalSource(src, dst string) error {
+	out, err := gitExec("-C", src, "ls-files", "-z", "--cached", "--others", "--exclude-standard")
+	if err != nil {
+		return err
+	}
+	if err := os.RemoveAll(dst); err != nil {
+		return err
+	}
+	for _, rel := range strings.Split(out, "\x00") {
+		if rel == "" {
+			continue
+		}
+		from := filepath.Join(src, rel)
+		info, err := os.Lstat(from)
+		if err != nil {
+			continue // deleted but not yet committed
+		}
+		to := filepath.Join(dst, rel)
+		if err := os.MkdirAll(filepath.Dir(to), 0755); err != nil {
+			return err
+		}
+		switch {
+		case info.Mode()&os.ModeSymlink != 0:
+			target, err := os.Readlink(from)
+			if err != nil {
+				return err
+			}
+			if err := os.Symlink(target, to); err != nil {
+				return err
+			}
+		case info.Mode().IsRegular():
+			data, err := os.ReadFile(from)
+			if err != nil {
+				return err
+			}
+			if err := os.WriteFile(to, data, info.Mode().Perm()); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// sourceSupportsUnixSocket reports whether llama-server in this source tree
+// can listen on a unix socket (upstream PR #12613, `--host *.sock`).
+func sourceSupportsUnixSocket(srcDir string) bool {
+	found := false
+	for _, sub := range []string{"tools/server", "examples/server"} {
+		root := filepath.Join(srcDir, sub)
+		_ = filepath.WalkDir(root, func(p string, d os.DirEntry, err error) error {
+			if found {
+				return filepath.SkipAll
+			}
+			if err != nil {
+				return filepath.SkipDir
+			}
+			if d.IsDir() {
+				return nil
+			}
+			ext := filepath.Ext(p)
+			if ext != ".cpp" && ext != ".h" && ext != ".hpp" {
+				return nil
+			}
+			if data, err := os.ReadFile(p); err == nil && bytes.Contains(data, []byte("AF_UNIX")) {
+				found = true
+			}
+			return nil
+		})
+	}
+	return found
+}
+
+// parseComputeCaps turns `nvidia-smi --query-gpu=compute_cap` output
+// ("8.9\n8.6\n") into CMAKE_CUDA_ARCHITECTURES ("86;89").
+func parseComputeCaps(out string) string {
+	seen := map[string]bool{}
+	var archs []string
+	for _, line := range strings.Split(out, "\n") {
+		a := strings.ReplaceAll(strings.TrimSpace(line), ".", "")
+		if a == "" || seen[a] {
+			continue
+		}
+		if _, err := strconv.Atoi(a); err != nil {
+			continue
+		}
+		seen[a] = true
+		archs = append(archs, a)
+	}
+	sort.Strings(archs)
+	return strings.Join(archs, ";")
+}
+
+// jetsonImageForRelease maps /etc/nv_tegra_release to an l4t-jetpack tag,
+// e.g. "# R36 (release), REVISION: 4.3, ..." -> nvcr.io/nvidia/l4t-jetpack:r36.4.0.
+func jetsonImageForRelease(release string) string {
+	m := regexp.MustCompile(`R(\d+) \(release\), REVISION: (\d+)`).FindStringSubmatch(release)
+	if m == nil {
+		return ""
+	}
+	return fmt.Sprintf("nvcr.io/nvidia/l4t-jetpack:r%s.%s.0", m[1], m[2])
+}
+
+// resolvedBuild is a BuildConfig with all defaults filled in.
+type resolvedBuild struct {
+	Name         string
+	Backend      string
+	CudaArch     string
+	BaseImage    string
+	RuntimeImage string
+	CmakeArgs    []string
+	Target       string
+	Dockerfile   string
+	Keep         int
+}
+
+func resolveBuildConfig(name string, bc BuildConfig) (resolvedBuild, error) {
+	rb := resolvedBuild{
+		Name:         name,
+		Backend:      strings.ToLower(bc.Backend),
+		CudaArch:     bc.CudaArch,
+		BaseImage:    bc.BaseImage,
+		RuntimeImage: bc.RuntimeImage,
+		CmakeArgs:    bc.CmakeArgs,
+		Target:       bc.Target,
+		Dockerfile:   bc.Dockerfile,
+		Keep:         bc.Keep,
+	}
+	if (bc.Repo == "") == (bc.Path == "") {
+		return rb, fmt.Errorf("build %q: set exactly one of repo or path", name)
+	}
+	if bc.Path != "" && bc.Ref != "" {
+		return rb, fmt.Errorf("build %q: ref only applies to repo builds", name)
+	}
+	if rb.Backend == "" {
+		rb.Backend = backendCUDA
+	}
+	if rb.Target == "" {
+		rb.Target = "llama-server"
+	}
+	if rb.Keep <= 0 {
+		rb.Keep = defaultBuildKeep
+	}
+	switch rb.Backend {
+	case backendCUDA:
+		if rb.BaseImage == "" {
+			rb.BaseImage = defaultCUDABuildImage
+		}
+		if rb.RuntimeImage == "" {
+			rb.RuntimeImage = defaultCUDARuntimeImage
+		}
+		if rb.CudaArch == "" {
+			out, err := exec.Command("nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader").Output()
+			if err == nil {
+				rb.CudaArch = parseComputeCaps(string(out))
+			}
+			if rb.CudaArch == "" {
+				return rb, fmt.Errorf("build %q: can't detect the GPU architecture (nvidia-smi); set cuda_arch, e.g. \"89\"", name)
+			}
+		}
+	case backendJetson:
+		if rb.BaseImage == "" {
+			if data, err := os.ReadFile("/etc/nv_tegra_release"); err == nil {
+				rb.BaseImage = jetsonImageForRelease(string(data))
+			}
+			if rb.BaseImage == "" {
+				rb.BaseImage = defaultJetsonImage
+			}
+		}
+		if rb.RuntimeImage == "" {
+			// JetPack 6 containers must ship CUDA themselves; reuse the
+			// JetPack image so cudart/cublas are present at run time.
+			rb.RuntimeImage = rb.BaseImage
+		}
+		if rb.CudaArch == "" {
+			rb.CudaArch = defaultJetsonCudaArch
+		}
+	default:
+		return rb, fmt.Errorf("build %q: backend must be cuda or jetson, got %q", name, bc.Backend)
+	}
+	return rb, nil
+}
+
+type buildImageSpec struct {
+	Build      resolvedBuild
+	ContextDir string
+	Dockerfile string // path to the Dockerfile to use
+	Tag        string // commit tag, e.g. abc123def456 or abc123def456-dirty-1a2b3c4d
+	Commit     string
+	Ref        string
+	Source     string
+	UnixSocket bool
+	BuiltAt    time.Time
+}
+
+// dockerBuildArgs builds the `docker build` argument list.
+func dockerBuildArgs(spec buildImageSpec) []string {
+	repo := buildRepo(spec.Build.Name)
+	return []string{
+		"build",
+		"-f", spec.Dockerfile,
+		"--build-arg", "BUILD_IMAGE=" + spec.Build.BaseImage,
+		"--build-arg", "RUNTIME_IMAGE=" + spec.Build.RuntimeImage,
+		"--build-arg", "CUDA_ARCH=" + spec.Build.CudaArch,
+		"--build-arg", "CMAKE_ARGS=" + strings.Join(spec.Build.CmakeArgs, " "),
+		"--build-arg", "TARGET=" + spec.Build.Target,
+		"--build-arg", "CCACHE_ID=llmctl-ccache-" + spec.Build.Backend,
+		"--label", buildLabel + "=" + spec.Build.Name,
+		"--label", buildCommitLabel + "=" + spec.Commit,
+		"--label", buildRefLabel + "=" + spec.Ref,
+		"--label", buildSourceLabel + "=" + spec.Source,
+		"--label", buildSocketLabel + "=" + strconv.FormatBool(spec.UnixSocket),
+		"--label", buildTimeLabel + "=" + spec.BuiltAt.UTC().Format(time.RFC3339Nano),
+		"-t", repo + ":" + spec.Tag,
+		"-t", repo + ":latest",
+		spec.ContextDir,
+	}
+}
+
+type builtImage struct {
+	Ref     string // repo:tag
+	Tag     string
+	ID      string
+	Created time.Time
+}
+
+func shortImageID(id string) string {
+	id = strings.TrimPrefix(id, "sha256:")
+	if len(id) > 12 {
+		id = id[:12]
+	}
+	return id
+}
+
+// listBuildImages returns the tagged images of a build (including :latest),
+// ordered by llmctl's own built_at label (image Created is not reliable:
+// BuildKit may reuse or backdate it).
+func listBuildImages(name string) ([]builtImage, error) {
+	out, err := dockerExec("image", "ls", "--filter", "label="+buildLabel+"="+name,
+		"--format", "{{.Repository}}:{{.Tag}}|{{.ID}}")
+	if err != nil {
+		return nil, err
+	}
+	var imgs []builtImage
+	var refs []string
+	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+		f := strings.SplitN(line, "|", 2)
+		if len(f) != 2 || strings.HasSuffix(f[0], ":<none>") {
+			continue
+		}
+		imgs = append(imgs, builtImage{
+			Ref: f[0],
+			Tag: f[0][strings.LastIndex(f[0], ":")+1:],
+			ID:  shortImageID(f[1]),
+		})
+		refs = append(refs, f[0])
+	}
+	if len(refs) == 0 {
+		return imgs, nil
+	}
+	args := append([]string{"image", "inspect", "-f",
+		fmt.Sprintf("{{.Created}}|{{index .Config.Labels %q}}", buildTimeLabel)}, refs...)
+	out, err = dockerExec(args...)
+	if err != nil {
+		return imgs, nil
+	}
+	for i, line := range strings.Split(strings.TrimSpace(out), "\n") {
+		if i >= len(imgs) {
+			break
+		}
+		created, label, _ := strings.Cut(strings.TrimSpace(line), "|")
+		if t, err := time.Parse(time.RFC3339Nano, label); err == nil {
+			imgs[i].Created = t
+		} else if t, err := time.Parse(time.RFC3339Nano, created); err == nil {
+			imgs[i].Created = t
+		}
+	}
+	return imgs, nil
+}
+
+// imagesToPrune picks commit-tagged images beyond the newest `keep`, never
+// touching :latest, the image :latest points to, or protected (in-use) IDs.
+func imagesToPrune(imgs []builtImage, keep int, protected map[string]bool) []string {
+	latestID := ""
+	var tagged []builtImage
+	for _, img := range imgs {
+		if img.Tag == "latest" {
+			latestID = img.ID
+			continue
+		}
+		tagged = append(tagged, img)
+	}
+	sort.SliceStable(tagged, func(i, j int) bool { return tagged[i].Created.After(tagged[j].Created) })
+	var prune []string
+	for i, img := range tagged {
+		if i < keep || img.ID == latestID || protected[img.ID] {
+			continue
+		}
+		prune = append(prune, img.Ref)
+	}
+	return prune
+}
+
+// inUseImageIDs returns short IDs of images used by llmctl containers.
+func inUseImageIDs() map[string]bool {
+	ids := map[string]bool{}
+	out, err := dockerExec("ps", "-aq", "--filter", "label="+containerLabel)
+	if err != nil || strings.TrimSpace(out) == "" {
+		return ids
+	}
+	args := append([]string{"inspect", "-f", "{{.Image}}"}, strings.Fields(out)...)
+	if out, err := dockerExec(args...); err == nil {
+		for _, id := range strings.Fields(out) {
+			ids[shortImageID(id)] = true
+		}
+	}
+	return ids
+}
+
+func pruneBuildImages(name string, keep int, verbose bool) {
+	imgs, err := listBuildImages(name)
+	if err != nil {
+		return
+	}
+	for _, ref := range imagesToPrune(imgs, keep, inUseImageIDs()) {
+		if verbose {
+			fmt.Printf("  Removing old image %s\n", ref)
+		}
+		_, _ = dockerExec("image", "rm", ref)
+	}
+}
+
+type buildOptions struct {
+	Ref   string // overrides the configured ref
+	Force bool
+}
+
+// runBuild builds (or re-tags) the image for a configured build.
+func runBuild(cfg Config, name string, opts buildOptions) error {
+	bc, ok := cfg.Builds[name]
+	if !ok {
+		return fmt.Errorf("no build %q in config (see `llmctl builds`)", name)
+	}
+	if opts.Ref != "" {
+		if bc.Path != "" {
+			return fmt.Errorf("build %q is a local checkout; --ref only applies to repo builds", name)
+		}
+		bc.Ref = opts.Ref
+	}
+	rb, err := resolveBuildConfig(name, bc)
+	if err != nil {
+		return err
+	}
+	repo := buildRepo(name)
+
+	// Rollback: an existing image for a (short) commit just becomes :latest.
+	if bc.Repo != "" && (shortSHARe.MatchString(bc.Ref) || fullSHARe.MatchString(bc.Ref)) {
+		if ref, err := findBuildImage(name, bc.Ref); err == nil && !opts.Force {
+			if _, err := dockerExec("tag", ref, repo+":latest"); err != nil {
+				return err
+			}
+			fmt.Printf("✓ %s:latest → %s (already built)\n", repo, ref)
+			return nil
+		}
+	}
+
+	srcDir := buildSourceDir(name)
+	var commit, tag, ref, source string
+	if bc.Repo != "" {
+		ref = bc.Ref
+		if ref == "" {
+			ref = "HEAD"
+		}
+		source = bc.Repo
+		fmt.Printf("Resolving %s @ %s...\n", bc.Repo, ref)
+		commit, err = resolveRemoteCommit(bc.Repo, ref)
+		if err != nil {
+			return err
+		}
+		tag = commit[:12]
+		if !opts.Force {
+			if _, err := dockerExec("image", "inspect", repo+":"+tag); err == nil {
+				if _, err := dockerExec("tag", repo+":"+tag, repo+":latest"); err != nil {
+					return err
+				}
+				fmt.Printf("✓ %s is up to date (%s:%s)\n", name, repo, tag)
+				return nil
+			}
+		}
+		fmt.Printf("Fetching %s...\n", commit[:12])
+		if commit, err = fetchRemoteSource(srcDir, bc.Repo, ref, commit); err != nil {
+			return err
+		}
+		tag = commit[:12]
+	} else {
+		path := expandHome(bc.Path)
+		source = path
+		ref = "local"
+		head, dirty, err := localSourceState(path)
+		if err != nil {
+			return err
+		}
+		commit, tag = head, head[:12]
+		if dirty != "" {
+			tag += "-dirty-" + dirty
+		}
+		if !opts.Force {
+			if _, err := dockerExec("image", "inspect", repo+":"+tag); err == nil {
+				if _, err := dockerExec("tag", repo+":"+tag, repo+":latest"); err != nil {
+					return err
+				}
+				fmt.Printf("✓ %s is up to date (%s:%s)\n", name, repo, tag)
+				return nil
+			}
+		}
+		fmt.Printf("Copying %s...\n", path)
+		if err := copyLocalSource(path, srcDir); err != nil {
+			return err
+		}
+	}
+
+	dockerfile := rb.Dockerfile
+	if dockerfile == "" {
+		f, err := os.CreateTemp("", "llmctl-*.Dockerfile")
+		if err != nil {
+			return err
+		}
+		defer func() { _ = os.Remove(f.Name()) }()
+		_, werr := f.WriteString(llamaServerDockerfile)
+		if cerr := f.Close(); werr == nil {
+			werr = cerr
+		}
+		if werr != nil {
+			return werr
+		}
+		dockerfile = f.Name()
+	} else if !filepath.IsAbs(expandHome(dockerfile)) {
+		dockerfile = filepath.Join(srcDir, dockerfile)
+	} else {
+		dockerfile = expandHome(dockerfile)
+	}
+
+	spec := buildImageSpec{
+		Build:      rb,
+		ContextDir: srcDir,
+		Dockerfile: dockerfile,
+		Tag:        tag,
+		Commit:     commit,
+		Ref:        ref,
+		Source:     source,
+		UnixSocket: sourceSupportsUnixSocket(srcDir),
+		BuiltAt:    time.Now(),
+	}
+	fmt.Printf("Building %s:%s (%s, CUDA arch %s, base %s)...\n", repo, tag, rb.Backend, rb.CudaArch, rb.BaseImage)
+	if !spec.UnixSocket {
+		fmt.Println("  note: this source has no unix-socket support in llama-server; models using it need docker_network \"internal\"")
+	}
+	start := time.Now()
+	cmd := exec.Command(dockerBin, dockerBuildArgs(spec)...)
+	cmd.Env = append(os.Environ(), "DOCKER_BUILDKIT=1")
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("docker build failed: %w", err)
+	}
+	fmt.Printf("✓ Built %s:%s in %s\n", repo, tag, time.Since(start).Round(time.Second))
+	pruneBuildImages(name, rb.Keep, true)
+	return nil
+}
+
+// findBuildImage returns the image ref for a build, optionally pinned to a
+// commit prefix ("" = :latest).
+func findBuildImage(name, commit string) (string, error) {
+	repo := buildRepo(name)
+	if commit == "" {
+		if _, err := dockerExec("image", "inspect", repo+":latest"); err != nil {
+			return "", fmt.Errorf("build %q has no image yet; run `llmctl build %s`", name, name)
+		}
+		return repo + ":latest", nil
+	}
+	imgs, err := listBuildImages(name)
+	if err != nil {
+		return "", err
+	}
+	commit = strings.ToLower(commit)
+	var matches []string
+	for _, img := range imgs {
+		if img.Tag != "latest" && (strings.HasPrefix(img.Tag, commit) || strings.HasPrefix(commit, img.Tag)) {
+			matches = append(matches, img.Ref)
+		}
+	}
+	switch len(matches) {
+	case 0:
+		return "", fmt.Errorf("build %q has no image for commit %s; run `llmctl build %s --ref <full sha>`", name, commit, name)
+	case 1:
+		return matches[0], nil
+	}
+	return "", fmt.Errorf("commit %s is ambiguous for build %q: %s", commit, name, strings.Join(matches, ", "))
+}
+
+// buildImageInfo returns a build image's commit and unix-socket support.
+func buildImageInfo(image string) (commit string, unixSocket bool, err error) {
+	out, err := dockerExec("image", "inspect", "-f",
+		fmt.Sprintf("{{index .Config.Labels %q}}|{{index .Config.Labels %q}}", buildCommitLabel, buildSocketLabel), image)
+	if err != nil {
+		return "", false, err
+	}
+	f := strings.SplitN(strings.TrimSpace(out), "|", 2)
+	if len(f) != 2 {
+		return "", false, fmt.Errorf("unexpected inspect output %q", out)
+	}
+	return f[0], f[1] == "true", nil
+}
+
+// splitBuildRef splits "name@commit" into its parts.
+func shortCommit(c string) string {
+	if len(c) > 12 {
+		return c[:12]
+	}
+	return c
+}
+
+func splitBuildRef(ref string) (name, commit string) {
+	if i := strings.LastIndex(ref, "@"); i >= 0 {
+		return ref[:i], ref[i+1:]
+	}
+	return ref, ""
+}
+
+func cmdBuild(cfg Config, names []string, all bool, opts buildOptions) {
+	if all {
+		names = names[:0]
+		for name := range cfg.Builds {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+	}
+	if len(names) == 0 {
+		fmt.Fprintln(os.Stderr, "Usage: llmctl build <name>... [--ref <ref>] [--force] | --all")
+		os.Exit(1)
+	}
+	failed := 0
+	for _, name := range names {
+		if err := runBuild(cfg, name, opts); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %s: %v\n", name, err)
+			failed++
+		}
+	}
+	if failed > 0 {
+		os.Exit(1)
+	}
+}
+
+func cmdBuilds(cfg Config) {
+	if len(cfg.Builds) == 0 {
+		fmt.Println("No builds configured. Add a `builds` section to ~/.llmctl.json.")
+		return
+	}
+	names := make([]string, 0, len(cfg.Builds))
+	for name := range cfg.Builds {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	usedBy := map[string][]string{}
+	for model, mc := range cfg.Models {
+		if mc.DockerBuild != nil {
+			b, _ := splitBuildRef(*mc.DockerBuild)
+			usedBy[b] = append(usedBy[b], model)
+		}
+	}
+	if cfg.Docker.Build != "" {
+		b, _ := splitBuildRef(cfg.Docker.Build)
+		usedBy[b] = append(usedBy[b], "(default)")
+	}
+
+	fmt.Printf("  %-16s %-8s %-14s %-12s %s\n", "NAME", "BACKEND", "LATEST", "BUILT", "SOURCE")
+	fmt.Printf("  %-16s %-8s %-14s %-12s %s\n", "────", "───────", "──────", "─────", "──────")
+	for _, name := range names {
+		bc := cfg.Builds[name]
+		source := bc.Path
+		if bc.Repo != "" {
+			ref := bc.Ref
+			if ref == "" {
+				ref = "HEAD"
+			}
+			source = bc.Repo + " @ " + ref
+		}
+		backend := bc.Backend
+		if backend == "" {
+			backend = backendCUDA
+		}
+		latest, built := "-", "never"
+		imgs, _ := listBuildImages(name)
+		latestID := ""
+		for _, img := range imgs {
+			if img.Tag == "latest" {
+				latestID = img.ID
+				built = formatAge(img.Created)
+			}
+		}
+		count := 0
+		for _, img := range imgs {
+			if img.Tag == "latest" {
+				continue
+			}
+			count++
+			if img.ID == latestID {
+				latest = img.Tag
+				if len(latest) > 14 {
+					latest = latest[:14]
+				}
+			}
+		}
+		fmt.Printf("  %-16s %-8s %-14s %-12s %s\n", name, backend, latest, built, source)
+		if count > 1 {
+			fmt.Printf("    images: %d kept\n", count)
+		}
+		if models := usedBy[name]; len(models) > 0 {
+			sort.Strings(models)
+			fmt.Printf("    used by: %s\n", strings.Join(models, ", "))
+		}
+	}
+}
+
+func formatAge(t time.Time) string {
+	if t.IsZero() {
+		return "?"
+	}
+	d := time.Since(t)
+	switch {
+	case d < time.Hour:
+		return fmt.Sprintf("%dm ago", int(d.Minutes()))
+	case d < 48*time.Hour:
+		return fmt.Sprintf("%dh ago", int(d.Hours()))
+	}
+	return fmt.Sprintf("%dd ago", int(d.Hours()/24))
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -2020,6 +2883,28 @@ func loadInstance(cfg Config, opts loadOptions) (Instance, bool, error) {
 	}
 	container := containerName(spec.InstanceName)
 
+	// A model using an llmctl build runs that build's (local) image.
+	buildName, buildCommit := "", ""
+	if cfg.Docker.Build != "" {
+		name, pin := splitBuildRef(cfg.Docker.Build)
+		if _, ok := cfg.Builds[name]; !ok {
+			return Instance{}, false, fmt.Errorf("docker_build %q: no such entry in builds", name)
+		}
+		image, err := findBuildImage(name, pin)
+		if err != nil {
+			return Instance{}, false, err
+		}
+		commit, unixSocket, err := buildImageInfo(image)
+		if err != nil {
+			return Instance{}, false, fmt.Errorf("inspecting %s: %w", image, err)
+		}
+		if network == netNone && !unixSocket {
+			return Instance{}, false, fmt.Errorf("build %q (%s) has no unix-socket support in llama-server, so it can't run with docker network \"none\"; set \"docker_network\": \"internal\" for this model", name, shortCommit(commit))
+		}
+		cfg.Docker.Image = image
+		buildName, buildCommit = name, commit
+	}
+
 	// Network none: llama-server listens on a unix socket in a per-instance
 	// directory; no TCP port is used.
 	backendPort := 0
@@ -2104,8 +2989,10 @@ func loadInstance(cfg Config, opts loadOptions) (Instance, bool, error) {
 		ServerArgs: args,
 	})
 
-	if err := ensureImage(cfg.Docker.Image, opts.Verbose); err != nil {
-		return Instance{}, false, fmt.Errorf("error pulling image %s: %w", cfg.Docker.Image, err)
+	if buildName == "" {
+		if err := ensureImage(cfg.Docker.Image, opts.Verbose); err != nil {
+			return Instance{}, false, fmt.Errorf("error pulling image %s: %w", cfg.Docker.Image, err)
+		}
 	}
 	if network == netInternal {
 		if err := ensureInternalNetwork(); err != nil {
@@ -2142,6 +3029,8 @@ func loadInstance(cfg Config, opts loadOptions) (Instance, bool, error) {
 		Mmproj:          spec.MmprojPath,
 		Container:       container,
 		Image:           cfg.Docker.Image,
+		Build:           buildName,
+		Commit:          buildCommit,
 		Network:         network,
 		Socket:          sockPath,
 		Addr:            addr,
@@ -2368,6 +3257,9 @@ func cmdPS() {
 		if len(inst.Aliases) > 0 {
 			fmt.Printf("    aliases: %s\n", strings.Join(inst.Aliases, ", "))
 		}
+		if inst.Build != "" {
+			fmt.Printf("    build: %s @ %s\n", inst.Build, shortCommit(inst.Commit))
+		}
 	}
 
 	fmt.Println()
@@ -2413,6 +3305,9 @@ func cmdInfo(name string) {
 	fmt.Printf("Status:     %s\n", status)
 	fmt.Printf("Container:  %s\n", inst.Container)
 	fmt.Printf("Image:      %s\n", inst.Image)
+	if inst.Build != "" {
+		fmt.Printf("Build:      %s @ %s\n", inst.Build, inst.Commit)
+	}
 	fmt.Printf("Model:      %s\n", inst.Model)
 	if inst.Mmproj != "" {
 		fmt.Printf("Mmproj:     %s\n", inst.Mmproj)
@@ -2922,6 +3817,9 @@ func cmdConfig(cfg Config) {
 	fmt.Println("  Docker:")
 	fmt.Printf("    bin:          %s\n", cfg.Docker.Bin)
 	fmt.Printf("    image:        %s\n", cfg.Docker.Image)
+	if cfg.Docker.Build != "" {
+		fmt.Printf("    build:        %s\n", cfg.Docker.Build)
+	}
 	if cfg.Docker.Entrypoint != "" {
 		fmt.Printf("    entrypoint:   %s\n", cfg.Docker.Entrypoint)
 	}
@@ -2955,6 +3853,25 @@ func cmdConfig(cfg Config) {
 			fmt.Printf("    %s → %s\n", k, v)
 		}
 	}
+	if len(cfg.Builds) > 0 {
+		fmt.Println("  Builds:")
+		names := make([]string, 0, len(cfg.Builds))
+		for name := range cfg.Builds {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			bc := cfg.Builds[name]
+			src := bc.Path
+			if bc.Repo != "" {
+				src = bc.Repo
+				if bc.Ref != "" {
+					src += " @ " + bc.Ref
+				}
+			}
+			fmt.Printf("    %s → %s\n", name, src)
+		}
+	}
 	if len(cfg.Models) > 0 {
 		fmt.Println("  Model overrides:")
 		for name, mc := range cfg.Models {
@@ -2970,6 +3887,9 @@ func cmdConfig(cfg Config) {
 			}
 			if mc.DockerNetwork != nil {
 				fmt.Printf("      docker_network: %s\n", *mc.DockerNetwork)
+			}
+			if mc.DockerBuild != nil {
+				fmt.Printf("      docker_build: %s\n", *mc.DockerBuild)
 			}
 			if mc.GpuLayers != nil {
 				fmt.Printf("      gpu_layers:  %d\n", *mc.GpuLayers)
@@ -3152,6 +4072,11 @@ Instance Management:
   info <name>                 Show detailed info for an instance
   logs <name>                 Show instance logs
 
+Custom llama.cpp builds (see "builds" in ~/.llmctl.json):
+  build <name>... [--ref R] [--force]  Build a llama-server image from a fork/branch/PR/local checkout
+  build --all                 Build every configured build (skips ones already up to date)
+  builds                      List builds, their latest commit and which models use them
+
 Proxy:
   proxy                       Start the OpenAI-compatible proxy
   status                      Overview
@@ -3248,6 +4173,31 @@ func main() {
 			os.Exit(1)
 		}
 		cmdAlias(cfg, os.Args[2], os.Args[3])
+	case "build":
+		ref, rest := extractFlag(os.Args[2:], "--ref")
+		var names []string
+		force, all := false, false
+		for _, a := range rest {
+			switch a {
+			case "--force", "-f":
+				force = true
+			case "--all":
+				all = true
+			default:
+				if strings.HasPrefix(a, "-") {
+					fmt.Fprintf(os.Stderr, "Unknown flag: %s\n", a)
+					os.Exit(1)
+				}
+				names = append(names, a)
+			}
+		}
+		if ref != "" && (all || len(names) != 1) {
+			fmt.Fprintln(os.Stderr, "Error: --ref needs exactly one build name")
+			os.Exit(1)
+		}
+		cmdBuild(cfg, names, all, buildOptions{Ref: ref, Force: force})
+	case "builds":
+		cmdBuilds(cfg)
 	case "config", "cfg":
 		cmdConfig(cfg)
 	case "set":

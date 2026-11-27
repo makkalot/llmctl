@@ -257,6 +257,57 @@ On **Jetson**, use an L4T-based llama.cpp image built for your JetPack version. 
 }
 ```
 
+### Custom llama.cpp builds
+
+To run a fork, a branch, a pull request or your own checkout instead of a prebuilt image, define a build and point models at it. `llmctl build` fetches the source on the host and builds a llama-server image with an embedded two-stage Dockerfile ([`docker/llama-server.Dockerfile`](docker/llama-server.Dockerfile)).
+
+```json
+{
+  "builds": {
+    "ik":       { "repo": "https://github.com/ikawrakow/ik_llama.cpp", "ref": "main" },
+    "upstream": { "repo": "https://github.com/ggml-org/llama.cpp", "ref": "#12345", "cmake_args": ["-DGGML_CUDA_FA_ALL_QUANTS=ON"] },
+    "jetson":   { "repo": "https://github.com/ggml-org/llama.cpp", "ref": "b6000", "backend": "jetson" },
+    "mine":     { "path": "~/src/llama.cpp" }
+  },
+  "models": {
+    "qwen":      { "docker_build": "ik" },
+    "qwen-pin":  { "docker_build": "ik@3f2a9c1" }
+  }
+}
+```
+
+```sh
+llmctl build ik                 # build the current commit of ik's ref (skips if already built)
+llmctl build ik --ref b6000     # one-off ref override (branch, tag, full SHA or #PR)
+llmctl build ik --ref 3f2a9c1   # roll back: re-point :latest at an existing image, no rebuild
+llmctl build --all              # build/refresh every build
+llmctl builds                   # list builds, latest commit, age, which models use them
+```
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `repo` / `path` | — | Git URL, or a local git checkout (uncommitted changes included, `.gitignore`d files excluded). Exactly one. |
+| `ref` | `HEAD` | Branch, tag, full commit SHA, or `#<number>` for a GitHub pull request (`refs/pull/N/head`) |
+| `backend` | `cuda` | `cuda` (desktop/server) or `jetson` (L4T; build on the Jetson itself) |
+| `cuda_arch` | host GPU (`nvidia-smi`) / `87` on Jetson | `CMAKE_CUDA_ARCHITECTURES`, e.g. `"89"` or `"86;89;120"` |
+| `base_image` | `nvidia/cuda:12.8.1-devel-ubuntu24.04` / L4T JetPack matching `/etc/nv_tegra_release` | Build-stage image |
+| `runtime_image` | `nvidia/cuda:12.8.1-runtime-ubuntu24.04` / same as `base_image` | Runtime-stage image |
+| `cmake_args` | — | Extra cmake flags (space-separated in the build; values can't contain spaces) |
+| `target` | `llama-server` | CMake target to build |
+| `dockerfile` | embedded | Use your own Dockerfile (relative to the source tree, e.g. a fork's `.devops/cuda.Dockerfile`) |
+| `keep` | `3` | Images kept per build; older ones are removed after a successful build |
+
+How it works:
+
+- **Commit-tagged images.** The ref is resolved with `git ls-remote` on the host (using your git credentials), and the image is tagged `llmctl/<build>:<sha12>` plus `:latest`. If that commit was already built, `llmctl build` just re-points `:latest`. Local checkouts with uncommitted changes are tagged `<sha12>-dirty-<hash>`.
+- **Source on the host.** Only the needed commit is shallow-fetched into `~/.cache/llmctl/src/<build>` and used as the build context, so PRs and private forks work, and the image needs no git.
+- **Fast rebuilds.** ccache lives in a BuildKit cache mount, so a nightly with a few changed files rebuilds in minutes. Requires BuildKit (default since Docker 23).
+- **Static binary.** llama-server is linked statically (`-DBUILD_SHARED_LIBS=OFF`) into a slim runtime image with entrypoint `/app/llama-server`.
+- **Unix-socket check.** llmctl checks the fork's server source for unix-socket support and records it on the image. A model whose build lacks it can't use `docker.network: none`; `load` says so and suggests `"docker_network": "internal"`.
+- **Retention.** The newest `keep` images per build are kept; `:latest` and images used by a container are never removed.
+- **Loading.** A model with `docker_build` runs `llmctl/<build>:latest` (or the pinned commit with `name@commit`). Loads never build: if the image is missing, `load` tells you to run `llmctl build`. `ps` and `info` show which build and commit an instance runs. `docker.build` sets a default build for all models.
+- **Network.** Builds need network (base images, apt); only running backends are isolated.
+
 ### Autoswitching
 
 Autoswitching lets the proxy start configured models on demand. When the requested model does not fit in the detected GPU memory, the proxy unloads the least-recently-used running models that have `auto_unload: true` until the requested model fits.

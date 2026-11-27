@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"net/http/httputil"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -976,5 +977,357 @@ func TestResolveLoadSpecUsesCachedHFFileWhenIsolated(t *testing.T) {
 	}
 	if spec.HFRepo != "" || spec.ModelPath != f {
 		t.Fatalf("expected local file load, got %+v", spec)
+	}
+}
+
+// ── Custom builds ───────────────────────────────────────────────────────────
+
+func stubGit(t *testing.T, fn func(args ...string) (string, error)) *[][]string {
+	t.Helper()
+	var calls [][]string
+	orig := gitExec
+	gitExec = func(args ...string) (string, error) {
+		calls = append(calls, args)
+		return fn(args...)
+	}
+	t.Cleanup(func() { gitExec = orig })
+	return &calls
+}
+
+func TestBuildRepoName(t *testing.T) {
+	if got := buildRepo("ik_Llama.cpp/PR#1"); got != "llmctl/ik_llama.cpp-pr-1" {
+		t.Fatalf("got %q", got)
+	}
+}
+
+func TestGitRefQuery(t *testing.T) {
+	for in, want := range map[string]string{"": "HEAD", "#12345": "refs/pull/12345/head", "main": "main", "b5000": "b5000"} {
+		if got := gitRefQuery(in); got != want {
+			t.Errorf("gitRefQuery(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestPickLsRemotePrefersBranchThenPeeledTag(t *testing.T) {
+	out := strings.Join([]string{
+		"1111111111111111111111111111111111111111\trefs/heads/main",
+		"2222222222222222222222222222222222222222\trefs/tags/main",
+		"3333333333333333333333333333333333333333\trefs/tags/v1",
+		"4444444444444444444444444444444444444444\trefs/tags/v1^{}",
+		"5555555555555555555555555555555555555555\trefs/pull/7/head",
+		"6666666666666666666666666666666666666666\tHEAD",
+	}, "\n")
+	cases := map[string]string{
+		"main": "1111111111111111111111111111111111111111",
+		"v1":   "4444444444444444444444444444444444444444",
+		"#7":   "5555555555555555555555555555555555555555",
+		"":     "6666666666666666666666666666666666666666",
+	}
+	for ref, want := range cases {
+		got, err := pickLsRemote(out, ref)
+		if err != nil || got != want {
+			t.Errorf("ref %q: got %q, %v; want %q", ref, got, err, want)
+		}
+	}
+	if _, err := pickLsRemote(out, "nope"); err == nil {
+		t.Error("expected error for missing ref")
+	}
+}
+
+func TestResolveRemoteCommit(t *testing.T) {
+	calls := stubGit(t, func(args ...string) (string, error) {
+		return "abcdefabcdefabcdefabcdefabcdefabcdefabcd\trefs/pull/9/head\n", nil
+	})
+	sha, err := resolveRemoteCommit("https://example.com/r.git", "#9")
+	if err != nil || sha != "abcdefabcdefabcdefabcdefabcdefabcdefabcd" {
+		t.Fatalf("got %q %v", sha, err)
+	}
+	if got := strings.Join((*calls)[0], " "); got != "ls-remote https://example.com/r.git refs/pull/9/head" {
+		t.Fatalf("git call = %q", got)
+	}
+	full := "ABCDEF0123456789ABCDEF0123456789ABCDEF01"
+	if sha, err := resolveRemoteCommit("r", full); err != nil || sha != strings.ToLower(full) {
+		t.Fatalf("full sha: %q %v", sha, err)
+	}
+	if len(*calls) != 1 {
+		t.Fatalf("full sha must not call git")
+	}
+	if _, err := resolveRemoteCommit("r", "abc1234"); err == nil || !strings.Contains(err.Error(), "full 40-character") {
+		t.Fatalf("short sha: %v", err)
+	}
+}
+
+func TestParseComputeCaps(t *testing.T) {
+	if got := parseComputeCaps("8.9\n8.6\n8.9\n\n"); got != "86;89" {
+		t.Fatalf("got %q", got)
+	}
+	if got := parseComputeCaps("[N/A]\n"); got != "" {
+		t.Fatalf("got %q", got)
+	}
+}
+
+func TestJetsonImageForRelease(t *testing.T) {
+	rel := "# R36 (release), REVISION: 4.3, GCID: 38968081, BOARD: generic, EABI: aarch64, DATE: Wed Jan  8 01:49:37 UTC 2025"
+	if got := jetsonImageForRelease(rel); got != "nvcr.io/nvidia/l4t-jetpack:r36.4.0" {
+		t.Fatalf("got %q", got)
+	}
+	if got := jetsonImageForRelease("garbage"); got != "" {
+		t.Fatalf("got %q", got)
+	}
+}
+
+func TestResolveBuildConfig(t *testing.T) {
+	if _, err := resolveBuildConfig("x", BuildConfig{}); err == nil {
+		t.Error("expected error without repo/path")
+	}
+	if _, err := resolveBuildConfig("x", BuildConfig{Repo: "r", Path: "/p"}); err == nil {
+		t.Error("expected error with both repo and path")
+	}
+	if _, err := resolveBuildConfig("x", BuildConfig{Path: "/p", Ref: "main"}); err == nil {
+		t.Error("expected error for ref on a path build")
+	}
+	if _, err := resolveBuildConfig("x", BuildConfig{Repo: "r", Backend: "rocm", CudaArch: "1"}); err == nil {
+		t.Error("expected error for unknown backend")
+	}
+
+	rb, err := resolveBuildConfig("x", BuildConfig{Repo: "r", CudaArch: "89"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rb.Backend != backendCUDA || rb.BaseImage != defaultCUDABuildImage || rb.RuntimeImage != defaultCUDARuntimeImage ||
+		rb.Target != "llama-server" || rb.Keep != defaultBuildKeep || rb.CudaArch != "89" {
+		t.Fatalf("cuda defaults: %+v", rb)
+	}
+
+	rb, err = resolveBuildConfig("j", BuildConfig{Repo: "r", Backend: "jetson", BaseImage: "nvcr.io/nvidia/l4t-jetpack:r36.3.0"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rb.CudaArch != "87" || rb.RuntimeImage != rb.BaseImage {
+		t.Fatalf("jetson defaults: %+v", rb)
+	}
+}
+
+func TestDockerBuildArgsMatchEmbeddedDockerfile(t *testing.T) {
+	args := dockerBuildArgs(buildImageSpec{
+		Build: resolvedBuild{Name: "ik", Backend: "cuda", CudaArch: "86;89", BaseImage: "b", RuntimeImage: "r",
+			CmakeArgs: []string{"-DGGML_CUDA_FA_ALL_QUANTS=ON", "-DX=1"}, Target: "llama-server"},
+		ContextDir: "/src", Dockerfile: "/tmp/D", Tag: "abc123def456",
+		Commit: "abc123def4567890", Ref: "main", Source: "https://x/y", UnixSocket: true,
+		BuiltAt: time.Date(2026, 11, 27, 10, 0, 0, 0, time.UTC),
+	})
+	joined := strings.Join(args, " ")
+	for _, want := range []string{
+		"build -f /tmp/D",
+		"--build-arg CUDA_ARCH=86;89",
+		"--build-arg CMAKE_ARGS=-DGGML_CUDA_FA_ALL_QUANTS=ON -DX=1",
+		"--build-arg CCACHE_ID=llmctl-ccache-cuda",
+		"--label llmctl.build=ik",
+		"--label llmctl.commit=abc123def4567890",
+		"--label llmctl.unix_socket=true",
+		"--label llmctl.built_at=2026-11-27T10:00:00Z",
+		"-t llmctl/ik:abc123def456 -t llmctl/ik:latest /src",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("missing %q in %s", want, joined)
+		}
+	}
+	// Every --build-arg we pass must be declared in the embedded Dockerfile.
+	for _, v := range argValue(args, "--build-arg") {
+		name := v[:strings.Index(v, "=")]
+		if !strings.Contains(llamaServerDockerfile, "ARG "+name) {
+			t.Errorf("embedded Dockerfile does not declare ARG %s", name)
+		}
+	}
+	if !strings.Contains(llamaServerDockerfile, `ENTRYPOINT ["/app/llama-server"]`) {
+		t.Error("embedded Dockerfile must use /app/llama-server as entrypoint")
+	}
+}
+
+func TestImagesToPrune(t *testing.T) {
+	day := func(n int) time.Time { return time.Date(2026, 11, n, 0, 0, 0, 0, time.UTC) }
+	imgs := []builtImage{
+		{Ref: "llmctl/ik:latest", Tag: "latest", ID: "id2", Created: day(2)},
+		{Ref: "llmctl/ik:c5", Tag: "c5", ID: "id5", Created: day(5)},
+		{Ref: "llmctl/ik:c4", Tag: "c4", ID: "id4", Created: day(4)},
+		{Ref: "llmctl/ik:c3", Tag: "c3", ID: "id3", Created: day(3)},
+		{Ref: "llmctl/ik:c2", Tag: "c2", ID: "id2", Created: day(2)}, // :latest (rolled back)
+		{Ref: "llmctl/ik:c1", Tag: "c1", ID: "id1", Created: day(1)}, // in use
+		{Ref: "llmctl/ik:c0", Tag: "c0", ID: "id0", Created: day(0)},
+	}
+	got := imagesToPrune(imgs, 2, map[string]bool{"id1": true})
+	if strings.Join(got, ",") != "llmctl/ik:c3,llmctl/ik:c0" {
+		t.Fatalf("prune = %v", got)
+	}
+}
+
+func TestListBuildImagesParsesDockerOutput(t *testing.T) {
+	stubDocker(t, func(args ...string) (string, error) {
+		if args[1] == "ls" {
+			return "llmctl/ik:latest|sha256:aaaaaaaaaaaaaaaa\n" +
+				"llmctl/ik:abc123def456|aaaaaaaaaaaa\n" +
+				"llmctl/ik:<none>|bbbbbbbbbbbb\n", nil
+		}
+		// image inspect, one line per ref: Created|built_at label
+		return "2026-11-27T10:00:00Z|<no value>\n" +
+			"2026-11-20T10:00:00Z|2026-11-27T10:00:01.5Z\n", nil
+	})
+	imgs, err := listBuildImages("ik")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(imgs) != 2 || imgs[0].ID != "aaaaaaaaaaaa" || imgs[1].Tag != "abc123def456" {
+		t.Fatalf("imgs = %+v", imgs)
+	}
+	if want := time.Date(2026, 11, 27, 10, 0, 0, 0, time.UTC); !imgs[0].Created.Equal(want) {
+		t.Fatalf("fallback to Created: %v", imgs[0].Created)
+	}
+	if want := time.Date(2026, 11, 27, 10, 0, 1, 500000000, time.UTC); !imgs[1].Created.Equal(want) {
+		t.Fatalf("built_at label must win over Created: %v", imgs[1].Created)
+	}
+}
+
+func TestFindBuildImagePin(t *testing.T) {
+	stubDocker(t, func(args ...string) (string, error) {
+		if args[0] == "image" && args[1] == "ls" {
+			return "llmctl/ik:latest|a\n" +
+				"llmctl/ik:abc123def456|a\n" +
+				"llmctl/ik:abd999999999|b\n", nil
+		}
+		return "", nil // image inspect ok
+	})
+	if ref, err := findBuildImage("ik", ""); err != nil || ref != "llmctl/ik:latest" {
+		t.Fatalf("latest: %q %v", ref, err)
+	}
+	if ref, err := findBuildImage("ik", "abc123d"); err != nil || ref != "llmctl/ik:abc123def456" {
+		t.Fatalf("short pin: %q %v", ref, err)
+	}
+	if ref, err := findBuildImage("ik", "abc123def456ffffffffffffffffffffffffffff"); err != nil || ref != "llmctl/ik:abc123def456" {
+		t.Fatalf("full pin: %q %v", ref, err)
+	}
+	if _, err := findBuildImage("ik", "ab"); err == nil || !strings.Contains(err.Error(), "ambiguous") {
+		t.Fatalf("ambiguous: %v", err)
+	}
+	if _, err := findBuildImage("ik", "fff"); err == nil {
+		t.Fatal("expected not found")
+	}
+}
+
+func TestFindBuildImageMissingSuggestsBuild(t *testing.T) {
+	stubDocker(t, func(args ...string) (string, error) { return "", fmt.Errorf("No such image") })
+	if _, err := findBuildImage("ik", ""); err == nil || !strings.Contains(err.Error(), "llmctl build ik") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestBuildImageInfo(t *testing.T) {
+	stubDocker(t, func(args ...string) (string, error) { return "abc123|false\n", nil })
+	commit, sock, err := buildImageInfo("llmctl/ik:latest")
+	if err != nil || commit != "abc123" || sock {
+		t.Fatalf("%q %t %v", commit, sock, err)
+	}
+}
+
+func TestSourceSupportsUnixSocket(t *testing.T) {
+	dir := t.TempDir()
+	if sourceSupportsUnixSocket(dir) {
+		t.Fatal("empty tree must not support sockets")
+	}
+	old := filepath.Join(dir, "examples", "server")
+	if err := os.MkdirAll(old, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(old, "server.cpp"), []byte("int main(){}"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if sourceSupportsUnixSocket(dir) {
+		t.Fatal("old server without AF_UNIX must not support sockets")
+	}
+	if err := os.WriteFile(filepath.Join(old, "server.cpp"), []byte("svr->set_address_family(AF_UNIX);"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if !sourceSupportsUnixSocket(dir) {
+		t.Fatal("AF_UNIX in server source should be detected")
+	}
+}
+
+func TestSplitBuildRefAndModelOverride(t *testing.T) {
+	if n, c := splitBuildRef("ik@abc123"); n != "ik" || c != "abc123" {
+		t.Fatalf("%q %q", n, c)
+	}
+	if n, c := splitBuildRef("ik"); n != "ik" || c != "" {
+		t.Fatalf("%q %q", n, c)
+	}
+	b, img := "ik@abc", "other:img"
+	cfg := defaultConfig()
+	cfg.Docker.Build = "upstream"
+	cfg.Models = map[string]ModelConfig{"a": {DockerBuild: &b}, "b": {DockerImage: &img}}
+	if got := configForModel(cfg, "a").Docker.Build; got != "ik@abc" {
+		t.Fatalf("docker_build override: %q", got)
+	}
+	if got := configForModel(cfg, "b"); got.Docker.Build != "" || got.Docker.Image != img {
+		t.Fatalf("explicit docker_image must win over global build: %+v", got.Docker)
+	}
+}
+
+// Real git: local-checkout builds copy only non-ignored files and tag dirty trees.
+func TestLocalSourceStateAndCopy(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	repo := t.TempDir()
+	run := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", append([]string{"-C", repo}, args...)...)
+		cmd.Env = append(os.Environ(), "GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@t", "GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@t")
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	write := func(rel, content string) {
+		t.Helper()
+		p := filepath.Join(repo, rel)
+		if err := os.MkdirAll(filepath.Dir(p), 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte(content), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	run("init", "-q")
+	write(".gitignore", "build/\n")
+	write("src/a.cpp", "v1")
+	run("add", ".")
+	run("commit", "-q", "-m", "init")
+
+	commit, dirty, err := localSourceState(repo)
+	if err != nil || len(commit) != 40 || dirty != "" {
+		t.Fatalf("clean: %q %q %v", commit, dirty, err)
+	}
+
+	write("src/a.cpp", "v2")      // modified
+	write("src/new.h", "x")       // untracked
+	write("build/huge.bin", "zz") // ignored
+	_, dirty1, err := localSourceState(repo)
+	if err != nil || len(dirty1) != 8 {
+		t.Fatalf("dirty: %q %v", dirty1, err)
+	}
+	write("src/new.h", "y")
+	if _, dirty2, _ := localSourceState(repo); dirty2 == dirty1 {
+		t.Fatal("dirty hash must change when untracked content changes")
+	}
+
+	dst := filepath.Join(t.TempDir(), "ctx")
+	if err := copyLocalSource(repo, dst); err != nil {
+		t.Fatal(err)
+	}
+	if data, _ := os.ReadFile(filepath.Join(dst, "src", "a.cpp")); string(data) != "v2" {
+		t.Fatalf("modified file not copied: %q", data)
+	}
+	if _, err := os.Stat(filepath.Join(dst, "src", "new.h")); err != nil {
+		t.Fatal("untracked file not copied")
+	}
+	if _, err := os.Stat(filepath.Join(dst, "build")); err == nil {
+		t.Fatal("ignored build/ must not be copied")
 	}
 }
