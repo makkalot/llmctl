@@ -259,7 +259,25 @@ On **Jetson**, use an L4T-based llama.cpp image built for your JetPack version. 
 
 ### Custom llama.cpp builds
 
-To run a fork, a branch, a pull request or your own checkout instead of a prebuilt image, define a build and point models at it. `llmctl build` fetches the source on the host and builds a llama-server image with an embedded two-stage Dockerfile ([`docker/llama-server.Dockerfile`](docker/llama-server.Dockerfile)).
+To run a fork, a branch, a pull request or your own checkout instead of a prebuilt image, build it and load a model with it.
+
+**Trying a fork** takes two commands — paste the URL from your browser:
+
+```sh
+llmctl build https://github.com/someone/llama.cpp/tree/their-branch   # adds build "someone" and builds it
+llmctl load qwen --build someone                                       # runs as "qwen-someone", next to your normal qwen
+```
+
+`llmctl build` accepts a GitHub repo, branch (`/tree/<branch>`), pull request (`/pull/<N>`) or commit (`/commit/<sha>`) URL, `owner/repo`, any other git URL, or a local path. It names the build after the GitHub owner (`<owner>-pr<N>` for pull requests) and saves it in the `builds` config, so the same command later only rebuilds if the branch moved. Settings can be given as flags: `--ref`, `--backend jetson`, `--cuda-arch 89`, `--cmake-arg -DGGML_CUDA_FA_ALL_QUANTS=ON` (repeatable), `--dockerfile`.
+
+`load --build <name>[@commit]` uses the build for that one load; the instance is named `<model>-<build>` (unless `--name` is given) and keeps the model's other settings (ctx size, extra args). If the fork predates unix-socket support, add `--network internal`.
+
+```sh
+llmctl build add ik https://github.com/ikawrakow/ik_llama.cpp   # add under a chosen name without building
+llmctl build rm someone                                         # remove the build, its images and fetched source
+```
+
+For builds you keep, you can also edit the config directly and point models at them: `llmctl build` fetches the source on the host and builds a llama-server image with an embedded two-stage Dockerfile ([`docker/llama-server.Dockerfile`](docker/llama-server.Dockerfile)).
 
 ```json
 {

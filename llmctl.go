@@ -1644,7 +1644,7 @@ func runBuild(cfg Config, name string, opts buildOptions) error {
 	}
 	fmt.Printf("Building %s:%s (%s, CUDA arch %s, base %s)...\n", repo, tag, rb.Backend, rb.CudaArch, rb.BaseImage)
 	if !spec.UnixSocket {
-		fmt.Println("  note: this source has no unix-socket support in llama-server; models using it need docker_network \"internal\"")
+		fmt.Println("  note: this source has no unix-socket support in llama-server; load it with --network internal (or docker_network \"internal\")")
 	}
 	start := time.Now()
 	cmd := exec.Command(dockerBin, dockerBuildArgs(spec)...)
@@ -1718,6 +1718,295 @@ func splitBuildRef(ref string) (name, commit string) {
 	return ref, ""
 }
 
+var (
+	githubURLRe   = regexp.MustCompile(`^(?:https?://)?(?:www\.)?github\.com/([^/\s]+)/([^/\s#?]+?)(?:\.git)?(?:/(tree|pull|commit)/(.+?))?/?(?:[#?].*)?$`)
+	ownerRepoRe   = regexp.MustCompile(`^([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)$`)
+	reservedBuild = map[string]bool{"add": true, "rm": true, "remove": true, "ls": true, "list": true}
+)
+
+// parseBuildSource turns what a user pastes (a GitHub URL — repo, branch,
+// PR or commit page —, owner/repo, any git URL, or a local path) into a
+// BuildConfig and a suggested build name. ok is false if arg doesn't look
+// like a source (e.g. it is the name of a configured build).
+func parseBuildSource(arg string) (bc BuildConfig, name string, ok bool) {
+	if arg == "" {
+		return bc, "", false
+	}
+	if strings.HasPrefix(arg, "/") || strings.HasPrefix(arg, "./") || strings.HasPrefix(arg, "../") ||
+		strings.HasPrefix(arg, "~") || arg == "." {
+		p := expandHome(arg)
+		if abs, err := filepath.Abs(p); err == nil {
+			p = abs
+		}
+		return BuildConfig{Path: p}, filepath.Base(p), true
+	}
+	if m := githubURLRe.FindStringSubmatch(arg); m != nil {
+		owner, repo := m[1], m[2]
+		bc.Repo = "https://github.com/" + owner + "/" + repo
+		name = owner
+		switch m[3] {
+		case "tree":
+			bc.Ref = m[4]
+		case "pull":
+			n := strings.SplitN(m[4], "/", 2)[0] // drop /files, /commits, ...
+			bc.Ref = "#" + n
+			name = owner + "-pr" + n
+		case "commit":
+			bc.Ref = m[4]
+		}
+		return bc, name, true
+	}
+	if strings.Contains(arg, "://") || strings.HasPrefix(arg, "git@") {
+		base := arg[strings.LastIndexAny(arg, "/:")+1:]
+		return BuildConfig{Repo: arg}, strings.TrimSuffix(base, ".git"), true
+	}
+	if m := ownerRepoRe.FindStringSubmatch(arg); m != nil {
+		if _, err := os.Stat(arg); err != nil { // not a relative directory
+			return BuildConfig{Repo: "https://github.com/" + m[1] + "/" + m[2]}, m[1], true
+		}
+		p, _ := filepath.Abs(arg)
+		return BuildConfig{Path: p}, filepath.Base(p), true
+	}
+	return bc, "", false
+}
+
+// sanitizeBuildName makes a build name that is also a valid image/dir name.
+func sanitizeBuildName(name string) string {
+	n := strings.Trim(strings.TrimPrefix(buildRepo(name), "llmctl/"), "-.")
+	if n == "" || reservedBuild[n] {
+		n = "build-" + n
+	}
+	return n
+}
+
+// sameBuildSource reports whether two builds fetch the same thing.
+func sameBuildSource(a, b BuildConfig) bool {
+	return a.Repo == b.Repo && a.Path == b.Path && a.Ref == b.Ref
+}
+
+// uniqueBuildName returns name, or name-2, name-3... if name is taken by a
+// build with a different source. Reusing an identical source keeps the name.
+func uniqueBuildName(builds map[string]BuildConfig, name string, bc BuildConfig) string {
+	candidate := name
+	for i := 2; ; i++ {
+		existing, taken := builds[candidate]
+		if !taken || sameBuildSource(existing, bc) {
+			return candidate
+		}
+		candidate = fmt.Sprintf("%s-%d", name, i)
+	}
+}
+
+// buildFlags are the `llmctl build` flags that define (not just run) a build.
+type buildFlags struct {
+	Ref, Backend, CudaArch, Dockerfile string
+	CmakeArgs                          []string
+}
+
+func (f buildFlags) apply(bc *BuildConfig) {
+	if f.Ref != "" {
+		bc.Ref = f.Ref
+	}
+	if f.Backend != "" {
+		bc.Backend = f.Backend
+	}
+	if f.CudaArch != "" {
+		bc.CudaArch = f.CudaArch
+	}
+	if f.Dockerfile != "" {
+		bc.Dockerfile = f.Dockerfile
+	}
+	if len(f.CmakeArgs) > 0 {
+		bc.CmakeArgs = f.CmakeArgs
+	}
+}
+
+// addBuild stores a build in the config and returns its (possibly adjusted) name.
+func addBuild(cfg *Config, name string, bc BuildConfig) (string, error) {
+	if cfg.Builds == nil {
+		cfg.Builds = map[string]BuildConfig{}
+	}
+	if _, err := resolveBuildSpecOnly(name, bc); err != nil {
+		return "", err
+	}
+	cfg.Builds[name] = bc
+	return name, saveConfig(*cfg)
+}
+
+// resolveBuildSpecOnly validates a build without host probing (nvidia-smi).
+func resolveBuildSpecOnly(name string, bc BuildConfig) (resolvedBuild, error) {
+	if bc.CudaArch == "" {
+		bc.CudaArch = "0" // placeholder: arch is detected at build time
+	}
+	return resolveBuildConfig(name, bc)
+}
+
+// removeBuild deletes a build from the config plus its images and source.
+func removeBuild(cfg *Config, name string) error {
+	if _, ok := cfg.Builds[name]; !ok {
+		return fmt.Errorf("no build %q in config", name)
+	}
+	imgs, _ := listBuildImages(name)
+	inUse := inUseImageIDs()
+	for _, img := range imgs {
+		if inUse[img.ID] {
+			return fmt.Errorf("build %q is used by a loaded model (%s); unload it first", name, img.Ref)
+		}
+	}
+	for _, img := range imgs {
+		_, _ = dockerExec("image", "rm", img.Ref)
+	}
+	_ = os.RemoveAll(buildSourceDir(name))
+	delete(cfg.Builds, name)
+	return saveConfig(*cfg)
+}
+
+// cmdBuildCLI handles `llmctl build ...`.
+func cmdBuildCLI(cfg Config, args []string) {
+	usage := func() {
+		fmt.Fprintln(os.Stderr, `Usage:
+  llmctl build <name|source>... [--ref R] [--force] [--backend cuda|jetson] [--cuda-arch A] [--cmake-arg ARG]... [--dockerfile F]
+  llmctl build --all
+  llmctl build add <name> <source> [flags]
+  llmctl build rm <name>
+
+<source> is a GitHub URL (repo, /tree/<branch>, /pull/<N>, /commit/<sha>), owner/repo, any git URL, or a local path.`)
+		os.Exit(1)
+	}
+	var f buildFlags
+	var positional []string
+	force, all := false, false
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		val := func() string {
+			if k, v, ok := strings.Cut(a, "="); ok && strings.HasPrefix(k, "--") {
+				return v
+			}
+			if i+1 >= len(args) {
+				fmt.Fprintf(os.Stderr, "Error: %s needs a value\n", a)
+				os.Exit(1)
+			}
+			i++
+			return args[i]
+		}
+		flag, _, _ := strings.Cut(a, "=")
+		switch flag {
+		case "--ref":
+			f.Ref = val()
+		case "--backend":
+			f.Backend = val()
+		case "--cuda-arch":
+			f.CudaArch = val()
+		case "--dockerfile":
+			f.Dockerfile = val()
+		case "--cmake-arg":
+			f.CmakeArgs = append(f.CmakeArgs, val())
+		case "--force", "-f":
+			force = true
+		case "--all":
+			all = true
+		case "-h", "--help":
+			usage()
+		default:
+			if strings.HasPrefix(a, "-") {
+				fmt.Fprintf(os.Stderr, "Unknown flag: %s\n", a)
+				usage()
+			}
+			positional = append(positional, a)
+		}
+	}
+	fail := func(err error) {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+
+	if len(positional) > 0 && (positional[0] == "rm" || positional[0] == "remove") {
+		if len(positional) != 2 {
+			usage()
+		}
+		if err := removeBuild(&cfg, positional[1]); err != nil {
+			fail(err)
+		}
+		fmt.Printf("✓ Removed build %q (config, images, source)\n", positional[1])
+		return
+	}
+
+	if len(positional) > 0 && positional[0] == "add" {
+		if len(positional) != 3 {
+			usage()
+		}
+		bc, _, ok := parseBuildSource(positional[2])
+		if !ok {
+			fail(fmt.Errorf("%q is not a git URL, owner/repo or path", positional[2]))
+		}
+		f.apply(&bc)
+		name := sanitizeBuildName(positional[1])
+		if _, err := addBuild(&cfg, name, bc); err != nil {
+			fail(err)
+		}
+		fmt.Printf("✓ Added build %q. Build it with: llmctl build %s\n", name, name)
+		return
+	}
+
+	if all {
+		cmdBuild(cfg, nil, true, buildOptions{Ref: f.Ref, Force: force})
+		return
+	}
+	if len(positional) == 0 {
+		usage()
+	}
+
+	// Positional args are configured build names, or sources to add first.
+	defines := f.Backend != "" || f.CudaArch != "" || f.Dockerfile != "" || len(f.CmakeArgs) > 0
+	var names []string
+	refForRun := f.Ref
+	for _, arg := range positional {
+		if bc, ok := cfg.Builds[arg]; ok {
+			if defines {
+				f.apply(&bc)
+				bc.Ref = cfg.Builds[arg].Ref // --ref stays a one-off override for existing builds
+				if _, err := addBuild(&cfg, arg, bc); err != nil {
+					fail(err)
+				}
+			}
+			names = append(names, arg)
+			continue
+		}
+		bc, suggested, ok := parseBuildSource(arg)
+		if !ok {
+			fail(fmt.Errorf("no build %q in config, and it's not a git URL, owner/repo or path (see `llmctl builds`)", arg))
+		}
+		f.apply(&bc)
+		name := uniqueBuildName(cfg.Builds, sanitizeBuildName(suggested), bc)
+		if _, exists := cfg.Builds[name]; !exists {
+			if _, err := addBuild(&cfg, name, bc); err != nil {
+				fail(err)
+			}
+			fmt.Printf("Added build %q → %s\n", name, describeBuildSource(bc))
+		}
+		refForRun = "" // the ref is part of the new build's definition
+		names = append(names, name)
+	}
+	if refForRun != "" && len(names) != 1 {
+		fail(fmt.Errorf("--ref needs exactly one build"))
+	}
+	cmdBuild(cfg, names, false, buildOptions{Ref: refForRun, Force: force})
+	if len(names) == 1 {
+		fmt.Printf("\n  Try it: llmctl load <model> --build %s\n", names[0])
+	}
+}
+
+func describeBuildSource(bc BuildConfig) string {
+	if bc.Path != "" {
+		return bc.Path
+	}
+	ref := bc.Ref
+	if ref == "" {
+		ref = "HEAD"
+	}
+	return bc.Repo + " @ " + ref
+}
+
 func cmdBuild(cfg Config, names []string, all bool, opts buildOptions) {
 	if all {
 		names = names[:0]
@@ -1769,14 +2058,7 @@ func cmdBuilds(cfg Config) {
 	fmt.Printf("  %-16s %-8s %-14s %-12s %s\n", "────", "───────", "──────", "─────", "──────")
 	for _, name := range names {
 		bc := cfg.Builds[name]
-		source := bc.Path
-		if bc.Repo != "" {
-			ref := bc.Ref
-			if ref == "" {
-				ref = "HEAD"
-			}
-			source = bc.Repo + " @ " + ref
-		}
+		source := describeBuildSource(bc)
 		backend := bc.Backend
 		if backend == "" {
 			backend = backendCUDA
@@ -2764,6 +3046,8 @@ type loadOptions struct {
 	Verbose         bool
 	AutoUnload      bool
 	EstimatedVramMB int
+	Build           string // one-off `--build name[@commit]`, overrides config
+	Network         string // one-off `--network mode`, overrides config
 }
 
 type loadSpec struct {
@@ -2802,11 +3086,25 @@ func resolveLoadSpec(cfg Config, opts loadOptions) (loadSpec, error) {
 		} else {
 			instanceName = deriveInstanceName(modelRef(cfg.ModelsDir, modelPath))
 		}
+		if opts.Build != "" {
+			// Run a one-off build next to the regular instance, not over it.
+			b, _ := splitBuildRef(opts.Build)
+			instanceName += "-" + b
+		}
 	}
 
 	configKey := modelConfigKey(cfg, opts.ModelName, instanceName, modelPath)
 	if configKey != "" {
 		cfg = configForModel(cfg, configKey)
+	}
+	if opts.Build != "" {
+		cfg.Docker.Build = opts.Build
+	}
+	if opts.Network != "" {
+		if !validNetworkMode(opts.Network) {
+			return loadSpec{}, fmt.Errorf("--network must be none, internal or bridge, got %q", opts.Network)
+		}
+		cfg.Docker.Network = opts.Network
 	}
 
 	// Isolated containers can't download, so fetch -hf models on the host
@@ -2888,7 +3186,7 @@ func loadInstance(cfg Config, opts loadOptions) (Instance, bool, error) {
 	if cfg.Docker.Build != "" {
 		name, pin := splitBuildRef(cfg.Docker.Build)
 		if _, ok := cfg.Builds[name]; !ok {
-			return Instance{}, false, fmt.Errorf("docker_build %q: no such entry in builds", name)
+			return Instance{}, false, fmt.Errorf("build %q is not configured; add it with `llmctl build <url>` (see `llmctl builds`)", name)
 		}
 		image, err := findBuildImage(name, pin)
 		if err != nil {
@@ -2899,7 +3197,7 @@ func loadInstance(cfg Config, opts loadOptions) (Instance, bool, error) {
 			return Instance{}, false, fmt.Errorf("inspecting %s: %w", image, err)
 		}
 		if network == netNone && !unixSocket {
-			return Instance{}, false, fmt.Errorf("build %q (%s) has no unix-socket support in llama-server, so it can't run with docker network \"none\"; set \"docker_network\": \"internal\" for this model", name, shortCommit(commit))
+			return Instance{}, false, fmt.Errorf("build %q (%s) has no unix-socket support in llama-server, so it can't run with docker network \"none\"; load with --network internal or set \"docker_network\": \"internal\" for this model", name, shortCommit(commit))
 		}
 		cfg.Docker.Image = image
 		buildName, buildCommit = name, commit
@@ -3099,15 +3397,10 @@ func loadInstance(cfg Config, opts loadOptions) (Instance, bool, error) {
 	return inst, true, nil
 }
 
-func cmdLoad(cfg Config, modelName string, instanceName string, hfRepo string, mmprojArg string) {
-	_, _, err := loadInstance(cfg, loadOptions{
-		ModelName:    modelName,
-		InstanceName: instanceName,
-		HFRepo:       hfRepo,
-		MmprojArg:    mmprojArg,
-		WaitTimeout:  60 * time.Second,
-		Verbose:      true,
-	})
+func cmdLoad(cfg Config, opts loadOptions) {
+	opts.WaitTimeout = 60 * time.Second
+	opts.Verbose = true
+	_, _, err := loadInstance(cfg, opts)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
@@ -4072,10 +4365,17 @@ Instance Management:
   info <name>                 Show detailed info for an instance
   logs <name>                 Show instance logs
 
-Custom llama.cpp builds (see "builds" in ~/.llmctl.json):
-  build <name>... [--ref R] [--force]  Build a llama-server image from a fork/branch/PR/local checkout
+Custom llama.cpp builds:
+  build <url|owner/repo|path> Add a build for a fork/branch/PR/commit/local checkout and build it
+  build <name>... [--ref R] [--force]  (Re)build configured builds; --ref is a one-off override
+  build add <name> <source>   Add a build under a chosen name without building
+  build rm <name>             Remove a build, its images and fetched source
   build --all                 Build every configured build (skips ones already up to date)
   builds                      List builds, their latest commit and which models use them
+    flags: --ref R  --backend cuda|jetson  --cuda-arch A  --cmake-arg ARG (repeatable)  --dockerfile F
+
+  load <model> --build <name>[@commit]   Run a model with a build (instance "<model>-<name>")
+  load <model> --network internal        For builds without unix-socket support
 
 Proxy:
   proxy                       Start the OpenAI-compatible proxy
@@ -4089,6 +4389,8 @@ Workflow:
   llmctl load mistral                              # backend on :9100
   llmctl load llama3 --name chat                   # backend on :9101
   llmctl load "" -hf unsloth/Qwen3.5-27B-GGUF     # direct from HF
+  llmctl build https://github.com/someone/llama.cpp/tree/branch
+  llmctl load mistral --build someone             # try a fork next to the regular one
   llmctl default chat
   llmctl proxy                                     # proxy on :8080
 
@@ -4116,13 +4418,22 @@ func main() {
 		cmdList(cfg)
 	case "load", "run":
 		if len(os.Args) < 3 {
-			fmt.Fprintln(os.Stderr, "Usage: llmctl load <model> [-hf <huggingface_repo>] [--name NAME] [--mmproj <path>]")
+			fmt.Fprintln(os.Stderr, "Usage: llmctl load <model> [-hf <huggingface_repo>] [--name NAME] [--mmproj <path>] [--build <build>[@commit]] [--network none|internal|bridge]")
 			os.Exit(1)
 		}
 		name, args := extractFlag(os.Args[3:], "--name")
-		hf, _ := extractFlag(args, "-hf")
-		mmproj, _ := extractFlag(args, "--mmproj")
-		cmdLoad(cfg, os.Args[2], name, hf, mmproj)
+		hf, args := extractFlag(args, "-hf")
+		mmproj, args := extractFlag(args, "--mmproj")
+		build, args := extractFlag(args, "--build")
+		network, _ := extractFlag(args, "--network")
+		cmdLoad(cfg, loadOptions{
+			ModelName:    os.Args[2],
+			InstanceName: name,
+			HFRepo:       hf,
+			MmprojArg:    mmproj,
+			Build:        build,
+			Network:      network,
+		})
 	case "unload":
 		if len(os.Args) < 3 {
 			fmt.Fprintln(os.Stderr, "Usage: llmctl unload <name>")
@@ -4174,28 +4485,7 @@ func main() {
 		}
 		cmdAlias(cfg, os.Args[2], os.Args[3])
 	case "build":
-		ref, rest := extractFlag(os.Args[2:], "--ref")
-		var names []string
-		force, all := false, false
-		for _, a := range rest {
-			switch a {
-			case "--force", "-f":
-				force = true
-			case "--all":
-				all = true
-			default:
-				if strings.HasPrefix(a, "-") {
-					fmt.Fprintf(os.Stderr, "Unknown flag: %s\n", a)
-					os.Exit(1)
-				}
-				names = append(names, a)
-			}
-		}
-		if ref != "" && (all || len(names) != 1) {
-			fmt.Fprintln(os.Stderr, "Error: --ref needs exactly one build name")
-			os.Exit(1)
-		}
-		cmdBuild(cfg, names, all, buildOptions{Ref: ref, Force: force})
+		cmdBuildCLI(cfg, os.Args[2:])
 	case "builds":
 		cmdBuilds(cfg)
 	case "config", "cfg":

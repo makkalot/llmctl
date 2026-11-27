@@ -1331,3 +1331,147 @@ func TestLocalSourceStateAndCopy(t *testing.T) {
 		t.Fatal("ignored build/ must not be copied")
 	}
 }
+
+func TestParseBuildSource(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	cases := []struct {
+		in         string
+		repo, ref  string
+		path, name string
+	}{
+		{"https://github.com/ikawrakow/ik_llama.cpp", "https://github.com/ikawrakow/ik_llama.cpp", "", "", "ikawrakow"},
+		{"https://github.com/ikawrakow/ik_llama.cpp.git", "https://github.com/ikawrakow/ik_llama.cpp", "", "", "ikawrakow"},
+		{"github.com/someone/llama.cpp/tree/feat/mtp-v2", "https://github.com/someone/llama.cpp", "feat/mtp-v2", "", "someone"},
+		{"https://github.com/ggml-org/llama.cpp/pull/12345/files", "https://github.com/ggml-org/llama.cpp", "#12345", "", "ggml-org-pr12345"},
+		{"https://github.com/a/llama.cpp/commit/0123456789abcdef0123456789abcdef01234567", "https://github.com/a/llama.cpp", "0123456789abcdef0123456789abcdef01234567", "", "a"},
+		{"https://github.com/a/llama.cpp?tab=readme", "https://github.com/a/llama.cpp", "", "", "a"},
+		{"someone/llama.cpp", "https://github.com/someone/llama.cpp", "", "", "someone"},
+		{"https://gitlab.com/x/forky.git", "https://gitlab.com/x/forky.git", "", "", "forky"},
+		{"git@github.com:x/forky.git", "git@github.com:x/forky.git", "", "", "forky"},
+		{"~/src/llama.cpp", "", "", filepath.Join(home, "src", "llama.cpp"), "llama.cpp"},
+	}
+	for _, c := range cases {
+		bc, name, ok := parseBuildSource(c.in)
+		if !ok || bc.Repo != c.repo || bc.Ref != c.ref || bc.Path != c.path || name != c.name {
+			t.Errorf("%q: got %+v name=%q ok=%t", c.in, bc, name, ok)
+		}
+	}
+	if _, _, ok := parseBuildSource("myfork"); ok {
+		t.Error("a bare name must not be treated as a source")
+	}
+}
+
+func TestUniqueBuildName(t *testing.T) {
+	builds := map[string]BuildConfig{
+		"someone":   {Repo: "https://github.com/someone/llama.cpp"},
+		"someone-2": {Repo: "https://github.com/someone/other"},
+	}
+	same := BuildConfig{Repo: "https://github.com/someone/llama.cpp"}
+	if got := uniqueBuildName(builds, "someone", same); got != "someone" {
+		t.Fatalf("identical source should reuse the name, got %q", got)
+	}
+	branch := BuildConfig{Repo: "https://github.com/someone/llama.cpp", Ref: "feat"}
+	if got := uniqueBuildName(builds, "someone", branch); got != "someone-3" {
+		t.Fatalf("got %q", got)
+	}
+	if got := sanitizeBuildName("Some.One"); got != "some.one" {
+		t.Fatalf("got %q", got)
+	}
+	if got := sanitizeBuildName("rm"); got != "build-rm" {
+		t.Fatalf("reserved names must be changed, got %q", got)
+	}
+}
+
+func TestAddAndRemoveBuild(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	calls := stubDocker(t, func(args ...string) (string, error) {
+		if args[0] == "image" && args[1] == "ls" {
+			return "llmctl/someone:latest|aaaaaaaaaaaa\nllmctl/someone:abc123def456|aaaaaaaaaaaa\n", nil
+		}
+		return "", nil // ps -aq: no containers; image inspect/rm ok
+	})
+	cfg := loadConfig()
+	if _, err := addBuild(&cfg, "someone", BuildConfig{Repo: "https://github.com/someone/llama.cpp", Ref: "feat"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := addBuild(&cfg, "bad", BuildConfig{}); err == nil {
+		t.Fatal("expected validation error")
+	}
+	if got := loadConfig().Builds["someone"]; got.Ref != "feat" {
+		t.Fatalf("build not saved: %+v", got)
+	}
+	src := buildSourceDir("someone")
+	if err := os.MkdirAll(src, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := removeBuild(&cfg, "someone"); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := loadConfig().Builds["someone"]; ok {
+		t.Fatal("build still in config")
+	}
+	if _, err := os.Stat(src); err == nil {
+		t.Fatal("source dir not removed")
+	}
+	removed := 0
+	for _, c := range *calls {
+		if c[0] == "image" && c[1] == "rm" {
+			removed++
+		}
+	}
+	if removed != 2 {
+		t.Fatalf("expected both tags removed, calls: %v", *calls)
+	}
+}
+
+func TestRemoveBuildRefusesWhileInUse(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	stubDocker(t, func(args ...string) (string, error) {
+		switch {
+		case args[0] == "image" && args[1] == "ls":
+			return "llmctl/x:latest|aaaaaaaaaaaa\n", nil
+		case args[0] == "ps":
+			return "c1\n", nil
+		case args[0] == "inspect":
+			return "sha256:aaaaaaaaaaaabbbb\n", nil
+		}
+		return "", nil
+	})
+	cfg := loadConfig()
+	cfg.Builds = map[string]BuildConfig{"x": {Repo: "r"}}
+	if err := removeBuild(&cfg, "x"); err == nil || !strings.Contains(err.Error(), "unload") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestResolveLoadSpecOneOffBuildAndNetwork(t *testing.T) {
+	dir := t.TempDir()
+	writeLocalModel(t, filepath.Join(dir, "qwen.gguf"))
+	cfg := testConfig(dir)
+	ctx := 8192
+	cfg.Models = map[string]ModelConfig{"qwen": {CtxSize: &ctx}}
+
+	spec, err := resolveLoadSpec(cfg, loadOptions{ModelName: "qwen", Build: "someone@abc123", Network: "internal"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if spec.InstanceName != "qwen-someone" {
+		t.Fatalf("instance name = %q", spec.InstanceName)
+	}
+	if spec.Config.Docker.Build != "someone@abc123" || spec.Config.Docker.Network != netInternal {
+		t.Fatalf("overrides not applied: %+v", spec.Config.Docker)
+	}
+	if spec.Config.CtxSize != 8192 {
+		t.Fatalf("model's own settings should still apply, ctx = %d", spec.Config.CtxSize)
+	}
+
+	spec, err = resolveLoadSpec(cfg, loadOptions{ModelName: "qwen", Build: "someone", InstanceName: "mine"})
+	if err != nil || spec.InstanceName != "mine" {
+		t.Fatalf("--name must win: %q %v", spec.InstanceName, err)
+	}
+	if _, err := resolveLoadSpec(cfg, loadOptions{ModelName: "qwen", Network: "host"}); err == nil {
+		t.Fatal("expected invalid network error")
+	}
+}
